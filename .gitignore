@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output — produced by `pnpm run build` (also wired to `prepare`).
+# Anchored: tests/lib/ is source and must stay tracked.
+/lib/
+
+# Generated test corpus. make-fixture.mjs recreates it, and it deliberately
+# contains a nested git repository for the .gitignore-resolution tests.
+tests/.fixture/
+
+# Machine-local paths for the test chain and maintenance scripts.
+# Copy .env.example to .env — never commit it.
+.env
+
+# Logs
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch
+*.tmp

@@ -1,0 +1,20 @@
+# dsh-forge bundle patch.
+#
+# Host-plane insert（dsh-ssh 同款第三方工具插件形态）：主入口（exports "."）
+# 在 host 进程里经 inject ['tools','commands','fs'] 注册 fffind / ffgrep /
+# fff-multi-grep 等 13 个 agent 工具与 /forge-status 命令。apply 必须是
+# generator 函数（fork 对普通函数会 new 构造并丢弃返回值），yield 的每个
+# disposer 由 cordis fork 的 _execute 收集——fork 的 ctx 上没有
+# effect/collect 属性（2026-10-11 启动失败根因）。
+#
+# 刻意**不**触碰 preset-standard：dsh-blackhole 的 patch 已对该行做了
+# 「config 整体替换、不做深合并」的全量重述（见其 cordis.patch.yml [2] 段）。
+# 两个全量重述互相覆盖，后应用者会抹掉先应用者的组内条目，所以 forge 的
+# 工具只挂 host plane，绝不在 preset 层再插一份全量列表。
+#
+# 启动零开销：FFF 引擎懒启动——首次工具调用才建索引（ FinderPool 按工作区
+# 根缓存），DSH 会话启动路径上没有任何本插件的工作。
+
+- insert:
+    - id: dsh-forge
+      name: dsh-forge
