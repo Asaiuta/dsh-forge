@@ -7,12 +7,18 @@
 //!     -> results: [{absPath,lang,symbols,signatures,partial,mtimeMs,size} | {absPath,error}]
 //!   {"id":N,"method":"findSymbols","files":[...],"name":"x","kinds":["function"]|null}
 //!     -> {items:[{absPath,qualifiedName,kind,occurrence,startLine,endLine,commentStartLine?,signature}],parsed:N}
+//!   {"id":N,"method":"traceFacts","files":[...]}
+//!     -> results: [TraceFileOutcome | {error}] in input order (module and JS-family
+//!        languages; the caller re-extracts error entries on its WASM path)
+//!   {"id":N,"method":"textFacts","text":"...","syntax":"javascript"|"typescript"|"tsx"}
+//!     -> {facts, partial} for an inline script body
 //!
 //! A per-process (mtime,size) cache lives in this long-running process so a
 //! warm findSymbols pays only a stat per file, no re-parse and no full-tree
 //! serialization.
 
 mod collect;
+mod facts;
 mod find;
 mod lang;
 mod symbol;
@@ -58,7 +64,7 @@ fn fs_meta(path: &str) -> Option<(u64, u64)> {
     Some((mtime_ms, size))
 }
 
-fn read_normalized(path: &str) -> Result<String, String> {
+fn read_capped(path: &str) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
     if meta.len() > MAX_AST_FILE_BYTES {
         return Err(format!("exceeds {MAX_AST_FILE_BYTES} byte AST cap"));
@@ -70,9 +76,18 @@ fn read_normalized(path: &str) -> Result<String, String> {
     if bytes.len() as u64 > MAX_AST_FILE_BYTES {
         return Err(format!("exceeds {MAX_AST_FILE_BYTES} byte AST cap"));
     }
-    let raw = String::from_utf8_lossy(&bytes);
+    Ok(bytes)
+}
+
+/// BOM-stripped, LF-normalized text (`normalizeText`).
+fn normalize(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
     let no_bom = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    Ok(no_bom.replace("\r\n", "\n").replace('\r', "\n"))
+    no_bom.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn read_normalized(path: &str) -> Result<String, String> {
+    read_capped(path).map(|bytes| normalize(&bytes))
 }
 
 fn signature_map(symbols: &[symbol::Symbol], text: &str) -> std::collections::BTreeMap<u32, String> {
@@ -168,6 +183,69 @@ fn trim_cache(cache: &mut HashMap<String, Entry>, cap: usize) {
     for (key, _) in oldest.into_iter().take(cache.len() - cap) {
         cache.remove(&key);
     }
+}
+
+/// Serialized TraceFileOutcome, kept as JSON text: a warm hit is written
+/// straight into the response without rebuilding or re-encoding the facts.
+/// Entries are keyed by a content hash, not stat: Windows exposes no ctime
+/// here, and a same-size edit with a restored mtime must not reuse old facts
+/// (the WASM path hashes content for the same reason).
+struct TraceEntry {
+    hash: u64,
+    json: Arc<str>,
+    last_used: std::time::Instant,
+}
+
+fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn trace_outcome(abs: &str, bytes: &[u8]) -> Result<String, String> {
+    let l = lang::detect_lang(abs).filter(|l| facts::supports_trace_facts(l)).ok_or("unsupported trace language")?;
+    let (value, partial) = facts::trace_facts(&normalize(bytes), l).ok_or("native extraction declined")?;
+    let outcome = serde_json::json!({ "value": value, "parseErrors": 0, "partialFiles": u8::from(partial) });
+    serde_json::to_string(&outcome).map_err(|e| e.to_string())
+}
+
+/// Read and hash every file in parallel, reuse entries whose content is
+/// unchanged, extract the rest. Errors are never cached.
+fn trace_parallel(cache: &mut HashMap<String, TraceEntry>, files: &[String]) -> Vec<Result<Arc<str>, String>> {
+    let shared: &HashMap<String, TraceEntry> = cache;
+    let computed: Vec<Result<(u64, Arc<str>, bool), String>> = files.par_iter().map(|file| {
+        let bytes = read_capped(file)?;
+        let hash = content_hash(&bytes);
+        if let Some(entry) = shared.get(file).filter(|e| e.hash == hash) { return Ok((hash, entry.json.clone(), false)); }
+        trace_outcome(file, &bytes).map(|json| (hash, Arc::from(json), true))
+    }).collect();
+    let now = std::time::Instant::now();
+    let results = files.iter().zip(computed).map(|(file, result)| result.map(|(hash, json, fresh)| {
+        if fresh { cache.insert(file.clone(), TraceEntry { hash, json: json.clone(), last_used: now }); }
+        else if let Some(entry) = cache.get_mut(file) { entry.last_used = now; }
+        json
+    })).collect();
+    if cache.len() > MAX_CACHED_FILES {
+        let mut oldest: Vec<_> = cache.iter().map(|(key, entry)| (key.clone(), entry.last_used)).collect();
+        oldest.sort_unstable_by_key(|(_, used)| *used);
+        for (key, _) in oldest.into_iter().take(cache.len() - MAX_CACHED_FILES) { cache.remove(&key); }
+    }
+    results
+}
+
+/// `{"id":..,"ok":true,"results":[...]}` assembled from cached JSON text.
+fn write_trace_response(writer: &mut impl Write, id: &serde_json::Value, results: &[Result<Arc<str>, String>]) -> std::io::Result<()> {
+    write!(writer, "{{\"id\":{id},\"ok\":true,\"results\":[")?;
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 { writer.write_all(b",")?; }
+        match result {
+            Ok(json) => writer.write_all(json.as_bytes())?,
+            Err(e) => serde_json::to_writer(&mut *writer, &serde_json::json!({ "error": e }))?,
+        }
+    }
+    writer.write_all(b"]}\n")?;
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -326,10 +404,14 @@ fn collect_matches(
 }
 
 fn main() {
+    // The fact walk recurses per syntax level (bounded by facts::js MAX_DEPTH);
+    // give pool threads room so a deep tree declines instead of overflowing.
+    let _ = rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build_global();
     let mut reader = std::io::stdin().lock();
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     let mut cache: HashMap<String, Entry> = HashMap::new();
+    let mut trace_cache: HashMap<String, TraceEntry> = HashMap::new();
     let mut line = String::new();
 
     loop {
@@ -349,10 +431,24 @@ fn main() {
         let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
+        if method == "traceFacts" {
+            let results = trace_parallel(&mut trace_cache, &files_arg(&req));
+            let _ = write_trace_response(&mut writer, &id, &results);
+            continue;
+        }
         let response = match method {
+            "textFacts" => {
+                let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let lang = match req.get("syntax").and_then(|v| v.as_str()) { Some("typescript") => "typescript", Some("tsx") => "tsx", _ => "javascript" };
+                match rayon::scope(|_| facts::text_facts(text, lang)) {
+                    Some((facts, partial)) => serde_json::json!({ "id": id, "ok": true, "facts": facts, "partial": partial }),
+                    None => serde_json::json!({ "id": id, "ok": false, "error": "native extraction declined" }),
+                }
+            }
             "ping" => serde_json::json!({ "id": id, "ok": true }),
             "resetCache" => {
                 cache.clear();
+                trace_cache.clear();
                 serde_json::json!({ "id": id, "ok": true })
             }
             "sexp" => {

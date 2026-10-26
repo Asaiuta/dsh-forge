@@ -14,7 +14,11 @@ export interface TraceFileOutcome {
   diagnostics?: Array<Omit<TraceDiagnostic, 'path'>>
 }
 
-export async function extractTraceFile(file: string): Promise<TraceFileOutcome> {
+/** Script-body facts for inline HTML/component scripts (WASM by default). */
+export type TextFactsParser = (text: string, syntax: JsSyntax) => Promise<{ facts: FileFacts; partial: boolean } | null>
+const wasmTextFacts: TextFactsParser = (text, syntax) => factsFromText(text, null, syntax)
+
+export async function extractTraceFile(file: string, parseText: TextFactsParser = wasmTextFacts): Promise<TraceFileOutcome> {
   try {
     if (BINARY_EXTENSIONS.has(path.extname(file).toLowerCase())) {
       const metadata = binaryFacts(readBoundedFile(file, MAX_BINARY_BYTES))
@@ -39,7 +43,7 @@ export async function extractTraceFile(file: string): Promise<TraceFileOutcome> 
           const group = { syntax: block.syntax, imports: [] as RequireFact[], requires: [] as RequireFact[] }
           if (block.src !== undefined) group.requires.push({ spec: block.src, line: block.line, componentSrc: true })
           else if (block.text !== undefined && block.text.trim() !== '') {
-            const parsed = await factsFromText(block.text, null, block.syntax)
+            const parsed = await parseText(block.text, block.syntax)
             if (!parsed) parseErrors++
             else {
               partial ||= parsed.partial
@@ -67,7 +71,7 @@ export async function extractTraceFile(file: string): Promise<TraceFileOutcome> 
     let parseErrors = 0
     let partial = false
     for (const body of html.inline) {
-      const parsed = await factsFromText(body.text, null)
+      const parsed = await parseText(body.text, 'javascript')
       if (!parsed) { parseErrors++; continue }
       partial ||= parsed.partial
       merged ??= emptyFacts()

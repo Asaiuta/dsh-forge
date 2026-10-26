@@ -939,7 +939,7 @@ impl<'a> Collector<'a> {
     }
 }
 
-fn parser_for(lang: &'static str) -> Option<tree_sitter::Parser> {
+pub(crate) fn parser_for(lang: &'static str) -> Option<tree_sitter::Parser> {
     let mut parser = tree_sitter::Parser::new();
     let language: tree_sitter::Language = match lang {
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),

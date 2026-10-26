@@ -9,6 +9,7 @@ import { AstWorkerPool } from '../lib/ast-pool.js'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-cache-'))
 const previousWorkers = process.env.DSH_FORGE_AST_WORKERS
+const previousNative = process.env.DSH_FORGE_TRACE_NATIVE
 let passed = 0
 const ok = label => console.log(`ok ${++passed} - ${label}`)
 const write = (name, content) => fs.writeFileSync(path.join(root, name), content)
@@ -94,6 +95,9 @@ try {
   assert.notEqual((await assembleTraceGraph(rootAlias, { workers: pool })).graph, firstRoot.graph)
   ok('root link retargets invalidate the graph even when every source stat signature is identical')
 
+  // The remaining groups pin the WASM worker-pool cancellation contract; the
+  // native sidecar would extract these sources without consulting the pool.
+  process.env.DSH_FORGE_TRACE_NATIVE = '0'
   clear()
   const otherPool = new AstWorkerPool()
   const originalFacts = pool.facts.bind(pool)
@@ -179,6 +183,8 @@ try {
   await pool.dispose()
   if (previousWorkers === undefined) delete process.env.DSH_FORGE_AST_WORKERS
   else process.env.DSH_FORGE_AST_WORKERS = previousWorkers
+  if (previousNative === undefined) delete process.env.DSH_FORGE_TRACE_NATIVE
+  else process.env.DSH_FORGE_TRACE_NATIVE = previousNative
   const intendedParent = path.resolve(os.tmpdir()) + path.sep
   assert.ok(path.resolve(root).startsWith(intendedParent) && path.basename(root).startsWith('forge-trace-cache-'))
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })

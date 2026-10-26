@@ -93,10 +93,11 @@ dsh-forge 在常规使用下开箱即用，无需特殊配置。如需调整缓�
 | `DSH_FORGE_DATA_DIR` | `~/.dsh/forge` | 跨会话 frecency 访问统计、查询历史、本地快照与知识卡片缓存的主目录。 |
 | `DSH_FORGE_GRAMMAR_DIR` | 随包预装 | Tree-sitter WASM 语法文件目录。 |
 | `DSH_FORGE_AST_WORKERS` | 自动，最多 `8` | 符号查询和 Trace 共用 AST Worker 池。默认候选达到 16 个时并行；`0` 强制顺序解析，`1..8` 显式指定 Worker 上限。 |
-| `DSH_FORGE_INDEXER` | 自动 | 可选 Rust 符号索引 sidecar：`0`/`off` 关闭，其余取值在可用时尝试原生解析；启动或读取失败会回退 WASM。Trace 使用 WASM Worker，不依赖此二进制。 |
+| `DSH_FORGE_INDEXER` | 自动 | 可选 Rust 索引 sidecar：`0`/`off` 关闭，其余取值在可用时尝试原生解析；启动或读取失败会回退 WASM。符号查询与 Trace 事实提取共用此二进制。 |
 | `DSH_FORGE_INDEXER_BIN` | 未配置 | 指向可信的本机 sidecar 二进制；源码 checkout 也会发现 `rust_indexer/bin`。npm 包不捆绑平台二进制，默认使用 WASM。 |
+| `DSH_FORGE_TRACE_NATIVE` | 自动 | sidecar 可用时，Trace 的源码与内联脚本事实由原生提取；`0`/`off` 保持 WASM Worker 路径。超过大小上限或嵌套过深的文件仍走 WASM。语法完整的文件两条路径结果逐字段一致；含语法错误的文件采用原生语法的错误恢复结果。 |
 
-可选原生符号加速：在源码 checkout 中安装 Rust 1.88+ 后执行 `pnpm run build:indexer`，会为当前平台构建并放入 `rust_indexer/bin`。npm 安装用户可将 `DSH_FORGE_INDEXER_BIN` 指向这份构建产物的绝对路径；没有该产物仍可使用全部工具。
+可选原生加速：在源码 checkout 中安装 Rust 1.88+ 后执行 `pnpm run build:indexer`，会为当前平台构建并放入 `rust_indexer/bin`。npm 安装用户可将 `DSH_FORGE_INDEXER_BIN` 指向这份构建产物的绝对路径；没有该产物仍可使用全部工具。启用后 Trace 冷启动不再加载 WASM 语法，峰值内存约降一个数量级（见 `docs/trace-native-facts-2026-10-26.md`）。
 
 Trace 首次扫描使用并行事实提取；全仓别名只做内存筛选，不再触发二次解析。同一工作区的重叠请求共享扫描，后续请求按文件 stat/ctime、声明表及被探测依赖的存在性验证缓存。文件新增、修改、删除或声明表变化会失效。输出的 `parseErrors`、`partialFiles`、`walkErrors`、`resolutionLimited` 与 `incomplete` 表示分析覆盖度；出现失败、部分解析、截断时，“未找到”只针对已分析范围。根 `.gitignore` 生效，跳过 `node_modules` / `.git` / `.dsh` 和目录链接；候选上限 20,000，源码上限 2 MiB，二进制上限 32 MiB。
 

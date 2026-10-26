@@ -22,6 +22,7 @@ import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } fr
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
 import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from './ast-pool.ts'
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
+import { indexerReady, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
 import { loadJsProject, projectMetadata } from './js-project.ts'
 import { loadPythonProject, pythonMetadata } from './python-project.ts'
@@ -191,20 +192,40 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
       outcomes[index] = { value: null, parseErrors: 1, partialFiles: 0, diagnostics: [{ reason: 'stat_failed', message: cause instanceof Error ? cause.message : String(cause) }] }
     }
   }
-  const parallel = missing.length > 0 && astWorkerCount() > 0 && (!astWorkerAuto() || missing.length >= 16)
-  const parsed: TraceFileOutcome[] = []
+  // Source files go to the native sidecar first. What it declines (size cap,
+  // over-deep trees, an older binary) keeps the WASM path below.
+  const parsed: Array<TraceFileOutcome | null> = missing.map(() => null)
+  const native = indexerTraceWanted() && missing.length > 0 && await indexerReady({ signal })
+  if (native) {
+    const indexes = missing.flatMap((item, index) => indexerTraceLang(item.file) ? [index] : [])
+    const outcomes = await indexerTraceFacts(indexes.map(index => missing[index].file), signal)
+    outcomes.forEach((outcome, offset) => { parsed[indexes[offset]] = outcome })
+  }
+  const rest = missing.flatMap((item, index) => parsed[index] ? [] : [{ ...item, slot: index }])
+  // With the sidecar, script hosts, manifests and binaries need no WASM pool:
+  // they are scanned here and inline scripts are parsed natively.
+  const hosted = native ? rest.filter(item => !indexerTraceLang(item.file)) : []
+  for (const item of hosted) {
+    signal?.throwIfAborted()
+    parsed[item.slot] = await extractTraceFile(item.file, indexerTextFacts)
+  }
+  const wasm = native ? rest.filter(item => indexerTraceLang(item.file)) : rest
+  // Files the sidecar declined are few; a full worker pool would cost each
+  // worker its own WASM compilation (hundreds of MB) for a handful of files.
+  const parallel = wasm.length > 0 && astWorkerCount() > 0 && (!astWorkerAuto() || wasm.length >= (native ? 256 : 16))
   if (parallel) {
-    parsed.push(...await (workers ? workers.facts(missing, signal) : parallelTrace(missing, signal)))
+    const outcomes = await (workers ? workers.facts(wasm, signal) : parallelTrace(wasm, signal))
+    wasm.forEach((item, index) => { parsed[item.slot] = outcomes[index] })
   } else {
-    for (const item of missing) {
+    for (const item of wasm) {
       await new Promise<void>(resolve => setImmediate(resolve))
       signal?.throwIfAborted()
-      parsed.push(await extractTraceFile(item.file))
+      parsed[item.slot] = await extractTraceFile(item.file)
     }
   }
   signal?.throwIfAborted()
   missing.forEach((item, index) => {
-    const value = parsed[index]
+    const value = parsed[index]!
     outcomes[item.index] = value
     // Failed reads must be retried: permission changes need not change stat.
     if (value.value && value.parseErrors === 0) rememberFacts(item.cacheKey, item.mtimeMs, item.bytes, item.ctimeMs, value)

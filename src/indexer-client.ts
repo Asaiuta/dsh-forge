@@ -18,7 +18,9 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { detectLanguage, type SymbolParse } from './ast.ts'
+import { detectLanguage, factsFromText, type SymbolParse } from './ast.ts'
+import type { TextFactsParser, TraceFileOutcome } from './trace-facts.ts'
+import type { FileFacts } from './facts.ts'
 
 /**
  * Languages the sidecar parses natively. This mirrors the sidecar's own
@@ -33,7 +35,6 @@ const SUPPORTED = new Set([
 
 let child: ChildProcess | null = null
 let seq = 1
-let buf = ''
 let disabled = false
 let readyPromise: Promise<boolean> | null = null
 const pending = new Map<number, { resolve(value: unknown): void; reject(cause: Error): void }>()
@@ -75,7 +76,6 @@ function ensureChild(): ChildProcess | null {
   // process and its stdio so the parent can exit; stdin EOF then stops the
   // sidecar cleanly.
   const spawned = child
-  buf = ''
   spawned.unref()
   ;(spawned.stdin as { unref?: () => void } | null)?.unref?.()
   ;(spawned.stdout as { unref?: () => void } | null)?.unref?.()
@@ -87,20 +87,26 @@ function ensureChild(): ChildProcess | null {
     for (const p of pending.values()) p.reject(cause)
     pending.clear()
     child = null
-    buf = ''
     disabled = true
   }
   spawned.on('error', failed)
   spawned.on('exit', () => failed(new Error('indexer exited')))
   spawned.stdin!.on('error', failed)
   spawned.stdout!.setEncoding('utf8')
+  // A traceFacts reply is one long line: search only the newly arrived text
+  // so assembling it stays linear in its size.
+  const parts: string[] = []
   spawned.stdout!.on('data', (chunk: string) => {
     if (child !== spawned) return
-    buf += chunk
-    let nl: number
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl)
-      buf = buf.slice(nl + 1)
+    let nl = chunk.indexOf('\n')
+    if (nl < 0) { parts.push(chunk); return }
+    let rest = chunk
+    while (nl >= 0) {
+      parts.push(rest.slice(0, nl))
+      const line = parts.join('')
+      parts.length = 0
+      rest = rest.slice(nl + 1)
+      nl = rest.indexOf('\n')
       if (!line.trim()) continue
       let msg: { id?: number; ok?: boolean; error?: string }
       try { msg = JSON.parse(line) } catch { continue }
@@ -110,6 +116,7 @@ function ensureChild(): ChildProcess | null {
       if (msg.ok) p.resolve(msg)
       else p.reject(new Error(msg.error ?? 'indexer error'))
     }
+    if (rest) parts.push(rest)
   })
   spawned.stderr!.on('data', () => { /* swallow diagnostics */ })
   return spawned
@@ -249,6 +256,60 @@ export async function indexerParseBatch(
   return out
 }
 
+/** Languages whose Trace facts the sidecar extracts (rust_indexer/src/facts). */
+const TRACE_LANGS = new Set(['javascript', 'typescript', 'tsx', 'python', 'rust', 'c', 'cpp', 'go', 'java', 'lua'])
+const TRACE_CHUNK = 2000
+
+/** Gate: `DSH_FORGE_TRACE_NATIVE=0|false|off` keeps Trace facts on the WASM path. */
+export function indexerTraceWanted(): boolean {
+  const raw = process.env.DSH_FORGE_TRACE_NATIVE?.trim().toLowerCase()
+  return raw !== '0' && raw !== 'false' && raw !== 'off'
+}
+
+export function indexerTraceLang(abs: string): boolean {
+  const lang = detectLanguage(abs)
+  return lang !== null && TRACE_LANGS.has(lang)
+}
+
+/**
+ * Trace facts for source files, aligned with `paths`. `null` means "re-extract
+ * on the WASM path" (files over the size cap, trees too deep for the native
+ * walk, an older binary), keeping its diagnostics. Cleanly parsed files match
+ * the WASM path exactly (rust_indexer/parity-facts.mjs); a partially parsed
+ * file keeps the newer native grammar's error recovery rather than loading
+ * WASM for it — one WASM fallback costs ~1 GB of V8 compilation memory.
+ */
+export async function indexerTraceFacts(paths: string[], signal?: AbortSignal): Promise<Array<TraceFileOutcome | null>> {
+  const out: Array<TraceFileOutcome | null> = paths.map(() => null)
+  for (let start = 0; start < paths.length; start += TRACE_CHUNK) {
+    signal?.throwIfAborted()
+    const files = paths.slice(start, start + TRACE_CHUNK)
+    let reply: { results?: unknown }
+    try {
+      reply = (await request('traceFacts', { files }, { signal })) as typeof reply
+    } catch {
+      signal?.throwIfAborted()
+      return out // older binary or sidecar failure: the rest falls back
+    }
+    const results = reply.results
+    if (!Array.isArray(results) || results.length !== files.length) return out
+    results.forEach((item: Partial<TraceFileOutcome> & { error?: string }, offset) => {
+      if (item && !item.error && item.value && item.parseErrors === 0) out[start + offset] = item as TraceFileOutcome
+    })
+  }
+  return out
+}
+
+/** Inline script facts through the sidecar (partial parses included, as for
+ *  source files); only a sidecar failure uses the WASM parser. */
+export const indexerTextFacts: TextFactsParser = async (text, syntax) => {
+  try {
+    const reply = (await request('textFacts', { text, syntax })) as { facts?: FileFacts; partial?: boolean }
+    if (reply.facts && typeof reply.partial === 'boolean') return { facts: reply.facts, partial: reply.partial }
+  } catch { /* fall through to WASM */ }
+  return factsFromText(text, null, syntax)
+}
+
 export interface IndexerHit {
   absPath: string
   qualifiedName: string
@@ -328,7 +389,6 @@ export async function resetIndexer(): Promise<void> {
   child = null
   for (const p of pending.values()) p.reject(new Error('indexer reset'))
   pending.clear()
-  buf = ''
   previous?.kill()
   readyPromise = null
   disabled = false
