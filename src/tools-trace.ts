@@ -22,7 +22,7 @@ import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } fr
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
 import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from './ast-pool.ts'
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
-import { indexerProbesUnchanged, indexerReady, indexerStatPaths, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
+import { indexerCollectCandidates, indexerProbesUnchanged, indexerReady, indexerStatPaths, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
 import { loadJsProject, projectMetadata } from './js-project.ts'
 import { loadPythonProject, pythonMetadata } from './python-project.ts'
@@ -75,8 +75,13 @@ function text(value: string): Array<{ type: 'text'; text: string }> {
  *  each path's verdict, which a fresh instance per scan would discard. */
 const IGNORE_RULES = new Map<string, { text: string; rules: ReturnType<typeof ignore> }>()
 
-/** Collect supported source, HTML, manifests and binaries, root-.gitignore-aware, capped. */
-function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number } {
+/** Collect supported source, HTML, manifests and binaries, root-.gitignore-aware, capped.
+ *
+ *  This is the reference the sidecar walk in `rust_indexer/src/candidates.rs`
+ *  is held to, entry for entry and order included: tests/run-trace-candidates
+ *  compares the two lists outright, so a rule that drifts on one side and not
+ *  the other fails the suite instead of quietly changing what gets scanned. */
+export function collectCandidatesLocal(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number } {
   let walkErrors = 0
   let text = ''
   const gitignore = path.join(root, '.gitignore')
@@ -140,6 +145,26 @@ function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{
   return { files: files.sort((a, b) => a.rel.localeCompare(b.rel)), projectFiles: projectFiles.sort(), pythonFiles: pythonFiles.sort(), cargoFiles: cargoFiles.sort(), goFiles: goFiles.sort(), truncated, walkErrors }
 }
 
+/** Discovery, walked by the sidecar when it can. The order it returns is
+ *  irrelevant: `localeCompare` and plain `sort()` are the contract here, and
+ *  neither has a byte-order equivalent in Rust. */
+async function collectCandidates(root: string, signal?: AbortSignal): Promise<ReturnType<typeof collectCandidatesLocal>> {
+  const remote = indexerTraceWanted() && await indexerReady({ signal }) ? await indexerCollectCandidates(root, signal) : null
+  if (!remote) return collectCandidatesLocal(root, signal)
+  const files = remote.files
+    .map(rel => ({ abs: path.join(root, ...rel.split('/')), rel }))
+    .sort((a, b) => a.rel.localeCompare(b.rel))
+  return {
+    files,
+    projectFiles: remote.projectFiles.sort(),
+    pythonFiles: remote.pythonFiles.sort(),
+    cargoFiles: remote.cargoFiles.sort(),
+    goFiles: remote.goFiles.sort(),
+    truncated: remote.truncated,
+    walkErrors: remote.walkErrors,
+  }
+}
+
 /**
  * Cache bridge-independent facts; select bridge references after discovering
  * aliases across the workspace. No source file needs the old second parse.
@@ -173,7 +198,7 @@ export function resetTraceFactsCache(): void {
 
 /** Scan one root: per-file facts (HTML scanner + AST extractor). */
 async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool) {
-  const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors } = collectCandidates(root, signal)
+  const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors } = await collectCandidates(root, signal)
   // Discovery never follows directory links below root. Check root's own
   // identity once so retargeting an alias cannot reuse another tree's facts,
   // even when every source file happens to have identical stat metadata.

@@ -174,13 +174,11 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 
 顺带修掉一处门控漏洞：重复查询的 `statPaths` 此前只检查 `DSH_FORGE_TRACE_NATIVE`，没有先问 sidecar 是否可用，于是 `DSH_FORGE_INDEXER=0` 仍会拉起子进程。现在两条下推都以「sidecar 就绪」为前提，关掉索引器就是完全不碰它——上表「本地实现」一列因此比上一轮记录的耗时更高，那是真正的无 sidecar 基线。
 
-### 试过但没下推：`collectCandidates`
+### 目录遍历：并行 readdir，不是缓存 mtime
 
-第三项是扫描时的目录遍历。Rust 侧实现过两次、也退回两次，每次的判据都是实测。
+第三项是扫描时的目录遍历。这一项前后做了三轮，前两轮都退了，第三轮才成立——三轮的判据都是实测，过程值得留着。
 
-语义对齐没有问题：四个仓库（1,726 / 2,862 / 169 / 142 个候选）的相对路径列表逐字相同，外加一个 60 项 `.gitignore` fixture（目录专用模式、锚定、`**`、字符类、转义、大小写、CRLF、嵌套 `.gitignore` 不生效、`_dsh` 标记、junction）全绿。
-
-价格站不住，而且这个数的测法本身值得记一笔：
+**第一轮（退回）**：语义对齐没问题（四个仓库 1,726 / 2,862 / 169 / 142 个候选的相对路径列表逐字相同，外加一个 60 项 `.gitignore` fixture），但按当时那组数字判为不值：
 
 | 量法（VCPToolBox） | 本地 | sidecar |
 |---|---:|---:|
@@ -189,14 +187,60 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 | 拆开：sidecar 请求本身 | — | 91 ms |
 | 拆开：abs 拼接 / 排序 | 8.3 / 1.9 ms | 同 |
 
-同一个函数三次量出 80 / 102 / 194–233 ms：紧循环里没有别的活，V8 能在 `await` 间隙做增量 GC；连续 5 次背靠背遍历又把 GC 空档挤没了。**只信插桩在真实路径里的那组**：100 ms，换语言挪走 0–10 ms。
+同一个函数三次量出 80 / 102 / 194–233 ms：紧循环里没有别的活，V8 能在 `await` 间隙做增量 GC；连续 5 次背靠背遍历又把 GC 空档挤没了。**只信插桩在真实路径里的那组**：100 ms，换语言挪走 0–10 ms。原因不是 JS 开销，是 `readdir` 的调用延迟——877 个目录 × 约 95 µs ≈ 83 ms。结论：搬语言没用，要减只能少调。
 
-原因是 readdir 的调用延迟，不是 JS 开销：877 个目录 × 约 95 µs ≈ 83 ms，和 2026-10-26 早先 `fsbench` 测到的 readdir 0.088 ms/次 对得上。
+**第二轮（也是退回）**：试「按目录时间戳缓存列举结果」。先验证 NTFS 能不能当失效信号（`dir-mtime.mjs`，8 个场景）：
+
+```
+create file / rename file / delete file / create subdir / rename subdir / delete subdir  → 目录变了
+modify file content / create file in subdirectory                                        → 目录没变
+同 tick（20 组 create+delete 对）漏判 0/20；跨进程立即可见；目录句柄被别人打开时仍可见
+```
+
+结论是可用，但单价的账不划算：
+
+| 调用 | 单价（VCPToolBox 3,303 个目录） |
+|---|---:|
+| `stat` 一个目录 | 45.3 µs |
+| `readdir` 一个目录 | 65.1 µs |
+
+纯 mtime 缓存每轮省 65.1 − 45.3 ≈ 20 µs/目录，即约 30%，却要换来跨请求状态和「15.6 ms 时钟粒度窗口内改了目录」的漏判面。而 readdir 是**延迟**不是 CPU：一次列举 65 µs，一个目录 800 个文件也不涨——那就把一整层目录同时列举，延迟就重叠了。
+
+**第三轮（成立）**：两阶段。
+
+- **阶段一**：按 BFS 逐层用 rayon 并行列举，每个目录的结果（`readdir` 原始顺序、已分类的 `File/Dir/Link/Other`、已算好的 ignore 与否）存进 `HashMap<PathBuf, Snapshot>`。列举量与目录数超过 `WALK_VISIT_CAP` / `DIR_BUDGET` 就放弃，退回原来的串行 DFS——那种规模下截断点必须按 DFS 顺序花掉，不能靠并行结果拼。
+- **阶段二**：按 DFS 在内存里的快照上重放，顺序与串行完全一致，因此 `FILE_CAP` / `WALK_VISIT_CAP` 截断在同一个文件上。这一条是必须的：**顺序变了，截断点就变**，两个实现在大仓库上会给出不同候选集。
+
+收益（同一进程、7 次中位数、冷 assemble 之后）：
+
+| 语料 | 本地遍历（含 abs + 排序） | sidecar 请求 | + abs 拼接 | + localeCompare | 合计 | 比值 |
+|---|---:|---:|---:|---:|---:|---:|
+| VCPToolBox（2,862） | 113.4 ms | 39.8 ms | 8.4 | 2.0 | **50.2 ms** | 0.44 |
+| VCPChat（1,726） | 62.8 ms | 25.6 ms | 4.5 | 1.1 | **31.2 ms** | 0.50 |
+
+端到端热查询（两个独立进程各取 5 次中位数，`DSH_FORGE_AST_WORKERS=0`）：
+
+| 语料 | `DSH_FORGE_INDEXER=0` | 默认（sidecar） | 差 |
+|---|---:|---:|---:|
+| VCPToolBox | 414 ms | **202 ms** | −212 |
+| VCPChat | 295 ms | **126 ms** | −168 |
+| audio-engine-core（169） | 38 ms | **30 ms** | −8 |
+| dsh-forge（142） | 28 ms | **33 ms** | **+5** |
+
+最后一行是实话：**小仓库上 sidecar 更慢**，多出来的是一趟 IPC 加上子进程侧的固定开销，几百个候选以下赚不回来。这条没有加阈值规避——判候选数要先遍历一遍，而真的按目录数猜阈值只是把误差挪个地方。
+
+一致性上，本轮新增了会失败的常驻对拍 `tests/run-trace-candidates.mjs`（5 组，进 `npm test`）：同一棵 fixture 上把两边列表逐字比对（不是比数量——数量恰好是「两个文件互换」最擅长骗过的东西），fixture 覆盖目录专用模式、`**`、锚定、字符类、否定、转义 `#`、同名规则在两个深度、ts/js config 家族、未知扩展名、`_dsh` 标记，并单独断言每条规则该收的收该弃的弃，避免「两边都是空」也算通过。另加 Rust 单测 `parallel_replay_matches_sequential_walk`（并行重放 vs 串行遍历，含截断旗标与 walkErrors）。
+
+对拍本身验过会红：把 `matched_path_or_any_parents` 改回 `matched`（也就是第一轮踩过的坑），`run-trace-candidates` 立刻在 `dist/bundle.js`、`dist/deep/nested.js` 两个条目上分歧，其余全绿。
+
+**顺带抓到一个真 bug，而且是别人抓的**：全量测试里 `run-trace-languages` 变红——那条测试的 `put()` helper 会给每个文件加 UTF-8 BOM，于是 `.gitignore` 的首行是 `\uFEFFignored/`。npm 的 `ignore` 包有一条第 `^\uFEFF` 的 replacer，Rust 的 `GitignoreBuilder` 没有，于是 sidecar 那条规则整条失效、`ignored/miss.py` 被重新扫进来。我新写的 fixture 不带 BOM，所以它没红——**新测试覆盖不到的地方，旧测试挡住了**。修法是按行剥掉行首 BOM；同时把 `read_to_string` 换成 `read` + `from_utf8_lossy`，因为非 UTF-8 的 `.gitignore`（中文 Windows 上的 GBK 文件）原本会让 Rust 侧多记一次 `walkErrors`，而 JS 侧只是把坏字节变成匹配不到任何东西的替换字符。
 
 两个语义偏差记在这里，将来若要重做可以直接抄：
 
 - `ignore` crate 的 `GitignoreBuilder::add_line` 一次只吃一行。把整个文件当一行传进去，**之后所有模式全部失效**（症状：sidecar 一个文件都不排除，dsh-forge 从 142 涨到 12,742）。要按 `lines()` 逐行喂。
 - `matched()` 只比路径自身，`dist/` 这类目录专用模式匹配不到 `dist/a.js`，而 JS 的 `ignore` 包会。改成 `matched_path_or_any_parents(rel, false)`：父目录按目录参与匹配，路径自身仍按非目录，正好复刻 JS。另外 `projectMetadata` 还接受 `/^(?:ts|js)config(?:\.[^/]+)?\.json$/`（`tsconfig.app.json` 这类），只按等值判断会漏三个文件。
+
+全量测试两种模式都通过：原生 262 条 `ok`，`DSH_FORGE_TRACE_NATIVE=0 DSH_FORGE_INDEXER=0` 261 条（少的一条是 candidate 对拍在无 sidecar 时显式 SKIPPED），均 exit 0。
 
 ## 热查询的分段成本（同日实测）
 
@@ -212,6 +256,8 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 | sidecar 就绪 `ready` | 54 | 25 | 6 |
 | 图缓存校验 `probes` | 0 | 0 | 0 |
 | 合计 | 238 | 128 | 27 |
+
+表里 `walk` 是并行遍历之前的那一版；现在同一语料上这一项约 50 ms，见《目录遍历：并行 readdir》。其余各行与本节一致。
 
 对照 `DSH_FORGE_INDEXER=0`（完全不碰 sidecar）：VCPToolBox 409 ms（`walk` 103 + `stamps` 165 + `probes` 89 + `contexts` 36）、VCPChat 197 ms（38 + 98 + 27 + 26）。差的 171 / 69 ms 就是前两轮下推兑现的部分。
 
@@ -234,6 +280,14 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 
 ### 下一步
 
-热查询剩下的两块钱：目录遍历 100 ms、两次 IPC 往返（`statBatch` + `ready`）合计 95 ms。前者只能靠"少调 readdir"——按目录 mtime 缓存列举结果，也就是 `probesUnchanged` 已经在用的按需列举思路；后者可以考虑把 stat 与探针校验合成一次请求，省一次往返。两者都不是"搬到 Rust"。
+热查询剩下的两块，都不再是「搬到 Rust」：
 
-顺带一个留意点：`ready` 那 54 ms 全花在一次往返上，请求体是 15,291 条探针（约 1 MB JSON），返回体只有几个计数。如果改成"只传根与缓存代次、探针留在 sidecar 里"，这次往返能压到个位数毫秒——代价是 sidecar 要跨请求记住图缓存，多了一层失效面，值不值得另说。这一条没有拆开量过，序列化占多少、Rust 侧列举占多少还没分开。
+1. **两次 IPC 往返**（`statBatch` + `ready`）合计 95 ms。第一刀是把 stat 与探针校验合成一次请求，省一次往返；第二刀是「只传根与缓存代次、探针留在 sidecar 里」，能把 `ready` 那 54 ms 压到个位数——代价是 sidecar 要跨请求记住图缓存，多一层失效面。
+2. **遍历之后剩下的 50 ms 里，12 ms 是纯 JS**：`abs` 拼接 8.4 ms、`localeCompare` 排序 2.0 ms。排序有理由留着（`localeCompare` 在 Rust 里没有字节序等价物，而顺序是扫描签名的一部分）；`path.join` 那 8.4 ms 是纯粹的实现选择，按分隔符做字符串拼接能省掉它的大部分，且不影响语义。
+
+顺带一句关于 `ready` 那 54 ms 的形态：请求体是 15,291 条探针（约 1 MB JSON），返回体只有几个计数。这一项没有拆开量过——序列化占多少、Rust 侧列举占多少还没分开，动手前要先拆。
+
+## 关于测量的两条（这一轮换来的）
+
+1. **同一个函数能差 3 倍，取决于你在哪儿量。** 紧循环 80 ms / 真实路径插桩 102 ms / 背靠背连调 5 次 194–233 ms，是同一个 `collectCandidates`。紧循环里 V8 在 `await` 间隙做增量 GC，把成本测低了；背靠背又把 GC 空档挤没了。**只有插桩在真实调用路径里的那组能用**，其余两组可以用来判断「方向」，不能用来判断「值不值」。
+2. **同一个函数在同一个进程里，位置不同也能差 2–3 倍。** `walk-heap.mjs` 把 `collectCandidates` 分别放在冷启动后和一次完整 assemble 之后各量一遍，后者稳定慢 2–3 倍（堆上已经有几万个 fact 对象和整张图）。所以「A 比 B 快」的结论必须在**同一个位置**上交替量，不能一个在干净进程里、一个在吃饱了的进程里。

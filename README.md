@@ -93,7 +93,7 @@ dsh-forge 在常规使用下开箱即用，无需特殊配置。如需调整缓�
 | `DSH_FORGE_DATA_DIR` | `~/.dsh/forge` | 跨会话 frecency 访问统计、查询历史、本地快照与知识卡片缓存的主目录。 |
 | `DSH_FORGE_GRAMMAR_DIR` | 随包预装 | Tree-sitter WASM 语法文件目录。 |
 | `DSH_FORGE_AST_WORKERS` | 自动，最多 `8` | 符号查询和 Trace 共用 AST Worker 池。默认候选达到 16 个时并行；`0` 强制顺序解析，`1..8` 显式指定 Worker 上限。 |
-| `DSH_FORGE_INDEXER` | 自动 | 可选 Rust 索引 sidecar：`0`/`off` 关闭，其余取值在可用时尝试原生解析；启动或读取失败会回退 WASM。符号查询、Trace 事实提取、重复查询的逐文件身份检查与图缓存校验共用此二进制。 |
+| `DSH_FORGE_INDEXER` | 自动 | 可选 Rust 索引 sidecar：`0`/`off` 关闭，其余取值在可用时尝试原生解析；启动或读取失败会回退 WASM。符号查询、Trace 事实提取、目录遍历、重复查询的逐文件身份检查与图缓存校验共用此二进制。 |
 | `DSH_FORGE_INDEXER_BIN` | 未配置 | 指向可信的本机 sidecar 二进制；源码 checkout 也会发现 `rust_indexer/bin`。npm 包不捆绑平台二进制，默认使用 WASM。 |
 | `DSH_FORGE_TRACE_NATIVE` | 自动 | sidecar 可用时，Trace 的源码与内联脚本事实由原生提取；`0`/`off` 保持 WASM Worker 路径。超过大小上限或嵌套过深的文件仍走 WASM。语法完整的文件两条路径结果逐字段一致；含语法错误的文件采用原生语法的错误恢复结果。 |
 

@@ -17,6 +17,7 @@
 //! warm findSymbols pays only a stat per file, no re-parse and no full-tree
 //! serialization.
 
+mod candidates;
 mod collect;
 mod facts;
 mod find;
@@ -812,6 +813,20 @@ fn main() {
                     "id": id, "ok": true, "unchanged": unchanged,
                     "probes": stats.probes, "reads": stats.reads,
                     "reals": stats.reals, "exact": stats.exact, "mismatches": stats.mismatches
+                })
+            }
+            // The Trace scan's directory walk. Two phases: enumerate in
+            // parallel (readdir is latency, not CPU), then replay depth first
+            // so the truncation point matches the sequential walk exactly.
+            "collectCandidates" => {
+                let root = req.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let walked = candidates::collect(root);
+                serde_json::json!({
+                    "id": id, "ok": true,
+                    "files": walked.files, "projectFiles": walked.project,
+                    "pythonFiles": walked.python, "cargoFiles": walked.cargo,
+                    "goFiles": walked.go, "truncated": walked.truncated,
+                    "walkErrors": walked.walk_errors
                 })
             }
             "ping" => serde_json::json!({ "id": id, "ok": true }),

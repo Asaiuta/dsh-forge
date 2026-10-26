@@ -380,6 +380,39 @@ export async function indexerProbesUnchanged(
   return true
 }
 
+/** The Trace scan's candidate list, walked in the sidecar.
+ *
+ *  The walk is `readdir` per directory, and on this machine a `readdir` costs
+ *  ~65 us regardless of size: the cost is latency, not CPU, so the sidecar
+ *  enumerates a whole level of directories at once and replays the tree depth
+ *  first afterwards. The reply is relative paths only; the caller restores
+ *  absolute paths and sorts, because `localeCompare` has no byte-order
+ *  equivalent here.
+ *
+ *  `null` means "walk it yourself" (no binary, older protocol, malformed
+ *  reply), never an empty tree. */
+export async function indexerCollectCandidates(
+  root: string,
+  signal?: AbortSignal,
+): Promise<{ files: string[]; projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number } | null> {
+  let reply: Record<string, unknown>
+  try {
+    reply = (await request('collectCandidates', { root }, { signal })) as Record<string, unknown>
+  } catch {
+    signal?.throwIfAborted()
+    return null
+  }
+  const list = (value: unknown): string[] | null => Array.isArray(value) && value.every(item => typeof item === 'string') ? value as string[] : null
+  const files = list(reply.files)
+  const projectFiles = list(reply.projectFiles)
+  const pythonFiles = list(reply.pythonFiles)
+  const cargoFiles = list(reply.cargoFiles)
+  const goFiles = list(reply.goFiles)
+  if (!files || !projectFiles || !pythonFiles || !cargoFiles || !goFiles) return null
+  if (typeof reply.truncated !== 'boolean' || typeof reply.walkErrors !== 'number') return null
+  return { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated: reply.truncated, walkErrors: reply.walkErrors }
+}
+
 /** Inline script facts through the sidecar (partial parses included, as for
  *  source files); only a sidecar failure uses the WASM parser. */
 export const indexerTextFacts: TextFactsParser = async (text, syntax) => {
