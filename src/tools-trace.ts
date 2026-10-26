@@ -24,6 +24,7 @@ import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
 import { loadJsProject, projectMetadata } from './js-project.ts'
+import { loadPythonProject, pythonMetadata } from './python-project.ts'
 import { findDefinitions } from './tools-symbol.ts'
 import type { EdgeMode, ProjectContext, TraceDiagnostic } from './trace-evidence.ts'
 
@@ -68,7 +69,7 @@ function text(value: string): Array<{ type: 'text'; text: string }> {
 }
 
 /** Collect supported source, HTML, manifests and binaries, root-.gitignore-aware, capped. */
-function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; truncated: boolean; walkErrors: number } {
+function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; pythonFiles: string[]; truncated: boolean; walkErrors: number } {
   const rules = ignore()
   let walkErrors = 0
   const gitignore = path.join(root, '.gitignore')
@@ -77,6 +78,7 @@ function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{
   }
   const files: Array<{ abs: string; rel: string }> = []
   const projectFiles: string[] = []
+  const pythonFiles: string[] = []
   let visited = 0
   let truncated = false
   const walk = (dir: string, prefix = ''): void => {
@@ -110,12 +112,13 @@ function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{
         walk(abs, rel + '/')
       } else if (entry.isFile()) {
         if (projectMetadata(entry.name)) projectFiles.push(rel)
+        if (pythonMetadata(entry.name)) pythonFiles.push(rel)
         if (SCAN_EXTS.has(path.extname(entry.name).toLowerCase()) || BINARY_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || entry.name === 'go.mod') files.push({ abs, rel })
       }
     }
   }
   walk(root)
-  return { files: files.sort((a, b) => a.rel.localeCompare(b.rel)), projectFiles: projectFiles.sort(), truncated, walkErrors }
+  return { files: files.sort((a, b) => a.rel.localeCompare(b.rel)), projectFiles: projectFiles.sort(), pythonFiles: pythonFiles.sort(), truncated, walkErrors }
 }
 
 /**
@@ -151,7 +154,7 @@ export function resetTraceFactsCache(): void {
 
 /** Scan one root: per-file facts (HTML scanner + AST extractor). */
 async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool) {
-  const { files, projectFiles, truncated, walkErrors } = collectCandidates(root, signal)
+  const { files, projectFiles, pythonFiles, truncated, walkErrors } = collectCandidates(root, signal)
   // Discovery never follows directory links below root. Check root's own
   // identity once so retargeting an alias cannot reuse another tree's facts,
   // even when every source file happens to have identical stat metadata.
@@ -207,7 +210,7 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
     if (outcome.partialFiles) diagnostics.push({ path: files[index].rel, reason: 'partial_parse', message: '语法或格式仅部分解析，事实可能不完整。' })
     if (outcome.value) entries.set(files[index].rel, outcome.value)
   })
-  return { entries, projectFiles, diagnostics, scanned: files.length, truncated, parseErrors, partialFiles, walkErrors,
+  return { entries, projectFiles, pythonFiles, diagnostics, scanned: files.length, truncated, parseErrors, partialFiles, walkErrors,
     signature: JSON.stringify([rootIdentity, stamps, outcomes.map(value => [Boolean(value.value), value.parseErrors, value.partialFiles, value.diagnostics]), truncated, walkErrors]) }
 }
 
@@ -253,7 +256,9 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   const cached = GRAPH_CACHE.get(key)
   const declsKey = JSON.stringify(decls)
   // Fixed slot order: a context that disappears (undefined) must not match one that existed.
-  const contexts: Array<ProjectContext | undefined> = [compilation, project]
+  const pythonSources = [...scan.entries].filter(([, entry]) => entry.kind === 'source' && entry.lang === 'python').map(([rel]) => rel)
+  const python = pythonSources.length ? loadPythonProject(root, scan.pythonFiles, pythonSources, options.signal) : undefined
+  const contexts: Array<ProjectContext | undefined> = [compilation, project, python]
   if (cached && cached.signature === scan.signature && cached.decls === declsKey
     && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
     && scan.walkErrors === 0 && !scan.truncated) {
@@ -277,9 +282,9 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   const entries = new Map([...scan.entries].map(([rel, entry]) => [rel, selectBridgeFacts(entry, bridge)]))
   options.signal?.throwIfAborted()
   const probes = new Map<string, GraphProbe>()
-  const graph = buildGraph(root, entries, decls, (rel, exists, identity) => probes.set(rel, { exists, identity: identity ?? null }), compilation?.resolve, project?.resolve)
+  const graph = buildGraph(root, entries, decls, (rel, exists, identity) => probes.set(rel, { exists, identity: identity ?? null }), compilation?.resolve, project?.resolve, python)
   const assembled = { graph, decls, scanned: scan.scanned, truncated: scan.truncated, parseErrors: scan.parseErrors, partialFiles: scan.partialFiles, walkErrors: scan.walkErrors,
-    diagnostics: [...scan.diagnostics, ...project?.issues ?? []],
+    diagnostics: [...scan.diagnostics, ...project?.issues ?? [], ...python?.issues ?? []],
     ...(project ? { project: { configs: project.configs, workspacePackages: project.workspacePackages } } : {}),
     ...(compilation?.info ? { compilation: compilation.info } : {}) }
   if (!scan.truncated && scan.walkErrors === 0) {
@@ -338,7 +343,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
   return {
     name: 'fftrace',
     description:
-      'Trace dependencies before changing code. Pick target= by question: who breaks if I change a file (run before any refactor) → impact:<path>; what a file imports → file:<path>; how A reaches B → path:<from> -> <to>; where an IPC channel registers/is called → ipc:<channel>; which channel a preload API reaches → api:<name>; which globals preloads expose and which members are used where → exposes: (all) or exposes:<global-or-file>; which keys one preload exposes (exposeInMainWorld) → file:<preload>; who defines/uses a window.* global → global:<name>; which scripts a page loads in order → page:<file.html>; where a symbol is defined when several files share the name → symbol:<name>. JS/TS resolution supports tsconfig/jsconfig paths/baseUrl/references, workspace package exports/imports, and TypeScript program membership (imported excluded files inherit the importing config; plain TS require() never joins a program). edgeMode=certain excludes candidate edges; diagnostics explains unresolved modules. Also covers HTML, Vue/Svelte script dependencies, Python, Rust, C/C++, Go/Java/Lua candidates and TS ambient declarations. ' +
+      'Trace dependencies before changing code. Pick target= by question: who breaks if I change a file (run before any refactor) → impact:<path>; what a file imports → file:<path>; how A reaches B → path:<from> -> <to>; where an IPC channel registers/is called → ipc:<channel>; which channel a preload API reaches → api:<name>; which globals preloads expose and which members are used where → exposes: (all) or exposes:<global-or-file>; which keys one preload exposes (exposeInMainWorld) → file:<preload>; who defines/uses a window.* global → global:<name>; which scripts a page loads in order → page:<file.html>; where a symbol is defined when several files share the name → symbol:<name>. JS/TS resolution supports tsconfig/jsconfig paths/baseUrl/references, workspace package exports/imports, and TypeScript program membership (imported excluded files inherit the importing config; plain TS require() never joins a program). edgeMode=certain excludes candidate edges; diagnostics explains unresolved modules. Also covers HTML, Vue/Svelte script dependencies, Python (package roots from pyproject.toml/setup.cfg and src/ layout), Rust, C/C++, Go/Java/Lua candidates and TS ambient declarations. ' +
       'ffi:<name> finds source boundary declarations and PE/ELF/WASM exports as separate evidence, never a verified cross-language call chain. Read-only; dynamic paths and external packages stay unresolved. Optional compile_commands.json resolves C/C++ include flags without executing commands.',
     parameters: {
       target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<from> -> <to>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), symbol:<name>, or ffi:<export-or-declaration-name>.' },

@@ -8,6 +8,7 @@ import type { TraceFileFacts } from './facts.ts'
 import type { ModuleFact } from './module-facts.ts'
 import type { IncludeResolver } from './compile-commands.ts'
 import type { UnresolvedReason } from './trace-evidence.ts'
+import type { PythonRoots } from './python-project.ts'
 import { javaResolver } from './java-resolution.ts'
 import { goResolver } from './go-resolution.ts'
 import { rustResolver } from './rust-resolution.ts'
@@ -28,6 +29,8 @@ export interface SourceContext {
   includeResolver?: IncludeResolver
   /** A workspace index hit its budget; inferences it would have made stop. */
   onLimit?: () => void
+  /** Package roots from pyproject.toml / setup.cfg and layout conventions. */
+  python?: PythonRoots
 }
 
 export const NOT_APPLICABLE: SourceResolution = { status: 'not_applicable' }

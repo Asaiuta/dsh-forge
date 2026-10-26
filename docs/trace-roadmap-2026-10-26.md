@@ -69,6 +69,12 @@ type Resolution =
 | 5 | Lua `package.path` | 仅字面量 `package.path = "..."` 的 `?` 模式 | candidate | 0.5 天 |
 
 - TOML：引入零依赖 `smol-toml`（已确认）。
+
+**P3.1 状态（已完成）**：
+- `python-project.ts`：读取 `pyproject.toml`（setuptools `package-dir` / `packages.find.where`、poetry `packages[].from`、hatch wheel `packages`、pdm `package-dir`、maturin `python-source`）与 `setup.cfg`（`[options] package_dir`、`[options.packages.find] where`）；具名 `package-dir` 映射单个顶层包。
+- 搜索顺序：扫描根 → 具名映射 → 声明根（certain）→ 约定根（candidate：`src/<pkg>/__init__.py`、无显式配置的嵌套工程目录）；同层多根命中记 `ambiguous_target`。
+- 作为 `ProjectContext` 接入缓存；内容哈希进签名，改 pyproject 即失效。
+- 测试：`tests/run-trace-python-project.mjs`。
 - 每项：`tests/run-trace-<lang>-project.mjs`、`eval-trace-real` 回归、与 `js-project` 一致的预算（2000 文件 / 8 MiB）。
 
 ## P4 远期（仅设计）
