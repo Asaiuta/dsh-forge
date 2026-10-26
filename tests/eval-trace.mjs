@@ -209,6 +209,7 @@ const T = {
   mFlag: mark(htmlLines, 'window.ModFlag = 2'),
   meImport: mark(modEntryLines, "from './mod-dep.js'"),
   meGetList: mark(modEntryLines, 'window.chatAPI.getList()'),
+  iModImport: mark(htmlLines, "from './mod-dep.js'"),
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +336,7 @@ const unknown = evaluate('bridge.unknown', [`mystery renderer/app.js:${T.aMyster
 const expectedDeps = [
   `main/handlers.js main/registry-helper.js require:${T.hRequire}`,
   `renderer/app.js renderer/extra.js require:${T.aRequire}`,
+  `renderer/index.html renderer/mod-dep.js import:${T.iModImport}`,
   `renderer/mod-entry.js renderer/mod-dep.js import:${T.meImport}`,
 ]
 const actualDeps = []
@@ -384,7 +386,7 @@ const membershipTruth = [
   'renderer/app.js direct:4',
   'renderer/extra.js member:4',
   'renderer/mod-entry.js direct:7',
-  'renderer/mod-dep.js member:7',
+  'renderer/mod-dep.js member:6',
 ]
 const membershipActual = []
 for (const [rel, pages] of graph.membership) {

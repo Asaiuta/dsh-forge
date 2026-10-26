@@ -4,7 +4,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { AstWorkerPool, astWorkerCount } from '../lib/ast-pool.js'
-import { createFindSymbolTool } from '../lib/tools-symbol.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { definitionsView } from './lib/read-views.mjs'
 const sandbox = fs.mkdtempSync(path.join(tmpdir(), 'forge-workers-'))
 const workers = new AstWorkerPool(), other = new AstWorkerPool()
 const exec = { agent: { session: { header: { cwd: sandbox, id: 'workers' } } } }
@@ -15,7 +16,7 @@ try {
   fs.writeFileSync(path.join(sandbox, '.gitignore'), 'ignored.js\n')
   fs.writeFileSync(path.join(sandbox, 'ignored.js'), 'function A() {}\n')
   for (const [name, content] of [['a.js', '/** A */\r\nfunction A() {}\r\n'], ['b.ts', 'class B {\n A() {}\n}\n']]) fs.writeFileSync(path.join(sandbox, 'src', name), content)
-  const tool = createFindSymbolTool(workers)
+  const tool = definitionsView(createReadTool(workers))
   process.env.DSH_FORGE_AST_WORKERS = '0'
   const sequential = await tool.execute({ name: 'A', limit: 200 }, exec)
   process.env.DSH_FORGE_AST_WORKERS = '2'

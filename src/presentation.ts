@@ -15,7 +15,7 @@ function decode(bytes: Buffer | null): string | null {
 }
 export async function freezePresentation(name: string, args: Record<string, unknown>, value: Record<string, unknown>, exec: ForgeExec,
   provider?: ForgeFileSystem, events: ForgeFsEvents = {}): Promise<ForgePresentation | undefined> {
-  if (!['ffedit', 'ffresolve', 'ffrollback', 'ff_file'].includes(name)) return
+  if (!['ffedit', 'ffrollback', 'ff_file'].includes(name)) return
   const id = Number(value.newBatch ?? value.batch)
   if (!Number.isSafeInteger(id) || id < 1) return
   let root = workdirOf(exec)

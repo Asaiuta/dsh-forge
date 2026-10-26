@@ -4,13 +4,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { applyEditSteps } from '../lib/edit-engine.js'
-import { createEditTool, createResolveTool, createRollbackTool } from '../lib/tools-edit.js'
+import { createEditTool, createRollbackTool } from '../lib/tools-edit.js'
 import { FinderPool } from '../lib/core.js'
 import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
 const sandbox = fs.mkdtempSync(path.join(tmpdir(), 'forge-targets-'))
 process.env.DSH_FORGE_DATA_DIR = path.join(sandbox, 'data')
 const exec = { agent: { session: { header: { cwd: sandbox, id: 'targets' } } }, token: {} }
-const pool = new FinderPool(), edit = createEditTool(pool), resolve = createResolveTool(pool), undo = createRollbackTool(pool)
+const pool = new FinderPool(), edit = createEditTool(pool), resolve = edit, undo = createRollbackTool(pool)
 let passed = 0
 const ok = label => console.log(`ok ${++passed} - ${label}`)
 try {
@@ -33,7 +33,7 @@ try {
   assert.equal(result.status,'ticket');assert.equal(result.candidates.length,2)
   const runtime=Object.create(ToolRuntime.prototype);runtime.canonicalResults=new WeakMap();runtime.concludingExecutions=new WeakSet()
   runtime.createSuccessResult(exec,defineTool(edit),result)
-  const changed=await resolve.execute({ticket:result.ticket,all:true},exec)
+  const changed=await resolve.execute({ticket:result.ticket,choice:'all'},exec)
   assert.equal(changed.status,'applied',changed.error);assert.equal(changed.applied,2)
   runtime.createSuccessResult(exec,defineTool(resolve),changed)
   assert.equal(fs.readFileSync(file,'utf8'),'prefix NEW + NEW suffix\r\n')
@@ -42,18 +42,23 @@ try {
   ok('same-line ambiguity carries exact offsets; all=true applies disjoint candidates and byte rollback')
   fs.writeFileSync(file,'same\nsame\nsame\n')
   const ticket=await edit.execute({path:'same.txt',steps:[{find:'same',replaceWith:'changed'}],reason:'multi'},exec)
-  const selected=await resolve.execute({ticket:ticket.ticket,choices:[0,2]},exec)
+  const selected=await resolve.execute({ticket:ticket.ticket,choice:'0,2'},exec)
   assert.equal(selected.status,'applied',selected.error);assert.equal(fs.readFileSync(file,'utf8'),'changed\nsame\nchanged\n')
   ok('multiple choices replace selected whole-line candidates while preserving the unchosen one')
   fs.writeFileSync(file,'aaaa\n')
   const overlap=await edit.execute({path:'same.txt',steps:[{find:'aa',replaceWith:'x'}],reason:'overlap'},exec)
   assert.equal(overlap.status,'ticket');assert.equal(overlap.candidates.length,3)
-  assert.match((await resolve.execute({ticket:overlap.ticket,all:true},exec)).error,/overlap/)
+  assert.match((await resolve.execute({ticket:overlap.ticket,choice:'all'},exec)).error,/overlap/)
   assert.equal(fs.readFileSync(file,'utf8'),'aaaa\n')
-  assert.match((await resolve.execute({ticket:overlap.ticket,choice:0,all:true},exec)).error,/exactly one/)
+  assert.match((await resolve.execute({ticket:overlap.ticket,choice:'0',all:true},exec)).error,/only \{ticket, choice\}/)
   fs.writeFileSync(file,'aa\n')
   assert.ok((await resolve.execute({ticket:overlap.ticket,choice:0},exec)).error)
   assert.equal(fs.readFileSync(file,'utf8'),'aa\n')
-  ok('overlapping all-selection, conflicting selectors and stale raw-byte identities never write')
+  ok('overlapping all-selection, foreign selector arguments and stale raw-byte identities never write')
+  fs.writeFileSync(file,'keep\n')
+  const modeRefused=await edit.execute({path:'same.txt',steps:[{find:'keep',replaceWith:'gone'}],reason:'mode',mode:'bestEffort'},exec)
+  assert.match(modeRefused.error,/mode is not a parameter/)
+  assert.equal(fs.readFileSync(file,'utf8'),'keep\n')
+  ok('asking for bestEffort is refused instead of half-applying the batch')
   console.log(`${passed} target groups passed`)
 } finally {pool.disposeAll();fs.rmSync(sandbox,{recursive:true,force:true})}

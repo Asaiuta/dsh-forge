@@ -3,7 +3,7 @@
  * Covers: engine step semantics (ops, inference, expect drift, anchors,
  * prefixes, indent shift, overlap/assembly), ledger (blobs, batches, state,
  * external tripwire, rollback/redo), tickets (issue/resolve/expire), and the
- * tool paths (ffedit/ffresolve/ffhistory/ffrollback) end-to-end on temp dirs.
+ * tool paths (ffedit incl. ticket replies / ffhistory / ffrollback) end-to-end.
  *
  * Allows natural shutdown so native handles finish their cleanup on Windows.
  */
@@ -15,8 +15,9 @@ import path from 'node:path'
 import { applyEditSteps } from '../lib/edit-engine.js'
 import { getBlob, putBlob, readKnownState, readLedgerTail, storeFor, workspaceForFile, detectEncoding, encodeText, looksBinary } from '../lib/ledger.js'
 import { createTicket, loadTicket } from '../lib/tickets.js'
-import { createEditTool, createResolveTool, createHistoryTool, createRollbackTool } from '../lib/tools-edit.js'
-import { createReadSymbolTool } from '../lib/tools-symbol.js'
+import { createEditTool, createHistoryTool, createRollbackTool } from '../lib/tools-edit.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { FinderPool } from '../lib/core.js'
 
 process.env.DSH_FORGE_DATA_DIR = mkdtempSync(path.join(tmpdir(), 'forge-edit-data-'))
@@ -24,7 +25,8 @@ const WORK = mkdtempSync(path.join(tmpdir(), 'forge-edit-work-'))
 const pool = new FinderPool()
 const exec = { agent: { session: { header: { cwd: WORK, id: 'sess_test_actor' } } } }
 const edit = createEditTool(pool)
-const resolveTool = createResolveTool(pool)
+// A ticket reply is the same tool: ffedit owns both halves now.
+const resolveTool = edit
 const history = createHistoryTool()
 const rollback = createRollbackTool(pool)
 
@@ -74,7 +76,41 @@ async function main() {
   {
     const r = applyEditSteps('a\nb\nc\n', [{ op: 'insert', after: 1, text: 'i1' }, { op: 'insert', after: 1, text: 'i2' }])
     assert.ok(!r.ok && /same boundary/.test(r.reason), 'duplicate insert boundary rejected')
-    ok('engine: duplicate insert boundary rejected')
+    assert.match(r.reason, /steps 0 and 1/, 'the refusal must name both steps')
+    assert.match(r.reason, /merge them into one insert step/, 'the refusal must name the repair')
+    ok('engine: duplicate insert boundary rejected, naming both steps and the repair')
+  }
+  {
+    // Measured (c90ba7775a15), replayed against the real main.js state read at
+    // the time: six of the block's seven lines matched the file exactly and the
+    // seventh was a truncated quote of a long comment. The refusal said only
+    // "not found" + "did you mean L55 (100%)" — true, but it named where the
+    // block starts rather than where it breaks, and the model re-guessed twice.
+    const r = applyEditSteps('a\n\n    }\n}\n\n\n// 长连接/流式回复不能依赖定时器节流\nlet x = 1;\n', [
+      { op: 'target', find: 'a\n\n    }\n}\n\n\n// 长连接', replaceWith: 'a\n// 长连接' },
+    ])
+    assert.ok(!r.ok, 'a truncated quote is a genuine block, not a match')
+    assert.match(r.reason, /block line 7 vs L7 is a truncated quote/, r.reason)
+    assert.match(r.reason, /长连接\/流式回复不能依赖定时器节流/, 'must quote what the file actually reads, so it can be copied')
+    ok('engine: a truncated quote is refused and diagnosed at the diverging line')
+  }
+  {
+    // Measured (c90ba7775a15), the next attempt: the block assumed the dangling
+    // braces were already gone, so it read a blank where the file still had
+    // "    }" — a stale mental model, not a near miss.
+    const r = applyEditSteps('head\n\n    }\n}\n\n\n// tail\n', [{ op: 'target', find: 'head\n\n\n// tail', replaceWith: 'head\n\n// tail' }])
+    assert.ok(!r.ok, 'a stale block must not match')
+    assert.match(r.reason, /block line 3 vs L3 disagrees about a blank line/, r.reason)
+    assert.match(r.reason, /"    }"/, 'must show the line the file actually has')
+    ok('engine: a stale block is refused and diagnosed as a blank-line disagreement')
+  }
+  {
+    // A one-line probe has no "almost matched" to diagnose: the suggestion list
+    // remains the whole answer, and inventing a divergence would be noise.
+    const r = applyEditSteps('alpha\nbeta\n', [{ op: 'target', find: 'alphax', replaceWith: 'y' }])
+    assert.ok(!r.ok && /not found/.test(r.reason))
+    assert.doesNotMatch(r.reason, /block line/, 'no divergence diagnosis for a single-line probe')
+    ok('engine: a single-line probe gets suggestions, not a divergence diagnosis')
   }
 
   // --- engine: expect drift ---------------------------------------------------
@@ -242,7 +278,36 @@ async function main() {
     ok('ffedit: binary content refused')
   }
 
-  // --- tickets: ambiguity → ffresolve ------------------------------------------
+  // --- single-step sugar (find/replaceWith instead of steps) -------------------
+  {
+    writeFile('sugar.js', 'const value = 1\nkeep\n')
+    const r = await edit.execute({ path: 'sugar.js', find: 'const value = 1', replaceWith: 'const value = 2', reason: 'sugar: single replacement' }, exec)
+    assert.ok(!r.error, `sugar edit failed: ${r.error}`)
+    assert.equal(r.status, 'applied', `sugar applied: ${JSON.stringify(r).slice(0, 200)}`)
+    assert.equal(readFile('sugar.js'), 'const value = 2\nkeep\n', 'sugar replacement landed')
+    ok('ffedit sugar: flat find/replaceWith applies as one target step')
+  }
+  {
+    const both = await edit.execute({ path: 'sugar.js', steps: [{ op: 'target', find: 'keep', replaceWith: 'KEEP' }], find: 'keep', replaceWith: 'K', reason: 'both' }, exec)
+    assert.ok(both.error && /not both/.test(both.error), `mutual exclusion: ${both.error}`)
+    const noReplace = await edit.execute({ path: 'sugar.js', find: 'keep', reason: 'missing replaceWith' }, exec)
+    assert.ok(noReplace.error && /replaceWith is required/.test(noReplace.error), `replaceWith required: ${noReplace.error}`)
+    const noSteps = await edit.execute({ path: 'sugar.js', reason: 'nothing given' }, exec)
+    assert.ok(noSteps.error && /find\/replaceWith pair/.test(noSteps.error), `steps-or-sugar error: ${noSteps.error}`)
+    ok('ffedit sugar: mutual exclusion and required-field errors are structured')
+  }
+  {
+    // Sugar goes through the same governance: ambiguity signs a ticket.
+    writeFile('sugar-twins.js', 'return "x";\nfiller\nreturn "x";\n')
+    const r = await edit.execute({ path: 'sugar-twins.js', find: 'return "x";', replaceWith: 'return "y";', reason: 'sugar ambiguous' }, exec)
+    assert.equal(r.status, 'ticket', 'sugar ambiguity signs a ticket like steps do')
+    const done = await resolveTool.execute({ ticket: r.ticket, choice: 0 }, exec)
+    assert.equal(done.status, 'applied', 'ticket from sugar resolves')
+    assert.equal(readFile('sugar-twins.js'), 'return "y";\nfiller\nreturn "x";\n')
+    ok('ffedit sugar: ambiguous shorthand enters the ticket path unchanged')
+  }
+
+  // --- tickets: ambiguity → ffedit {ticket, choice} ----------------------------
   let ticketId = null
   {
     writeFile('dup.js', 'function dup() {}\nmarker\nfunction dup() {}\n')
@@ -263,7 +328,7 @@ async function main() {
     const out = readFile('dup.js')
     assert.equal(out.split('function unique() {}').length - 1, 1, 'exactly the chosen occurrence replaced')
     assert.ok(!existsSync(path.join(process.env.DSH_FORGE_DATA_DIR, 'tickets', `${ticketId}.json`)), 'ticket consumed on success')
-    ok('ffresolve: chosen candidate applied, ticket consumed')
+    ok('ffedit ticket reply: chosen candidate applied, ticket consumed')
   }
   {
     // ticket invalidation: the chosen candidate moves away but the target
@@ -280,7 +345,7 @@ async function main() {
     const fin = await resolveTool.execute({ ticket: res.ticket, choice: 1 }, exec)
     assert.equal(fin.status, 'applied')
     assert.equal(readFile('moved.js'), 'other\ntarget1\nCHANGED\n')
-    ok('ffresolve: moved candidate invalidates and re-issues (forge contract)')
+    ok('ffedit ticket reply: moved candidate invalidates and re-issues')
   }
   {
     // target gone entirely → clean error, no write
@@ -367,7 +432,7 @@ async function main() {
 
   // --- identity perturbation: same-name reorder vs content anchors (A.1) ----
   {
-    const readSymbol = createReadSymbolTool()
+    const readSymbol = symbolReader(createReadTool)
     writeFile('twins.js', 'function resolve() {\n  return "first";\n}\n\nfunction resolve() {\n  return "second";\n}\n')
     const read1 = await readSymbol.execute({ path: 'twins.js', symbol: 'resolve', occurrence: 1 }, exec)
     assert.match(read1.text, /"first"/, 'occurrence=1 reads the first declaration')
@@ -409,6 +474,50 @@ async function main() {
     assert.doesNotMatch(readFileSync(file('same.js'), 'utf8'), /"y"/)
     rmSync(file('same.js'), { force: true })
     ok('identity perturbation: identical twins ticket the edit instead of guessing')
+  }
+  {
+    // The diagnosis has to survive the tool's failure rendering, which is what
+    // the model actually reads (it prefixes step index/op and appends the
+    // suggestions). Pin it end to end on the measured shape.
+    writeFile('diagnose.js', 'a\n\n    }\n}\n\n\n// 长连接/流式回复不能依赖定时器节流\nlet x = 1;\n')
+    const refused = await edit.execute({
+      path: 'diagnose.js',
+      steps: [{ find: 'a\n\n    }\n}\n\n\n// 长连接', replaceWith: 'a\n// 长连接' }],
+      reason: 'stale-quote',
+    }, exec)
+    assert.ok(refused.error, `expected a refusal: ${JSON.stringify(refused).slice(0, 160)}`)
+    assert.match(refused.error, /block line 7 vs L7 is a truncated quote/, refused.error)
+    assert.match(refused.error, /did you mean L1/, 'the suggestion still points at the block\'s first line, which is why the diagnosis is needed')
+    assert.equal(readFile('diagnose.js'), 'a\n\n    }\n}\n\n\n// 长连接/流式回复不能依赖定时器节流\nlet x = 1;\n', 'a refused edit writes nothing')
+    rmSync(file('diagnose.js'), { force: true })
+    ok('ffedit surfaces the divergence diagnosis in the error the model reads')
+  }
+
+  {
+    // DSH refuses a mutation whose target this session has not observed
+    // (`fs/write-intent`). ffedit planned from a bare readFileSync, which
+    // publishes nothing — the same exposure ff_file had. The planning read of an
+    // existing file must go through the host channel; a create has nothing to
+    // observe and must not require one.
+    const observed = []
+    const observing = {
+      ...exec,
+      beginNativeRead: async (target) => {
+        observed.push(path.basename(target))
+        return { path: target, finish: async () => {} }
+      },
+    }
+    writeFile('observed.js', 'const one = 1;\n')
+    observed.length = 0
+    const edited = await edit.execute({ path: 'observed.js', steps: [{ find: 'const one = 1;', replaceWith: 'const one = 2;' }], reason: 'observe' }, observing)
+    assert.ok(edited.batch, `edit should commit: ${JSON.stringify(edited).slice(0, 120)}`)
+    assert.deepEqual(observed, ['observed.js'], 'an edit observes the file it plans from')
+    assert.match(readFile('observed.js'), /const one = 2;/)
+    observed.length = 0
+    const created = await edit.execute({ path: 'fresh.js', steps: [{ after: 0, text: 'const fresh = 1;' }], reason: 'observe-create' }, observing)
+    assert.ok(created.batch, `insert-create should commit: ${JSON.stringify(created).slice(0, 120)}`)
+    assert.deepEqual(observed, [], 'a create reads nothing, so it observes nothing')
+    ok('ffedit observes an existing target through the host before committing')
   }
 
   await cleanup()

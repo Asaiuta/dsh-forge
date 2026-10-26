@@ -23,14 +23,16 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "docs/DESIGN.md",
     "LICENSE"
   ],
   "scripts": {
     "prepare": "node build.mjs",
     "build": "node build.mjs",
+    "build:indexer": "node scripts/build-indexer.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "pnpm run typecheck && pnpm run build",
-    "test": "node tests/run-mount.mjs && node tests/run-tools.mjs && node tests/run-read.mjs && node tests/run-trace.mjs && node tests/eval-trace.mjs && node tests/eval-trace-real.mjs && node tests/run-ast.mjs && node tests/run-edit.mjs && node tests/eval-quality.mjs && node tests/eval-ast.mjs && node tests/eval-edit.mjs && node tests/eval-task.mjs && node tests/eval-coverage.mjs && node tests/run-regressions.mjs && node tests/run-projects.mjs && node tests/run-files.mjs && node tests/run-workers.mjs && node tests/run-languages.mjs && node tests/run-targets.mjs && node tests/run-review-regressions.mjs && node tests/run-host-integration.mjs",
+    "test": "node tests/run-mount.mjs && node tests/run-registration.mjs && node tests/run-prewarm.mjs && node tests/run-overlay.mjs && node tests/run-indexer-fallback.mjs && node tests/run-tools.mjs && node tests/run-absence.mjs && node tests/run-read.mjs && node tests/run-cards.mjs && node tests/run-distill.mjs && node tests/run-trace.mjs && node tests/run-trace-cache.mjs && node tests/run-trace-languages.mjs && node tests/run-trace-packages.mjs && node tests/run-trace-native.mjs && node tests/run-trace-semantic.mjs && node tests/run-trace-projects.mjs && node tests/run-trace-analysis.mjs && node tests/eval-trace.mjs && node tests/eval-trace-real.mjs && node tests/run-ast.mjs && node tests/run-edit.mjs && node tests/eval-quality.mjs && node tests/eval-ast.mjs && node tests/eval-edit.mjs && node tests/eval-task.mjs && node tests/eval-coverage.mjs && node tests/run-regressions.mjs && node tests/run-files.mjs && node tests/run-workers.mjs && node tests/run-languages.mjs && node tests/run-targets.mjs && node tests/run-review-regressions.mjs && node tests/run-host-integration.mjs",
     "bench": "node tests/bench.mjs"
   },
   "engines": {
@@ -38,10 +40,12 @@
     "dsh": ">=0.2.0-rc.2 <0.3.0"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.5",
     "@ff-labs/fff-node": "0.11.0",
+    "@tree-sitter-grammars/tree-sitter-lua": "0.4.1",
+    "ignore": "7.0.5",
     "tree-sitter-wasms": "0.1.13",
-    "web-tree-sitter": "0.25.0",
-    "ignore": "7.0.5"
+    "web-tree-sitter": "0.25.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1-rc.1",

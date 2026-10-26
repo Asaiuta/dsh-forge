@@ -1,7 +1,7 @@
 /**
  * dsh-forge ambiguity tickets (stage 3). When a target step matches several
  * locations, ffedit does NOT guess: it signs a ticket holding the full batch
- * payload plus annotated candidates, and the model answers with ffresolve
+ * payload plus annotated candidates, and the model answers by resending ffedit
  * carrying only the ticket id and a choice index — no content re-send.
  *
  * Persistence decision (user): tickets live under ~/.dsh/forge/tickets/ as
@@ -21,7 +21,6 @@ import { randomUUID } from 'node:crypto'
 import { dataDir } from './core.ts'
 import { atomicWrite } from './ledger.ts'
 import type { EditStep, StepCandidate } from './edit-engine.ts'
-import type { ProjectLink } from './project-model.ts'
 
 export const TICKET_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -35,17 +34,17 @@ export interface TicketCandidate extends StepCandidate {
   preview: string
 }
 
-export interface TicketPayload extends Partial<ProjectLink> {
+export interface TicketPayload {
   /** Absolute file path the batch targets. */
   file: string
-  /** The full original step list (unchanged — ffresolve replays it). */
+  /** The full original step list (unchanged — a ticket reply replays it). */
   steps: EditStep[]
   /** Index of the ambiguous target step. */
   stepIndex: number
   candidates: TicketCandidate[]
   reason: string
   mode: 'atomic'
-  /** Persisted so ffresolve replay keeps the refusal policy of the original call. */
+  /** Persisted so a ticket replay keeps the refusal policy of the original call. */
   revertOnSyntaxError?: boolean
   /** Bind the whole original snapshot; choices cannot silently retarget. */
   sourceHash: string

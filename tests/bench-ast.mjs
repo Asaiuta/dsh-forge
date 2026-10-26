@@ -7,9 +7,9 @@
  * (3) the grep→symbol weld overhead on a 30-hit page.
  *
  * Floors (asserted, exit 1 on miss):
- *   A1  warm ff_outline p50 < 20 ms on a ≥50 KB file
- *   A2  ff_find_symbol cold scan < 60 s over the corpus
- *   A3  ff_find_symbol warm p50 < 1 s
+ *   A1  warm view=outline p50 < 20 ms on a ≥50 KB file
+ *   A2  view=definitions cold scan < 60 s over the corpus
+ *   A3  view=definitions warm p50 < 1 s
  *   A4  ffgrep enclosing:true delta vs plain < 150 ms p50 (30-hit page)
  */
 
@@ -18,7 +18,8 @@ import { readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
 import { createGrepTool } from '../lib/tools.js'
-import { createOutlineTool, createFindSymbolTool } from '../lib/tools-symbol.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { outlineView, definitionsView } from './lib/read-views.mjs'
 import { localEnv } from '../scripts/local-env.mjs'
 
 const CORPUS = localEnv('DSH_FORGE_BENCH_CORPUS') ?? localEnv('DSH_FORGE_DSH_MODULES', { required: true })
@@ -63,8 +64,8 @@ function fileClosestTo(root, target, depth = 3) {
 async function main() {
   const pool = new FinderPool()
   const exec = { agent: { session: { header: { cwd: CORPUS } } } }
-  const outline = createOutlineTool()
-  const findSymbol = createFindSymbolTool()
+  const outline = outlineView(createReadTool())
+  const findSymbol = definitionsView(createReadTool())
   const grep = createGrepTool(pool)
 
   // --- A1: warm outline on a representative ~200KB file --------------------

@@ -3,7 +3,7 @@
  * prompt-surface.mjs (which captures DSH's real native + PTC projections).
  *
  * Scope covered (superset of the earlier ad-hoc script):
- *   1. native       — JSON.stringify(schemaOf(...)) for all 15 tools
+ *   1. native       — JSON.stringify(schemaOf(...)) for all registered tools
  *   2. ptcTypescript— renderToolsSdk(outputs)  minus empty-preamble
  *   3. ptcPython    — renderToolsSdkPy(outputs) minus empty-preamble
  *   + per-tool marginal cost in each projection
@@ -114,17 +114,17 @@ try {
   const sum = (k) => rows.reduce((a, r) => a + r[k], 0)
   console.log('  ' + '-'.repeat(78))
   console.log(
-    '  ' + 'SUM(15 tools)'.padEnd(15) + fmt(sum('descTok')) + fmt(sum('paramTok')) +
+    '  ' + `SUM(${rows.length} tools)`.padEnd(15) + fmt(sum('descTok')) + fmt(sum('paramTok')) +
     fmt(sum('nativeTok')) + fmt(sum('tsTok')) + fmt(sum('pyTok')) +
     String(sum('blank')).padStart(7),
   )
 
-  console.log('\n--- 投影总量（模型每轮实际收到的文本）---')
-  console.log(`  native  (JSON schema array)  : ${tc(nativeAll)} tok (cl100k) / ${to(nativeAll)} (o200k)   ${bytes(nativeAll)} B  [15 工具]`)
+  console.log('\n--- 离线工具投影总量（不含完整宿主提示及运行时作用域）---')
+  console.log(`  native  (JSON schema array)  : ${tc(nativeAll)} tok (cl100k) / ${to(nativeAll)} (o200k)   ${bytes(nativeAll)} B  [${rows.length} 工具]`)
   console.log(`  ptcTypescript (SDK 源码投影) : ${tc(tsAll) - emptyTsTok} tok (cl100k) / ${to(tsAll) - to(emptyTs)} (o200k)   ${bytes(tsAll) - emptyTsLen} B`)
   console.log(`  ptcPython    (SDK 源码投影)  : ${tc(pyAll) - emptyPyTok} tok (cl100k) / ${to(pyAll) - to(emptyPy)} (o200k)   ${bytes(pyAll) - emptyPyLen} B`)
   console.log(`  forge-status 命令            : ${cmdTok} tok (cl100k)`)
-  console.log(`  旧 bytes/4 估算(native)      : ${Math.ceil(bytes(nativeAll) / 4)}  → 真实 ${tc(nativeAll)}，低估 ${tc(nativeAll) - Math.ceil(bytes(nativeAll) / 4)} (${Math.round((tc(nativeAll) / Math.ceil(bytes(nativeAll) / 4) - 1) * 100)}%)`)
+  console.log(`  bytes/4 估算(native)         : ${Math.ceil(bytes(nativeAll) / 4)}  → cl100k ${tc(nativeAll)}`)
 
   console.log('\n--- 结构拆分（native 视角）---')
   console.log(`  description 正文合计 : ${sum('descTok')} tok`)

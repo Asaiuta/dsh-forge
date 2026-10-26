@@ -11,16 +11,18 @@ import { writeFileSync, rmSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
 import { createGrepTool } from '../lib/tools.js'
-import { createOutlineTool, createFindSymbolTool, createReadSymbolTool } from '../lib/tools-symbol.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { outlineView, definitionsView } from './lib/read-views.mjs'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { parseFile, flattenSymbols } from '../lib/ast.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
 
 const truth = buildFixture()
 const pool = new FinderPool()
 const exec = { agent: { session: { header: { cwd: FIXTURE_DIR } } } }
-const outline = createOutlineTool()
-const findSymbolTool = createFindSymbolTool()
-const readSymbol = createReadSymbolTool()
+const outline = outlineView(createReadTool())
+const findSymbolTool = definitionsView(createReadTool())
+const readSymbol = symbolReader(createReadTool)
 const grep = createGrepTool(pool)
 
 let floors = 0

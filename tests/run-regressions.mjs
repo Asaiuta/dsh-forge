@@ -8,9 +8,11 @@ import { syncBuiltinESMExports } from 'node:module'
 import { spawnSync } from 'node:child_process'
 import { apply } from '../lib/index.js'
 import { FinderPool, withFileLock } from '../lib/core.js'
-import { createEditTool, createResolveTool, createRollbackTool, createHistoryTool } from '../lib/tools-edit.js'
+import { createEditTool, createRollbackTool, createHistoryTool } from '../lib/tools-edit.js'
 import { createGrepTool, createFindTool } from '../lib/tools.js'
-import { createFindSymbolTool, createOutlineTool, createReadSymbolTool } from '../lib/tools-symbol.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { outlineView, definitionsView } from './lib/read-views.mjs'
+import { singleSymbolView } from './lib/symbol-read.mjs'
 import { parseFile, flattenSymbols } from '../lib/ast.js'
 import { storeFor, putBlob, getBlob, commitFiles, readLedgerTail, recoverStore, recordBatch, referencedBlobIds, gcStoreBlobs, purgeStore } from '../lib/ledger.js'
 import { loadTicket } from '../lib/tickets.js'
@@ -23,7 +25,7 @@ fs.mkdirSync(work)
 process.env.DSH_FORGE_DATA_DIR = path.join(sandbox, '.dsh', 'forge')
 const exec = { agent: { session: { header: { cwd: work, id: 'regression' } } }, token: {} }
 const pool = new FinderPool()
-const edit = createEditTool(pool), resolve = createResolveTool(pool), rollback = createRollbackTool(pool)
+const edit = createEditTool(pool), resolve = edit, rollback = createRollbackTool(pool)
 const store = storeFor(work)
 let passed = 0
 const ok = name => console.log(`ok ${++passed} - ${name}`)
@@ -44,8 +46,8 @@ async function main() {
     tools: { register(def) { definitions.push(def) } }, commands: { register(def) { assert.equal(def.name, 'forge-status') } } })) {
     assert.equal(typeof disposable === 'function' || disposable === undefined || disposable === null, true)
   }
-  assert.equal(definitions.length, 15)
-  assert.deepEqual(new Set(definitions.map(d => d.name)), new Set(['ffgrep','fffind','fff_multi_grep','ff_outline','ff_find_symbol','ff_read_symbol','ffedit','ffresolve','ffhistory','ffrollback','ff_project','ff_diff','ff_file','ff_read','fftrace']))
+  assert.equal(definitions.length, 9)
+  assert.deepEqual(new Set(definitions.map(d => d.name)), new Set(['ffgrep','fffind','ffedit','ffhistory','ffrollback','ff_file','ff_read','fftrace','ff_cards']))
   ok('plugin mounts every tool through the installed SDK')
   async function call(name, args) {
     const def = definitions.find(d => d.name === name)
@@ -57,40 +59,40 @@ async function main() {
   }
   put('one.js', 'function One() {}\nfunction Two() {}\n')
   for (const [name,args] of [
-    ['ffgrep',{pattern:'One',enclosing:true}],['fffind',{pattern:'one.js'}],['fff_multi_grep',{patterns:['One','Two']}],
-    ['ff_outline',{path:'one.js'}],['ff_find_symbol',{name:'One'}],['ff_read_symbol',{path:'one.js',symbol:'One'}],
+    ['ffgrep',{pattern:'One',enclosing:true}],['fffind',{pattern:'one.js'}],['ffgrep',{patterns:['One','Two']}],
+    ['ff_read',{view:'outline',path:'one.js'}],['ff_read',{view:'definitions',symbol:'One'}],['ff_read',{path:'one.js',symbol:'One'}],
     ['ffedit',{path:'one.js',steps:[{start:1,text:'function Uno() {}'}],reason:'host'}],['ffhistory',{}],
     ['ffrollback',{batch:'last',reason:'host'}],['ffrollback',{batch:'last',reason:'host',dryRun:false}],
     ['ffedit',{path:'one.js',steps:[{start:1,text:'function One() {}'}],reason:'no-op'}],
   ]) await call(name,args)
   ok('SDK materializes search/symbol/edit/history/rollback and no-op outputs')
-  for (const [name,args] of [['ffgrep',{pattern:''}],['ff_outline',{path:'missing.txt'}],['ffedit',{path:'one.js',steps:[{start:1,text:'x'}],reason:''}],['ffresolve',{ticket:'bad',choice:0}]]) {
+  for (const [name,args] of [['ffgrep',{pattern:''}],['ff_read',{view:'outline',path:'missing.txt'}],['ffedit',{path:'one.js',steps:[{start:1,text:'x'}],reason:''}],['ffedit',{ticket:'bad',choice:'0'}]]) {
     await assert.rejects(() => definitions.find(d => d.name === name).execute(args,exec))
   }
   ok('tool failures use the SDK exception channel')
   put('dup.txt','A\nB\nA\nB\n')
   const ticket = await call('ffedit',{path:'dup.txt',steps:[{find:'A',replaceWith:'AA'},{find:'B',replaceWith:'BB'}],reason:'multiple'})
-  const next = await call('ffresolve',{ticket:ticket.ticket,choice:0})
+  const next = await call('ffedit',{ticket:ticket.ticket,choice:'0'})
   assert.equal(next.status,'ticket'); assert.equal(loadTicket(next.ticket).decisions.length,1)
-  const done = await call('ffresolve',{ticket:next.ticket,choice:1})
+  const done = await call('ffedit',{ticket:next.ticket,choice:'1'})
   assert.equal(done.status,'applied'); assert.equal(read('dup.txt'),'AA\nB\nA\nBB\n')
   ok('multiple ambiguity decisions persist and SDK validates both ticket and resolved result')
   put('stale.txt','TARGET\nother\nTARGET\n')
   const stale = await edit.execute({path:'stale.txt',steps:[{find:'TARGET',replaceWith:'PLUGIN'}],reason:'stale'},exec)
   put('stale.txt','other\nTARGET\n')
-  const refused = await resolve.execute({ticket:stale.ticket,choice:0},exec)
+  const refused = await resolve.execute({ticket:stale.ticket,choice:'0'},exec)
   assert.ok(refused.error); assert.equal(read('stale.txt'),'other\nTARGET\n')
   ok('stale ticket cannot retarget the remaining unique occurrence')
   put('simultaneous.txt','A\nA\n')
   const simultaneous=await edit.execute({path:'simultaneous.txt',steps:[{find:'A',replaceWith:'B'}],reason:'one decision'},exec)
-  const choices=await Promise.all([resolve.execute({ticket:simultaneous.ticket,choice:0},exec),resolve.execute({ticket:simultaneous.ticket,choice:1},exec)])
+  const choices=await Promise.all([resolve.execute({ticket:simultaneous.ticket,choice:'0'},exec),resolve.execute({ticket:simultaneous.ticket,choice:'1'},exec)])
   assert.equal(choices.filter(r=>r.status==='applied').length,1);assert.equal(choices.filter(r=>r.error).length,1)
   assert.equal(read('simultaneous.txt'),'B\nA\n')
   ok('concurrent resolution consumes a ticket once')
   put('restart.txt','A\nA\n')
   const restart=await edit.execute({path:'restart.txt',steps:[{find:'A',replaceWith:'B'}],reason:'restart'},exec)
-  const restartCode=`import {createResolveTool} from ${JSON.stringify(new URL('../lib/tools-edit.js',import.meta.url).href)};
-    const result=await createResolveTool({peekMain(){return null}}).execute(${JSON.stringify({ticket:restart.ticket,choice:1})},${JSON.stringify(exec)});
+  const restartCode=`import {createEditTool} from ${JSON.stringify(new URL('../lib/tools-edit.js',import.meta.url).href)};
+    const result=await createEditTool({peekMain(){return null}}).execute(${JSON.stringify({ticket:restart.ticket,choice:'1'})},${JSON.stringify(exec)});
     if(result.status!=='applied')throw Error(JSON.stringify(result));`
   const restarted=spawnSync(process.execPath,['--input-type=module','-e',restartCode],{encoding:'utf8',timeout:30000})
   assert.equal(restarted.status,0,restarted.stderr);assert.equal(read('restart.txt'),'A\nB\n')
@@ -256,14 +258,14 @@ async function main() {
   }
   ok('AST preserves function/class scope, nested arrows, Rust modules and Go generic receivers')
   put('comments.py','# detached\n\n@decorator\ndef decorated():\n    pass\n')
-  const comment=await createOutlineTool().execute({path:'comments.py'},exec)
+  const comment=await outlineView(createReadTool()).execute({path:'comments.py'},exec)
   assert.equal(comment.items[0].startLine,3);assert.equal(comment.items[0].commentStartLine,undefined)
-  assert.match((await createReadSymbolTool().execute({path:'comments.py',symbol:'decorated'},exec)).text,/^@decorator/)
+  assert.match(singleSymbolView(await createReadTool().execute({path:'comments.py',symbol:'decorated'},exec)).text,/^@decorator/)
   ok('comments require adjacency and decorated reads include the decorator')
   put('.gitignore','secret/\nignored/*.js\n!ignored/keep.js\n')
   put('secret/private.js','function Secret(){}');put('ignored/drop.js','function Drop(){}');put('ignored/keep.js','function Keep(){}')
   put('nested/.gitignore','hidden.js\n');put('nested/hidden.js','function Hidden(){}')
-  const find=createFindSymbolTool()
+  const find=definitionsView(createReadTool())
   for(const name of ['Secret','Drop','Hidden'])assert.equal((await find.execute({name},exec)).items.length,0)
   assert.equal((await find.execute({name:'Keep'},exec)).items.length,1)
   ok('symbol walks honor root/nested gitignore and negated files')

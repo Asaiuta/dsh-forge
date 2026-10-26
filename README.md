@@ -1,197 +1,281 @@
 # dsh-forge
 
-DSH（DeepSeek Harness）的 FFF 检索 + 施工治理插件。把 [fff](https://github.com/dmtrKovalenko/fff)（Rust 原生、SIMD 加速、带跨会话 frecency 的搜索引擎）接成 DSH agent 工具，提供容错编辑、快照回退与 reason/actor 台账，并沿用 DSH 的会话文件策略、观察策略和文件锁。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%5E22.19%20%7C%7C%20%3E%3D24-brightgreen.svg)](https://nodejs.org)
+[![DeepSeek Harness](https://img.shields.io/badge/DSH-Plugin-orange.svg)](https://github.com/deepseek-ai)
 
-当前提供 15 个工具：FFF 检索、11 语言 AST 符号、持久化工程与任务、容错编辑、文件/代码搬移、快照历史/diff、节点与时间点回退、统一寻址批量读、链路图 Trace。工程状态与文件批次共用一份台账，并接入 DSH 本机文件策略和 diff 卡片。
+**dsh-forge** 是专为 **DSH (DeepSeek Harness)** 打造的高性能检索与施工治理扩展插件。
 
-目标是适配 DSH。ProjectForge 作为包外行为与性能参考，不是要复制的产品规范：VCPChat 的 preload registry、角色表、工程/Git 面板和多模态批量读取不直接迁入。图片交给 DSH 的内建读取/附件工具；Trace 默认只读静态源码，可显式提供 JSON 声明数据。内部的可行性调研、逐轮验收报告与 ProjectForge 对照脚本不随源码分发。
+它将 [fff](https://github.com/dmtrKovalenko/fff)（基于 Rust 开发、SIMD 加速、支持跨会话热度学习的搜索引擎）无缝接入 DSH 工具系统，结合多语言 AST 符号提取能力与工业级容错编辑引擎，为 AI 编程 Agent 提供“找得快、看得准、改得稳”的端到端开发体验。
 
-## Rust 在哪里，DSH 能否使用
+---
 
-**dsh-forge 本身是 TypeScript 插件；Rust 实现在第三方 FFF 依赖中。** 安装时下载适合本机平台的预编译库，所以本项目 `src/` 没有 `.rs` 文件。当前各层实际使用的技术如下：
+## 核心特性
 
-| 层 | 实现 | 源码 / 运行文件 |
+- ⚡ **极速检索（L0/L1）**：集成 Rust 原生 FFF 检索内核，提供文件名模糊搜索（支持拼写纠错与 frecency 排序）、路径模式匹配与高速文本检索（支持 Aho-Corasick 多词扫描与行符号标注）。
+- 🧭 **精准符号定位（L2）**：基于 Tree-sitter WASM 覆盖 11 种主流源码语言的大纲分析、定义查找与跨会话读取，大幅降低阅读整个文件对模型 Token 的消耗。
+- 🛠️ **容错编辑引擎（L3）**：提供支持行号漂移校正、首尾行锚定、行内/块模糊匹配的多步编辑能力，写前检测语法合法性，支持歧义票据决议。
+- 📜 **快照历史与治理台账**：所有写操作强制关联原因（reason）与执行者（actor），内置内容寻址的增量快照库，支持批次/节点/时间点安全回退，工作区零侵入。
+- 🧠 **Agent 任务感知**：内置优化过的系统提示词路由（System Prompt Guidance），引导模型“按开发意图选工具”，实现更自然的工具调用习惯。
+- 🪞 **写后即可搜**：工具自己写过的文件（`ffedit` / `ff_file` / 回滚）在 15 秒内以**刚写入的字节**为准作答，压过还没追上来的索引。否则"改完立刻搜"会拿到改动前的旧内容：5.8k 文件实测，新建文件后立刻搜索返回 **0 命中**，覆盖写入后仍在返回已删除的符号。命中来源会在 note 里标明，不会让新答案伪装成索引答案。
+- 🗂️ **知识卡片沉淀**：施工台账的跨批次确定性蒸馏（零模型）：`overview`（总量 + reason 分布）、`hotspot`（热点文件）、`timeline`（近 14 天）、`structure`（近期文件的符号骨架）四张缓存卡，锚定台账游标与文件 stat 签名，动过即自动重建；模型润色层（阶段二）压在这组骨架上，骨架即回退。
+
+---
+
+## 架构概览
+
+dsh-forge 采用轻量化分层架构，运行时无需在本地安装 `cargo` 或 `rustc` 编译环境：
+
+| 层次 | 功能职责 | 实现技术 | 核心模块 / 依赖 |
+|---|---|---|---|
+| **工具接入与治理** | DSH 工具注册、施工台账、会话策略适配 | TypeScript (Node.js) | `src/index.ts`, `src/ledger.ts`, `src/tools-*.ts` |
+| **底层全文检索** | 快速路径检索、全文 Grep、跨会话热度模型 | Rust 原生动态库 (FFF) | `@ff-labs/fff-node` + 预编译 `fff_c` 动态链接库 |
+| **AST 符号解析** | 11 种语言的符号提取、代码大纲、精确定义定位 | WebAssembly (WASM) | `web-tree-sitter` + `tree-sitter-wasms` |
+| **容错编辑引擎** | 漂移校正、快照坐标对齐、歧义票据处理 | 纯 TypeScript 算法 | `src/edit-engine.ts` |
+
+---
+
+## 工具列表 (9 个核心工具)
+
+| 工具名 | 层级 | 功能简介 | 常见使用场景 |
+|---|---|---|---|
+| `fffind` | L0 发现 | 找文件，两种模式：`mode=name`（默认）文件名模糊搜索，容错拼写，基于匹配分与访问频率综合排序；`mode=glob` 路径 Glob 匹配（npm-glob 语法、gitignore 感知、按页分页），返回纯文件路径列表。两种模式都只返回**文件**。 | 知道大致文件名时用 `mode=name`；批量列举特定目录结构或文件类型时用 `mode=glob`。 |
+| `ffgrep` | L1 检索 | 高速文本内容搜索（支持 plain/regex/fuzzy），支持 Aho-Corasick 多字面量批量扫描；开启 `enclosing: true` 可同时返回命中行所在的代码符号。 | 查找关键字、配置名或调用点，支持快速定位外层函数。 |
+| `ff_read` | L2 符号 / 寻址 | 统一读取，三种视图：`view=body`（默认）按行区间（`lines=L10-20`）、符号名（`path#Symbol`）、批量路径或 Glob 模式读取正文；`view=outline` 解析单文件 AST，给出类/函数/接口/结构体的定义与起止行区间；`view=definitions` 全局符号定义查找（支持限定名与 Rust `::` 路径），覆盖 11 种语言。均支持按序号消除同名定义歧义。三个视图的参数互不通用：传了别的视图才有的参数会**直接报错并指路**，不再静默忽略。 | 了解新模块架构时优先 `view=outline`（省 Token、无需读全文件）；已知名字时 `view=definitions` 定位定义；再 `view=body` 精确读实现。 |
+| `fftrace` | L2 链路 | 静态分析 JS/TS/HTML 模块、IPC、全局、Rust/Python/C/C++/Go/Java/Lua 文件关系；提供影响分析、最短路径，以及源码 FFI 声明和 PE/ELF/WASM 导出元数据。 | `file:路径` 查直接引用，`impact:路径` 查传递影响，`path:源 -> 目标` 解释文件依赖，`exposes:名称` 查 preload 暴露的全局与逐键使用点，`symbol:名称` 查同名符号的全部定义，`ffi:名称` 查原生边界证据。 |
+| `ffedit` | L3 施工 | 工业级容错多步行级编辑工具：自动基于快照坐标合并修改、支持 ±20 行锚点漂移校正、自动识别首尾锚点；写前可选语法校验拦截。定位命中多处时**不猜**：写入零字节、签一张票据，用同一工具回传 `{ticket, choice}` 决议。 | 对代码进行精准、安全的单处或多处修改；含歧义决议。 |
+| `ff_file` | L3 施工 | 高级文件操作：创建、删除、移动文件，或进行符号级/行块级的代码迁移；支持四种落点锚定并自动校正代码缩进。 | 重构、函数搬移或跨文件模块拆分。 |
+| `ffhistory` | L3 治理 | 施工台账与快照差异检索：查询修改记录（谁在何时因何原因改动了哪些文件），支持直接获取不可变快照 diff。 | 审查 Agent 修改历史、排查改动来源。 |
+| `ffrollback` | L3 治理 | 安全回滚工具：支持按批次、节点或时间点还原文件状态；回滚操作本身生成新批次，支持二次重做。 | 代码改错或测试失败时一键安全复原。 |
+| `ff_cards` | L3 治理 | 知识卡片（沉淀层）：把施工台账确定性蒸馏成四张卡——`overview`（总量与 reason 分布）、`hotspot`（热点文件）、`timeline`（近 14 天）、`structure`（近期文件的符号骨架）。无参数列目录，`card=<name>` 读正文；台账锚或被覆盖文件变动时自动重建。骨架可经 `{polish: "<name>", content: "<润色稿>"}` 升级为可读卡（有限引用校验后缓存，标记模型来源）。 | 新会话快速掌握"这个项目最近在施工什么、改在哪儿"；台账越多越有用。 |
+
+*AST 支持的 11 种语言*：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python（含 PYI）、Rust、Go、C、C++、Java、C#、Lua。
+
+---
+
+## 快速安装与配置
+
+### 1. 安装插件至 DSH (以桌面版为例)
+
+1. 在 DSH 配置文件 `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 中添加依赖：
+   ```json
+   {
+     "dependencies": {
+       "dsh-forge": "link:<dsh-forge 仓库的本地绝对路径>"
+     }
+   }
+   ```
+2. 在该配置文件的 `dsh.profile.bundles` 数组中追加 `"dsh-forge"`：
+   ```json
+   {
+     "dsh": {
+       "profile": {
+         "bundles": [
+           "...",
+           "dsh-forge"
+         ]
+       }
+     }
+   }
+   ```
+3. 在配置目录执行依赖安装：
+   ```bash
+   pnpm -C ~/.dsh/profiles/desktop install
+   ```
+4. 重启 DeepSeek Harness 即可生效。
+
+### 2. 环境变量配置（可选）
+
+dsh-forge 在常规使用下开箱即用，无需特殊配置。如需调整缓存路径或性能参数，可配置以下环境变量：
+
+| 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| DSH 工具注册、编辑与治理 | 本项目 TypeScript | `src/index.ts`、`src/tools-edit.ts`、`src/ledger.ts` 等 |
-| FFF 文件与内容检索 | 上游 Rust 原生库 | `@ff-labs/fff-bin-win32-x64@0.11.0/fff_c.dll`；上游 `crates/fff-core/src/`、`crates/fff-c/src/lib.rs` |
-| Node → Rust 桥接 | `@ff-labs/fff-node@0.11.0` + `ffi-rs@1.3.7` | JS SDK → N-API `.node` 桥 → C ABI DLL |
-| AST 符号解析 | `web-tree-sitter@0.25.0` + WASM 语法 | `src/ast.ts`；当前不是原生 Rust AST 后端 |
+| `DSH_FORGE_DATA_DIR` | `~/.dsh/forge` | 跨会话 frecency 访问统计、查询历史、本地快照与知识卡片缓存的主目录。 |
+| `DSH_FORGE_GRAMMAR_DIR` | 随包预装 | Tree-sitter WASM 语法文件目录。 |
+| `DSH_FORGE_AST_WORKERS` | 自动，最多 `8` | 符号查询和 Trace 共用 AST Worker 池。默认候选达到 16 个时并行；`0` 强制顺序解析，`1..8` 显式指定 Worker 上限。 |
+| `DSH_FORGE_INDEXER` | 自动 | 可选 Rust 符号索引 sidecar：`0`/`off` 关闭，其余取值在可用时尝试原生解析；启动或读取失败会回退 WASM。Trace 使用 WASM Worker，不依赖此二进制。 |
+| `DSH_FORGE_INDEXER_BIN` | 未配置 | 指向可信的本机 sidecar 二进制；源码 checkout 也会发现 `rust_indexer/bin`。npm 包不捆绑平台二进制，默认使用 WASM。 |
 
-可直接查看上游的 [Rust 检索内核](https://github.com/dmtrKovalenko/fff/tree/d978416f77aec3f9928d56e00c9e56ba39ca1fda/crates/fff-core/src) 和 [Rust C ABI 导出](https://github.com/dmtrKovalenko/fff/blob/d978416f77aec3f9928d56e00c9e56ba39ca1fda/crates/fff-c/src/lib.rs)。这些链接固定本次观察到的上游提交，用于说明源码位置；不代表已复现安装的 0.11.0 DLL 的构建。
+可选原生符号加速：在源码 checkout 中安装 Rust 1.88+ 后执行 `pnpm run build:indexer`，会为当前平台构建并放入 `rust_indexer/bin`。npm 安装用户可将 `DSH_FORGE_INDEXER_BIN` 指向这份构建产物的绝对路径；没有该产物仍可使用全部工具。
 
-**本机 DSH 的 Rust 调用已有运行验证。** 桌面版可执行文件的 Electron Node 模式能够加载 FFF DLL 与 WASM；最新验收覆盖全部 15 个工具的 SDK 成功结果、实际 sandbox provider 和观察策略。此模式不代表完整桌面 UI/模型验收。运行预编译 Rust 库不需要安装 `cargo` / `rustc`；DSH 的 Cordis 插件入口仍是 JS/TS。
+Trace 首次扫描使用并行事实提取；全仓别名只做内存筛选，不再触发二次解析。同一工作区的重叠请求共享扫描，后续请求按文件 stat/ctime、声明表及被探测依赖的存在性验证缓存。文件新增、修改、删除或声明表变化会失效。输出的 `parseErrors`、`partialFiles`、`walkErrors`、`resolutionLimited` 与 `incomplete` 表示分析覆盖度；出现失败、部分解析、截断时，“未找到”只针对已分析范围。根 `.gitignore` 生效，跳过 `node_modules` / `.git` / `.dsh` 和目录链接；候选上限 20,000，源码上限 2 MiB，二进制上限 32 MiB。
 
-工程注册表、任务关联、验收报告、文件/代码搬移和节点历史已实现。DSH todo 保留当前会话进度作用，跨会话任务真值由 forge 工程台账负责。可选并行 WASM 的热查询已经接近 PF，但冷查询和内存仍明显落后；新的 Rust AST 后端仍是候选。本次没有启动完整桌面 profile、PTC 或模型会话。
+Trace 新增语言的支持范围如下，查询形式为 `file:src/lib.rs`、`file:pkg/service.py`、`file:native/main.cpp`。被引用的 `.txt`、`.inc` 等资源也可反查引用者，内容不参与解析。
 
-## 工具
-
-| 工具 | 层 | 作用 |
+| 语言 | 静态文件依赖 | 解析边界 |
 |---|---|---|
-| `fffind` | L0 | 文件名模糊搜索，容错拼写，frecency + git 状态加权排序 |
-| `ffgrep` | L1 | 内容搜索（plain/regex/fuzzy），cursor 分页，`enclosing: true` 时给每个命中标注所在符号 |
-| `fff_multi_grep` | L1 | 多模式 OR 搜索（Aho-Corasick），验证扫描一次搞定 |
-| `ff_outline` | L2 | 单文件符号大纲（类/函数/方法/接口/结构体…），精确行区间，比读全文省 token |
-| `ff_find_symbol` | L2 | 工作区级定义查找：简单名、限定名与 Rust `::`，覆盖 11 种源码语言；可选并行解析 |
-| `ff_read_symbol` | L2 | 按符号地址读源码（含前置注释；`body=true` 从签名行起），区间锚定当前内容 |
-| `ffedit` | L3 施工 | 容错多步行级编辑（原始快照坐标 / expect 漂移校正 / 首尾锚定 / 歧义票据），每次写入前快照、强制 reason；`revertOnSyntaxError` 在原本干净的文件将引入语法错误时写前拒绝（票据持久化该策略） |
-| `ffresolve` | L3 施工 | 持久化票据单选、多选 `choices`、全选 `all`；重叠和过期字节身份拒绝写入 |
-| `ffhistory` | L3 治理 | 台账检索：谁（actor=会话 id）、何时、为何（reason）改了哪些文件 |
-| `ffrollback` | L3 治理 | 批次/节点/时间点文件状态回退；回退自身也是新批次，可重做；`dryRun` 默认 true |
-| `ff_project` | 工程 | 工程注册、查询、任务 patch、revision 检查、验收报告、软删除/恢复 |
-| `ff_file` | L3 施工 | 创建/删除/搬移文件，复制/搬移符号或 `fromLines=L10-20` 行块；落点锚四选一（`after=N` / `before=N` / `afterSymbol` / `beforeSymbol` 含前置注释），`indent=auto` 按插入点自动重排缩进（闭行参照上一行），按 AST 字符区间替换/删除/前后插入 |
-| `ff_diff` | L3 治理 | 以稳定 `b:<batch>:n:<index>` 节点地址读取不可变快照 diff |
-| `ff_read` | L2 | 统一寻址批量读：`path#符号` / `lines=L10-20` / 多 path / glob（根 .gitignore 生效）；整文件 4000 行上限，文本预算可能截断或跳过，结果带标记/原因；行号契约与 ffedit 一致 |
-| `fftrace` | L2 链路 | 静态查询 `ipc:通道或API名`、`global:名称`、`page:xxx.html`、`file:相对路径`；分析 JS/TS 族与 HTML 的模块、IPC、页面顺序和全局关系。可选 `declarations` 指定 JSON 数据文件，补充 API/角色事实；不执行 registry。动态参数列位置不入边，结果位置可回填 ffedit/ff_read |
-| `/forge-status` | — | 引擎状态 + 施工台账统计 + 票据计数；`rescan` 重扫、`prune` 清孤儿快照库并回收无引用 blob、`purge [confirm=yes]` 永久清除当前工作区施工历史（预览式确认，磁盘文件不动） |
+| JS / TS | 相对 import/require、HTML script；无顶层 import/export 的脚本中，精确名称 `declare module "name"` 可作为裸模块声明目标 | 不模拟包管理器、通配 ambient module 或模块增强合并；重复声明不任意选文件。 |
+| Rust | `mod`、内联模块作用域、直接 `#[path]`、字面量 `include!` / `include_str!` / `include_bytes!`，以及分组、别名、`crate/self/super` 形式的 `use` 模块候选 | 按常见 Cargo 入口和真实 `mod` 树确定归属；不展开宏、条件编译、重导出或 `extern crate`。模块归属工作预算 20,000、深度 64；达到预算停止 `use` 推断，标记 `resolutionLimited` 和 `incomplete`。 |
+| Python / PYI | 工作区根下的 import/from；字面量 `__import__`、已确认 importlib / import_module 别名及字面量 package 相对导入 | 不执行 Python 或推断 sys.path；动态表达式保持未解析。发现 loader 名称绑定或遮蔽时保守停止该名称的动态推断。`from` 子模块保留候选标记。 |
+| C / C++ | 本地 include 与显式编译目录；C++20 顶层命名模块、同模块分区和头文件单元的候选依赖 | 不推断编译器隐式目录或 BMI 构建映射、不展开宏/条件编译/响应文件。模块提供者重复时拒绝选取；部分模块语法仍保留上游 grammar 的 partial 标记。头文件不继承未证实的编译单元配置。 |
+| Go | 最近 go.mod 的 module 名称和工作区内包成员；附着在独立 `import "C"` 前的 cgo 导言字面量本地 include 候选 | 不计算 build tag、GOOS/GOARCH、go.work、replace/vendor 或 cgo CFLAGS；嵌套 go.mod（包括无效清单）隔离模块边界。尾随代码的注释不作为导言。 |
+| Java | package/类型索引解析 import、直接嵌套类型、继承/接口、泛型边界、字段/参数/返回/throws 类型候选；module-info 的 requires/exports/opens/services 候选 | 不解析 classpath/JAR、模块路径或完整类型/访问控制。泛型和局部/匿名类型遮蔽会排除误匹配；可能的继承成员或未知父类阻止简单名回退。继承检查预算 20,000、深度 64，触发后报告 resolutionLimited/incomplete。 |
+| Lua | 字面量 require，按根下 `name.lua` / `name/init.lua` 约定查找候选 | 不执行 package.path、自定义搜索器或动态参数；require / `_G.require` 重绑定时停止推断。Lua 使用维护中的独立 WASM 语法包，避免旧 grammar 的跨文件状态串扰。 |
 
-覆盖语言（AST 层）：JavaScript / TypeScript / TSX / Python / Rust / Go / C / C++ / Java / C# / Lua。`.mts/.cts` 按 TypeScript、`.pyi` 按 Python、`.h/.cppm/.ixx` 按 C++ 解析；bundled grammar 对部分 C++ module 语法仍可能返回 partial。查找的 occurrence 按完整限定名组、声明顺序编号后再过滤 kind/limit；声明重排后应重新查找。其他文件类型由 FFF 文本检索覆盖。
+这些关系表示源码中的文件引用，不提供函数调用图、类型推断或运行时依赖保证。增加语言会扩大默认扫描集合，首次查询耗时也取决于新增文件数量。
 
-### 为 Trace 提供应用声明
+JS/TS 还会只读发现根内的 `tsconfig.json` / `jsconfig.json`、相对 `extends`、`references` 指向的配置及 `package.json`。支持 JSONC、`paths` 精确/单星号映射及顺序目标回退、`baseUrl`、多份继承、根成员 `files/include/exclude`（`*` / `**` / `?`），路径相对声明配置定位。工程映射的文件边保留来源配置。尚未展开完整 TypeScript program 导入闭包；成员归属不明或多配置歧义时停止裸包名回退并报告限制。包名形式的 `extends`、`rootDirs`、`moduleSuffixes`、自定义条件及 bundler alias 保持未解析，不执行配置代码。
 
-默认只分析源码，不自动导入任何工程代码或 VCPChat 角色。需要角色可见性检查时，在工程中提供数据文件（最多 256KiB）：
+根 `package.json` 的 npm/yarn `workspaces` 和 `pnpm-workspace.yaml` 字面量 `packages` 列表用于识别本地包，支持正向/排除模式、包自身引用、`exports/imports` 精确及单星号入口、`main`/`types` 和入口转发。同名包拒绝猜测，包外依赖不读 `node_modules`。此处确定边基于已识别的本地 workspace 映射，不证明安装器实际选择了哪个同名包版本。条件导出保留可用分支作为候选；CTS/MTS、显式 module、NodeNext 与 package type 帮助选择 import/require 分支，未知 TS 编译上下文保留两者候选。缺失条件产物单独报告；包映射数组、复杂 YAML、安装器链接覆盖和完整 bundler/Node loader 语义不在支持范围。单个工程元数据上限 256 KiB，总上限 2,000 文件 / 8 MiB；元数据内容和相关路径链接身份变化使图缓存失效。
+
+`impact:` 沿反向文件依赖递归查找引用者，给出距离、受影响的 HTML 页面和引用行号；`path:` 沿正向文件依赖及 HTML script 引用查找一条最短路径。例如：
 
 ```json
-{
-  "apis": [
-    { "name": "loadSettings", "channel": "settings:load", "kind": "query", "roles": ["main"] }
-  ],
-  "roleGlobals": { "main": "appBridge" }
-}
+{"target":"impact:src/lib.rs"}
+{"target":"path:app/index.html -> renderer/helper.js"}
+{"target":"path:src/main.ts -> src/service.ts","edgeMode":"certain"}
+{"target":"file:native/main.cpp","compileCommands":"build/compile_commands.json"}
+{"target":"ffi:shared_export"}
 ```
 
-调用 `fftrace` 时传入 `{"target":"ipc:settings:load","declarations":"trace-declarations.json"}`。`kind` 可为 `query`、`command`、`subscription`，`channel` 可为 null；无效数据会返回 `decls: "failed"` 并保留静态事实。扫描响应取消，不创建声明执行子进程。
+路径查询的箭头两侧需留空格；支持根内绝对路径和相对路径。`file:/impact:/path:` 接受 `edgeMode: "all" | "certain"`，默认包含候选边，certain 排除它们；确定仅表示静态文件引用可解析，不保证运行时执行。`analysis` 返回 `edgeMode`、引用边的 `from/to/line/kind/evidence`、文件距离、页面及计数；`evidence` 包含 `confidence/basis/config?`。ambient 声明、条件导出及多语言候选保留候选身份。单次查询最多索引 200,000 条边、遍历 20,000 个节点，结构化文件/边/页面列表各最多 100 项，文本各展示前 30 项。`analysis.complete` 表示所选图的遍历是否完成，`analysis.truncated` 也包含展示截断；它们与扫描覆盖度 `incomplete` 分开，达到遍历上限时不会据“未找到”断言不可达。
 
-### 焊接点（L1 → L2）
+`diagnostics` 提供未解析项的 `path/line/spec/reason/detail?/config?`，以及文件读取、部分解析、工程配置问题；两类列表各最多 100 项，分别保留总数与截断标记。`file:` 的未解析列表限定当前文件，文件/工程问题仍报告全扫描范围。JS/TS 区分非字面量、缺失目标、外部包、歧义、配置限制和根外目标；其他语言无法细分的失败诚实使用 `unsupported_resolution`，不会把未知原因伪装为缺失文件。`incomplete` 包含已知的配置/归属限制，不能用 `analysis.complete` 代替完整工程覆盖度。
 
-`ffgrep` 传 `enclosing: true`，每个命中行带 `in: {name, startLine, endLine}`——定义命中和调用点命中都能标注所在符号。典型流：`ffgrep pattern enclosing:true` → `ff_read_symbol path file#Symbol`。这就是"grep 命中行 → 所在函数"的精确版（ProjectForge 用正则兜底做同一件事，这里永远走 AST）。
+包含 C/C++ 文件时自动读取根下的 `compile_commands.json`；其他位置通过 `compileCommands` 指定。文件上限为 8 MiB、20,000 条记录，优先读取 `arguments`，也接受当前平台常见引号形式的 `command`。只把 JSON 当作数据，不运行编译器或 shell；带响应文件、sysroot、未知预处理转发、`env` 启动器或显式 include 环境变量赋值（如 `CPATH`、`INCLUDE`、`SDKROOT`）的记录保持未解析，`compilation` 会报告不支持的记录数。解析只依据显式搜索路径，不模拟完整预处理环境。数据库内容变化及搜索目标的存在性、目录链接身份变化均使图缓存失效。
 
-### AST 层设计原则（承自 forge 计划）
+`ffi:<name>` 按精确名称分别列出源码边界声明和二进制导出，不会把同名拼成跨语言调用链。源码支持 Rust no_mangle/export_name/link_name、extern 块，C/C++ extern C / dllexport、Node/N-API 常见注册宏和紧邻函数的 cgo `//export`。标记只证明源码声明，无法证明链接保留、符号修饰或 ABI 一致；上游 Rust grammar 尚不识别部分 `unsafe extern` 新语法，会报告部分解析。复杂宏与函数指针声明不做完整语义推断。
 
-- **区间以内容为准，不以索引为准**：每次查询重读文件、归一化 EOL、取 sha256，命中缓存才复用解析；索引用于发现，返回区间按本次读取的内容计算（有地板测试：改文件 → 立即查询 → 反映新内容）。并发写入的保证见已知边界。
-- **只给确定的东西**：只提供定义 + 精确区间，不做调用图猜测；引用搜索留给 ffgrep。
-- **行号契约**：1-based、去 BOM、CRLF/CR→LF 归一，与 fff 层一致（编辑引擎同契约）。
-- **永远可降级**：不支持的扩展名报结构化错误并指向 ffgrep；语法缺失可重试。
+二进制按魔数读取 `.exe/.dll/.node/.so/.elf/.wasm` 的 PE/ELF/WebAssembly 元数据，绝不加载或实例化。PE 支持 ordinal/forwarder，ELF 仅动态符号表作为导出证据，WASM 支持导入库和导出名；`file:` 可查看依赖库及限制说明。未覆盖 Mach-O、archive、导入函数符号、PE delay-load、无 section header 的 ELF 动态表和 WASM memory64；不做反汇编、完整二进制有效性验证或源码产物对应验证。每文件符号上限 20,000，FFI 结构化匹配最多 100 条、文本最多 30 条。
 
-## 施工治理内核（第三阶段）
+### 3. 插件设置：接管原生 / 增量并存
 
-### 容错编辑引擎（`src/edit-engine.ts`，纯函数）
+工具面有两种挂法，写在用户 patch 层即可（升级不丢）：
 
-- **原始快照坐标**：一批 steps 全部以调用前的快照为坐标编译成互斥区间，重叠直接报错（不猜测），最后按升序一次拼接。
-- **expect 漂移校正**：行号记错时，锚点内容在 ±20 行内就近重定位，报告漂移量。
-- **首尾锚定**：replacement 引用了区间自身首尾行时识别为锚（LLM 过量引用的典型错误），只替换内部——重复发送同一编辑是幂等的。
-- **`N | ` 前缀剥除**：仅当所有非空行都带前缀才剥（markdown 表格安全）。
-- **target 步**：整块匹配（精确 → 容忍首尾空白并平移缩进）；单行 literal 没有整行命中时自动匹配行内；独占行 `...` / `…` 支持省略块；零命中给相似行，多处命中签发票据。行内最多 100 个候选，省略块有搜索预算；超限拒绝写入。
-- **atomic（默认）/ bestEffort**：任一步失败全批不写 / 跳过失败行级步骤并报告。行内 target 暂仅支持 atomic，bestEffort 显式报错。
+```yaml
+# ~/.dsh/profiles/<profile>/cordis.patch.yml
+- id: dsh-forge
+  name: dsh-forge
+  config:
+    registration: takeover   # 默认 additive
+    takeover: [read, glob, grep]   # 可省略；省略即取全部可接管项
+```
 
-### 治理决策（实现前经用户确认）
-
-| 决策点 | 采纳 | 理由 |
-|---|---|---|
-| reason 强制程度 | 每次写操作强制必填，缺失报错并附可照抄格式 | PF 对齐；台账完整可读 |
-| 票据落盘 | `~/.dsh/forge/tickets/`，24h 过期 | 相比 PF 内存票据可跨进程重启保留；仓库零污染 |
-| 快照作用域 | `~/.dsh/forge/snapshots/<workspace-key>/` 中心式 | 仓库零污染、回退不依赖 git |
-| 存储格式 | JSONL 台账 + sha256 内容寻址 gzip blob（零原生依赖） | 本机无 VS 工具链，better-sqlite3 原生绑定在 Electron ABI 下有风险；PF 用它只因主依赖已在 |
-| actor 来源 | `exec.agent.session.header.id`（DSH 会话 id） | 子代理各有 id，按操作者过滤天然成立 |
-
-### 数据面纪律（承自 forge 计划）
-
-- **外部修改保护**：每次写入前把磁盘 hash 与台账最后已知 hash 比对，不一致先记 `external` 节点；规划后的变化会中止提交。检测到的手动改动有原始字节快照，外部并发写入的保证见已知边界。
-- **回退即新批次**：rollback 记录 before/after 双 blob，回退回退即重做；文件级回退还原完整快照而非 diff。
-- **台账反哺 frecency（1+1>2 焊点）**：fff-node 无 recordAccess API（已核实 typings），唯一诚实通道是 `trackQuery(query, file)`——ffgrep/fffind 命中文件时记下 (query→file)，ffedit 写入成功后回放进查询史库；查询与选中都真实发生，不造假学习数据。mtime frecency 随写入自动更新。
-- **编辑后复解析**：`ffedit` 语法警告默认 report-only（写后新增与存量错误分开表述）；`revertOnSyntaxError` 开启时，原本干净的文件将被写坏 → 写前拒绝，已脏文件保持 report-only（tree-sitter 的二值 hasError 无法逐条归因）；按符号修改/搬移要求原始及计划结果的支持语法有效。共享声明、需要逗号处理的成员删除/搬移拒绝，改用明确整段 target，避免误伤邻居；语法解析不能代替编译器。
-- **提交与锁**：工作区台账串行，多文件按固定顺序获取锁；最终授权、版本重验和文件发布共用 DSH provider 的目标锁。快照与文件恢复日志先落盘，文件完成后提交台账。重启恢复先授权全部文件目标并检查 write-intent；未知外部字节阻止写入。台账增量追加前保存 offset、前缀摘要及完整待写行；进程中断后仅恢复与证明精确匹配的字节，严格工程台账的未知撕裂尾部仍拒绝。完整损坏记录不被当作旧历史。
-- **长历史热路径**：复用完整验证过、文件身份未变的台账视图与派生文件状态；每次追加只写新行，每 128 批次保存可丢弃 checkpoint。台账/元数据的 inode、size、mtime 或 ctime 变化会触发全量校验；重启首读也会全量校验。缓存最多保留四个工作区，不以 state.json 代替权威台账。
-- **字节与链接**：编辑严格接受 UTF-8；回滚/重做保存原始 Buffer，外部二进制或无效 UTF-8 也能完整恢复。编辑符号链接会解析真实目标并保留链接身份。
-- **票据决策**：多个 target 步骤的既有选择随下一张票据持久化。任何原始文件变化都重新要求决策；原歧义消失时返回错误，绝不自动改写剩余的唯一位置。
-
-## 检索栈分工
-
-| 层 | 问题 | 工具 |
-|---|---|---|
-| L0 文件发现 | "那个文件叫什么？" | fffind |
-| L1 文本检索 | "哪些行出现了 X？" | ffgrep / fff_multi_grep（引用全集、验证扫描） |
-| L2 符号定位 | "X 的定义边界在哪？" | ff_outline / ff_find_symbol / ff_read_symbol（定义 + 精确区间） |
-
-fff 解决"找得快、排得准"，AST 解决"找得精"。二者数据面隔离：frecency 只影响发现排序，永不参与坐标计算。
-
-设计要点：
-
-- **会话启动零开销**：引擎懒启动，首次工具调用才按工作区根建索引（实测 3815 文件冷启动 0.3 秒）。
-- **跨会话学习**：frecency（访问频率 + 新近度）与查询史存 LMDB，在 `~/.dsh/forge/fff/`（可用 `DSH_FORGE_DATA_DIR` 重定向）。这是**全局库**——学习信号跨工作区累积，这是有意为之的默认值；要与某工作区隔离时用环境变量指向独立目录。
-- **学习与正确性分面**：frecency 只影响发现类结果的排序，永不参与坐标计算。精确的符号边界是第二阶段 AST 层的职责。
-- **降级安全**：原生库加载失败、路径不存在、fs 根拒绝索引时，工具通过 SDK 错误通道报告具体原因与降级提示，避免把错误对象当成成功输出校验。
-- **gitignore 生效**：gitignored 内容永不出现（grep 与 find 均然）。
-
-## 已知边界（诚实契约）
-
-- `limit` 是**目标页大小**：引擎按文件边界取整分页，单页可能略超 limit；`nextCursor` 分页保证不重不漏（有地板测试钉住）。
-- 施工层：快照库**绑定本机**；外部路径也记入当前会话工作区台账，`ffhistory` / `ffrollback` 可直接寻址。`ffhistory` 支持 `content=` 快照内容过滤（大小写不敏感、32MB 扫描预算）。锁只覆盖同一 host 进程；提交前重验 hash，但不承诺跨进程文件 CAS、断电持久性或硬链接身份。编辑后语法检查是 report-only。
-- 工程/任务/报告已持久化；删除和恢复只改变记录。`/forge-status purge`（`confirm=yes` 确认式）永久清除当前工作区施工历史；`prune` 回收孤儿快照库与无引用 blob（引用感知，绝不删台账可达快照）。时间点回退恢复文件，保留任务/报告历史，不还原工程元数据。接受报告后，关联文件修改会提升 revision 并让工程重新变为 active。
-- 支持共享本机 LocalFileSystem 和标准 SandboxedFileSystem。按当前会话解析 sandboxPolicy：read-only 可读取、拒绝文件写入；workspace-write 检查规范目标所在范围；danger-full-access 仍执行观察/版本检查。读取固定 provider 的规范路径，仅稳定成功读取或确认缺失才发 observed；写入与 DSH 内建文件工具共用 provider 锁，等待后重新核验目标与版本。远端/不共享路径仍拒绝。
-- 此适配已核对装机 DSH `0.2.0-rc.2` 的 `checkedTarget` / `withLock` 实现；它们不是公共 SDK 稳定承诺。缺少 per-session policy、规范写入 fence 或 sandbox 共享锁时文件写入失败关闭，升级 DSH 后应重跑接入测试。仍不承诺跨进程文件 CAS、断电持久性或完整审批 UI 等价。
-- 施工结果将不可变 diff 冻结到 SDK metadata，并返回现有 DSH `card:'diff'`。卡片回放不读磁盘；256KB 卡片预算省略大文本/二进制，可查询 `ff_diff`。这不等于完整工程/Git 面板或桌面视觉验收。
-- 变更 UI 适配：`scripts/patch-workspace-changes.mjs` 给装机版 dsh-workspace-changes 的 `mutationPath()` 幂等补上 `ffedit`/`ff_file` 两个 case（带备份，`--restore` 可回滚），使非 Git 目录、Gitignored 文件与仓库外路径的 forge 写入获得与内建文件工具相同的轮次快照捕获；**DSH 应用更新会覆盖该文件，更新后需重跑**。Git 仓库内的 forge 改动本就由轮次 numstat 捕获，与本 patch 无关。
-- 引擎 0.11.0 的 `classifyDefinitions` 对 JS 系文件不可靠（探针确认：定义行漏标、调用行误标），已弃用不暴露；def 标记由第二阶段 AST 正规解决（`enclosing` 焊接 + ff_outline/ff_read_symbol）。
-- AST 层使用 `ignore` 库处理根目录和嵌套 `.gitignore`，包含取反规则；目录忽略清单见 `tools-symbol.ts` 的 IGNORE_DIRS。原始文件超过 **2MiB** 时在读取源码、解码和 hash 前拒绝；打开后增长的输入也有界读取。此上限与 PF 的 8MB 不同。
-- web-tree-sitter 固定 **0.25.0**：它必须与 tree-sitter-wasms 0.1.13 预编译语法的 ABI 匹配（0.27 加载同一批 wasm 会报 dylink 错误）。升级 web-tree-sitter 前先跑 `node tests/run-ast.mjs`。
-- `ff_file` 每文件 8MB 上限，要求目标父目录已存在；传输源为 `symbol` 或 `fromLines`，落点锚四选一。`edit_symbol` 操作精确符号区间，共享声明及列表成员删除/搬移需用 `ffedit` 显式处理。创建/删除/搬移与回退拒绝链接身份；普通 `ffedit` 可编辑可达链接的真实目标，悬空链接始终拒绝。
-- `fftrace`：静态分析默认开启，声明仅接收显式 JSON 数据。模块解析只处理相对路径，包名不入图；`globalsUsed` 只统计显式 `window.` / `globalThis.`；包装函数只在同文件识别，跨文件降级为 dynamic；桥接别名按顶层/同页采纳。facts 仅 JS 族 + HTML，不宣称 ffi 或多语言调用图完整覆盖。
-- 工具描述里写明了与内建搜索/内建编辑的分工；内建工具不受影响，删掉本插件即完全回滚（快照库留在 `~/.dsh/forge/`，可整目录删除）。
-
-## 安装（DSH 桌面版，无 dsh CLI）
-
-1. 编辑 `~/.dsh/profiles/desktop/package.json`：`dependencies` 加 `"dsh-forge": "link:<本仓库绝对路径>"`，`dsh.profile.bundles` 数组追加 `"dsh-forge"`。
-2. `pnpm -C ~/.dsh/profiles/desktop install`（若 pnpm 拦构建脚本，按惯例在 pnpm-workspace.yaml 的 allowBuilds 里放行后重装）。
-3. 重启 DSH 生效。回滚：bundles 数组删行 + dependencies 删项，再 `pnpm install`。
-
-cordis.patch.yml 只在 host plane `insert` 一行（dsh-ssh 同款），**刻意不碰 preset-standard**——dsh-blackhole 的 patch 已全量重述该列表，两份全量重述会互相覆盖。
-
-## 配置（环境变量）
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `DSH_FORGE_DATA_DIR` | `~/.dsh/forge` | frecency/查询史 LMDB 根目录 |
-| `DSH_FORGE_GRAMMAR_DIR` | 随包 `tree-sitter-wasms/out` | tree-sitter 预编译语法目录 |
-| `DSH_FORGE_AST_WORKERS` | `0` | `0` 顺序 WASM；`1..8` 有界 worker，按 CPU 数收紧。2/4 可降低查询延迟，但显著增加总内存 |
-
-插件本身不需要任何本机路径。只有测试链和维护脚本需要，它们从仓库根目录下 gitignored 的 `.env` 读取，真实环境变量优先。复制 `.env.example` 为 `.env` 再按需填：
-
-| 变量 | 用途 |
+| `registration` | 结果 |
 |---|---|
-| `DSH_FORGE_DSH_MODULES` | 装机 DSH 的 `@deepseek-ai` 包目录；启用 `run-host-integration`，并作为基准语料兜底 |
-| `DSH_APP_DIR` | DSH 应用目录，供 `scripts/patch-workspace-changes.mjs` 使用 |
-| `DSH_FORGE_BENCH_CORPUS` | `bench.mjs` / `bench-ast.mjs` 的基准源码树，任意大型真实仓库 |
-| `DSH_FORGE_RG` | `bench.mjs` 进程基线用的 ripgrep，默认走 `PATH` 的 `rg` |
-| `DSH_FORGE_REAL_REPO` | `eval-trace-real.mjs` 的额外真实仓库；未设时找同级 checkout，找不到即 skip |
-| `DSH_FORGE_PF_EXE` / `DSH_FORGE_PF_PLUGIN` | ProjectForge 索引器与插件目录，**位于本仓库之外**（CC BY-NC-SA，绝不随包分发）。未设时 `eval-coverage.mjs` 的 ProjectForge 列报为不可用而非报错 |
+| `additive`（默认） | 9 个工具全部以 `ff*` 名挂在全局，与内置 `read`/`grep`/`glob`/`edit` 并存。 |
+| `takeover` | 列出的名字改成**每个 agent 作用域**注册（`agent.ctx`），遮蔽同名内置工具；其余工具仍走全局。模型看到的是一件事一个工具，而不是两个。 |
 
-## 验证与历史对照
+目前可接管：`read`、`glob`、`grep`。
 
-```powershell
+`read` 的 `file_path` / `offset` / `limit` 与 `path` / `lines` 两套参数都接受（`limit` 的含义由寻址方式决定：`file_path` 寻址按行数，`path` 寻址按文件数），越界时会给出 `continue with offset=<n>`。
+
+`glob` 的内置契约只有 `{pattern, path}`、返回路径列表（无分页、无 limit），接管后原样接受。**剩下的差别是作用域，不是语法**，且写在工具描述里：内置 glob 走 `ripgrep --files --no-ignore --hidden`（磁盘上有什么），本索引尊重 `.gitignore` 且不含 `node_modules`（仓库里有什么）。两种都是"哪些文件匹配"的合理答案，所以这是接管而不是改名——调用方看得见自己拿到的是哪一种。
+
+改完重启后，`/forge-status` 的第一行就是**当前进程实际生效的注册模式**。补丁层没被应用和从来没写过，在配置文件上长得完全一样，只有进程自己说得清。
+
+`grep` 的内置契约是 `{pattern, path, include}`，`pattern` 按 ripgrep 正则、**大小写敏感**解释。接管后原样接受这三个参数（`mode` 固定 `regex`、`smartCase: false`，其余不额外开放），`include` 按 ripgrep 的 glob 语义编译：无分隔符的 `*.ts` 匹配任意深度的文件名，大小写跟随文件系统；`!` 取反与逗号列表按内置的做法直接拒绝。
+
+真正让 `grep` 能安全接管的是**逐调用回退**（`src/delegate.ts`）：索引答不上来时，这一次调用原样交给内置 grep，用内置自己的参数、自己的执行上下文。触发条件有四条，每一条都对应一种索引可能给错的场景——
+
+| 触发 | 为什么索引不可信 |
+|---|---|
+| 扫描尚未完成 | 半成品页是样本，不是答案 |
+| finder 起不来 | 这个根根本没有索引 |
+| 一页零命中 | 索引是快照，别的进程刚写的文件它看不见 |
+| `path` 里带 glob | 内置会把它当路径报错，那才是同一条调用的答案 |
+
+零命中那条最关键：**"0 命中"是调用方唯一会据以放弃的答案**。回退后会出现三种结果，各自说清是谁回答的——磁盘命中了（`come from ripgrep on disk`）、磁盘也没有（`no match in the index and none on disk`）、磁盘检查本身失败（把失败原因写进 note，并保留索引自己的答案）。回退拿不到句柄时一切照旧走索引，所以它只是改进，不是依赖。
+
+`/forge-status` 在接管 `grep` 时会多一行 `内置委托：可用 / 不可用`：能否拿到内置句柄取决于宿主把 fs 工具注册在哪一层，配置上看不出来，只有进程自己知道——不可用时 `grep` 仍按内置语义工作，只是空结果不再被磁盘复核。
+
+实测（一个 2 667 文件的真实 Electron 仓库，索引已就绪）与内置 `rg --json --regexp=…` 逐条比对：
+
+| 查询 | 索引 | 内置 ripgrep | 接管后 | 命中集差异 |
+|---|---|---|---|---|
+| `browserWindow`（10 命中） | 958 ms | 1 022 ms | 855 ms | 0 / 0 |
+| 不存在的 token | 418 ms | 1 136 ms | 1 137 ms（含磁盘复核） | 0 / 0 |
+| 大小写不符 `Browserwindow` | 471 ms / 0 命中 | 1 018 ms / 0 命中 | 993 ms / 0 命中 | 0 / 0 |
+| `require`（宽泛） | 37 ms | 1 028 ms | 25 ms | 索引 ⊆ 磁盘 |
+| `ipc[A-Z]\w+`（正则） | 38 ms | 999 ms | 27 ms | 索引 ⊆ 磁盘 |
+| `include: *.md` | 460 ms / 132 | 240 ms / 89 | 521 ms / 132 | 索引多 43 条，全在隐藏点目录下 |
+
+两处差异都是作用域，不是语义：命中多出来的 43 条全部落在点目录里——`rg` 默认跳过隐藏路径，索引不跳。这一条写在工具描述里。零命中那一行的代价是诚实的：**接管的"没有"要花内置的钱**（约 1.1 s），换来的是这个"没有"同时被磁盘确认过。
+
+`edit` 仍不支持接管，而且回退也救不了它：内置在 `replace_all: false` 时要求 `old_string` **唯一出现**，歧义就报错；`ffedit` 的锚定/模糊引擎遇到多匹配会按规则挑一个。等到歧义出现时，内置手上也只剩一句报错——把那句报错塞给模型，比让它看见"该确认哪一处"更糟。所以 `edit` 保留自己的名字和自己的语义。
+
+同一条 `config` 里还有 `prewarm`（默认 `true`）：agent 出现后约 1.5 s，在后台把该工作区的索引建到**完全就绪**，而不是等第一次查询再建。5 千文件实测，第一次真实查询从 2.9 s（冷启动）／约 2.0 s（索引已落盘，但实际只等到了扫描）降到 4 ms。代价是一次原生扫描会阻塞 JS 线程约 0.5 s（同规模实测 p99 531 ms），所以它延迟启动、不 await、`unref()` 不拖住进程，并且全程 best-effort——失败不抛，只在查询真正需要时由工具层报出。纯聊天、不需要检索或不愿有启动 IO 抖动的 profile 可以关掉：
+
+```yaml
+- id: dsh-forge
+  name: dsh-forge
+  config:
+    prewarm: false
+```
+
+### 4. 插件设置页：知识卡片蒸馏
+
+以上全部配置共同构成 DSH 插件管理器里 dsh-forge 的设置页（Config schema 即设置界面）。知识卡片（`ff_cards`）的蒸馏行为由 `cards` 块控制：
+
+```yaml
+- id: dsh-forge
+  name: dsh-forge
+  config:
+    cards:
+      distill: session   # session（默认）| endpoint | off
+      endpoint:          # 仅 distill: endpoint 时需要
+        baseUrl: https://api.example.com/v1
+        model: your-model
+        apiKeyEnv: OPENAI_API_KEY   # 或用 apiKey 内联（不推荐，会写进配置文件）
+        timeoutMs: 120000
+```
+
+| `distill` | 行为 |
+|---|---|
+| `session`（默认） | **当前会话模型润色**。读骨架卡时附带蒸馏指令；模型用 `{polish: "<name>", content: "<润色稿>"}` 写回，经有限引用校验后缓存。消耗会话 token，无额外后台调用。 |
+| `endpoint` | 读到未润色骨架时内联 POST `{baseUrl}/chat/completions`，经同一引用校验缓存；失败回退骨架并说明原因。只在按需读取时发生，无后台定时器。 |
+| `off` | 拒绝 polish 写入与模型调用，仍可读取已有草稿。 |
+
+引用校验只核对反引号中的路径、`#N` 的实际批次身份及格式/大小，无法核实裸路径、数量、日期或自然语言事实。润色返回 `source: "model"` 并明确提示事实未经核验；`{card: "overview", skeleton: true}` 始终返回 `source: "ledger"` 的确定性来源，即使 endpoint 模式也不发请求。卡片来自本插件施工台账，不代表完整项目知识。
+
+润色稿是**缓存不是资产**：以台账锚（批次游标 + 文件 stat 签名）为有效性凭据，锚一动即整体丢弃——没有人工编辑保护，下次蒸馏从新事实重新开始。`refresh: true` 也会丢掉全部润色稿。
+
+**反馈闭环**：卡正文每次被读取都计入 `reads.json`——刻意与卡片重建分离，重建、丢弃润色稿都不清零（用量是读者侧的历史，不是台账的派生物）。两个消费者：`ff_cards` 无参数列表带每卡读取次数、蒸馏建议点名**最常读的未润色卡**；`/forge-status` 新增知识卡片行（锚新鲜度、润色 k/N、各卡读取次数），只读不重建——过期只报告，修理是 `ff_cards` 的职责。
+
+---
+
+## 架构设计与技术细节
+
+更多有关系统提示词设计（为什么采用“任务导向”而非“能力罗列”）、容错编辑算法细节、外部修改检测纪律以及 Token 开销控制，请参阅专门的设计文档：
+
+👉 **[查看详细架构与设计思考 (docs/DESIGN.md)](docs/DESIGN.md)**
+
+---
+
+## 已知边界与使用说明
+
+1. **快照库存储**：修改快照统一存放在 `~/.dsh/forge/snapshots/`，不污染被操作的目标项目，即使用户仓库没有初始化 Git，也享有完整的快照与版本回滚能力。知识卡片缓存在 `~/.dsh/forge/cards/`，同为插件私有数据：整体可删，下次 `ff_cards` 调用即按台账重建；卡片是生成物，不做人工编辑保护（定位为缓存）。
+2. **目录与文件搜索差异**：`fffind` 的两种模式（`mode=name` / `mode=glob`）都只返回**文件**路径，不直接返回目录节点；若需遍历目录，请使用 `dir/**` 模式（`mode=glob`）或将 `path` 参数显式指向对应目录。
+3. **大文件防护**：AST 符号解析层对单文件设置了 **2MiB** 大小防护上限，超限文件会自动降级并提示使用 `ffgrep` 文本检索，避免极端文件导致内存耗尽。
+4. **单文件行数上限**：`ff_read` 单次整文件读取上限为 4000 行，超过上限需通过行区间（`lines=L1-2000`）分段读取。
+5. **单文件命中上限**：`ffgrep` 对单个文件最多收集 2000 行命中（`GREP_MAX_MATCHES_PER_FILE`）。这是引擎侧的硬截断：它在一个文件内停住后直接跳到下一个文件，`nextCursor` 不会回到该文件，所以更靠后的命中翻页也拿不到。一旦触顶，返回结果会带一条 note 指明是哪个文件，此时应改用更窄的模式或直接 `ff_read` 该文件。注意 `limit` 管不住这件事——引擎按**整个文件**收集完才看 `pageSize`，所以 `limit=5` 也可能返回几百行。
+6. **空页面的两种解释**：空结果会区分"索引看不见"和"被 `path=` 约束滤掉"。后者不会再给出"磁盘上有、区分大小写"这类诊断，而是直接说命中有多少落在约束之外——因为前者的根因是索引可见性，后者的根因是约束写窄了。
+
+---
+
+## 本地开发与测试
+
+本项目采用标准 TypeScript + Node.js 环境开发：
+
+```bash
+# 类型检查与构建
 pnpm run check
+
+# 执行完整集成测试套件
 pnpm test
-node tests/bench.mjs
-node tests/bench-ast.mjs
+
+# 执行检索与 AST 性能测试
+pnpm run bench
 ```
 
-完整测试链包含 21 套件，其中 `run-host-integration.mjs` 使用装机的实际 SDK、sandbox provider、会话策略与观察策略；通过 `DSH_FORGE_DSH_MODULES` 指定 `@deepseek-ai` 包目录，未找到安装时明确报告 skip。`run-review-regressions.mjs` 覆盖符号身份、读取前预算、缓存完整性和真实进程强退恢复。单纯 factory 测试不代替接入测试。
+本地深度集成测试可通过复制 `.env.example` 为 `.env` 并配置 `DSH_FORGE_DSH_MODULES` 等路径以接入真实的宿主环境。
 
-工具描述保留选择边界、条件必填、互斥、默认值、坐标和副作用；多 action 工具的约束由参数说明与运行时校验共同保证。找定义用 `ff_find_symbol`，找引用用 `ffgrep`；单符号消歧读用 `ff_read_symbol`，批量读用 `ff_read`；行/文本编辑用 `ffedit`，符号编辑与代码传输用 `ff_file`。
+---
 
-下列脚本离线捕获实际注册的完整 native schema 和 PTC 声明（含嵌套参数与输出类型），不发送模型请求。通过 `DSH_FORGE_DSH_MODULES` 指向宿主同版本 SDK；安装了 `js-tiktoken` 时额外输出两种比较用分词计数。PTC 成本减去空 SDK 的固定前导，命令单列，不把 bytes/4 估算当作 DeepSeek 实际 token。
+## 开源协议
 
-```powershell
-node scripts/audit-descriptions.mjs
-node scripts/dump-injected-prompt.mjs --json
-node scripts/dump-injected-prompt.mjs --json --compare <baseline.json>
-```
+本项目采用 [MIT 许可证](LICENSE)。
 
-描述优化的前后数据与验证范围见仓库外的内部工具描述报告。脚本策略评测与宿主接入通过均不等于真实模型调用准确率。
-
-ProjectForge 的符号、共同编辑行为和性能数据只作为冻结语料下的历史参考，对照脚本与审查证据均保存在包目录外，不随源码分发。原比较脚本已修正为等待全部 parseFile 完成并在本进程预热后计时；未等待 Promise 的旧热扫描数值不再作为证据。
-
-审查时默认 WASM 的整库冷查询和 RSS 落后于 PF；单文件热缓存相近，可选 worker 的热查询更接近但内存更高。本次修复没有替换 AST 后端，也没有据此宣称整体更快或产品等价。FFF/rg 基准包含调用形态与配额差异，不能解读为等工作量速度倍率。
-
-## 许可
-
-MIT。依赖 `@ff-labs/fff-node`、`web-tree-sitter`、`tree-sitter-wasms`、`ignore`（均 MIT）。本插件的 AST 与施工治理内核自行实现。本次对比读取并执行了 VCPChat/ProjectForge（CC BY-NC-SA）的原始引擎与客户端，仅保存在包目录外的审计证据中；未把其实现代码或二进制加入插件发布内容。
+感谢上游开源项目：
+- [fff](https://github.com/dmtrKovalenko/fff) (Rust 检索内核与算法实现)
+- [web-tree-sitter](https://github.com/tree-sitter/tree-sitter) & [tree-sitter-wasms](https://github.com/samuel/tree-sitter-wasms) (WASM 语法解析能力)

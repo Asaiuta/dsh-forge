@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { applyEditSteps } from '../lib/edit-engine.js'
-import { createEditTool, createResolveTool, createRollbackTool } from '../lib/tools-edit.js'
+import { createEditTool, createRollbackTool } from '../lib/tools-edit.js'
 import { readLedgerTail, storeFor, getBlob, readKnownState } from '../lib/ledger.js'
 import { FinderPool } from '../lib/core.js'
 import { createHash } from 'node:crypto'
@@ -22,7 +22,8 @@ const WORK = mkdtempSync(path.join(tmpdir(), 'forge-eval-edit-w-'))
 const pool = new FinderPool()
 const exec = { agent: { session: { header: { cwd: WORK, id: 'sess_eval_edit' } } } }
 const edit = createEditTool(pool)
-const resolveTool = createResolveTool(pool)
+// Ticket replies go through ffedit itself (ffresolve was folded in).
+const resolveTool = edit
 const rollback = createRollbackTool(pool)
 
 let floors = 0

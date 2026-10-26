@@ -90,6 +90,40 @@ contextBridge.exposeInMainWorld('electronAPI', {
 ipcRenderer.invoke('chat:direct').then(() => {})
 `)
 
+write('preloads/chart.js', `const { contextBridge, ipcRenderer } = require('electron')
+const chartAPI = Object.freeze({
+  listCharts: () => ipcRenderer.invoke('chart:list'),
+  togglePin: () => ipcRenderer.invoke('chart:toggle-pin'),
+  onChartChanged: callback => ipcRenderer.on('chart:changed', callback),
+})
+contextBridge.exposeInMainWorld('chartAPI', chartAPI)
+contextBridge.exposeInMainWorld('api', { ping: () => {} })
+`)
+
+write('preloads/core/expose.js', `const { ROLE_GLOBALS } = require('./registry')
+function exposeRole(role) {
+  const globalName = ROLE_GLOBALS[role]
+  contextBridge.exposeInMainWorld(globalName, {})
+}
+module.exports = { exposeRole }
+`)
+
+write('renderer/chart-users.js', `;(function () {
+  const api = window.chartAPI
+  api.listCharts()
+  api.listCharts()
+  api.onChartChanged(() => {})
+})()
+`)
+
+write('renderer/a.js', `function escapeHtml(value) { return String(value) }
+module.exports = { escapeHtml }
+`)
+write('renderer/b.js', `const escapeHtml = (value) => String(value)
+module.exports = { escapeHtml }
+`)
+
+
 write('renderer/app.js', `const api = window.chatAPI || window.electronAPI
 const helper = require('./helper.js')
 async function boot() {
@@ -309,14 +343,47 @@ resetFactsCache()
   assert.ok(r.text.includes('exposeInMainWorld'), r.text)
   assert.ok(r.text.includes('`electronAPI` · '), r.text)
   assert.ok(r.text.includes('direct'), r.text)
+  assert.ok(/electronAPI` · L2 · 键：direct、compatInvoke · 使用 1 处：`renderer\/app\.js:\d+`/.test(r.text), r.text)
   ok('file: exposeInMainWorld keys rendered')
+}
+{
+  const r = await run('file:preloads/chart.js')
+  assert.ok(/`chartAPI` · L\d+ · 键：listCharts、togglePin、onChartChanged/.test(r.text), r.text)
+  assert.ok(/`listCharts` ×2：`renderer\/chart-users\.js:\d+`、`renderer\/chart-users\.js:\d+`/.test(r.text), r.text)
+  assert.ok(/`onChartChanged` ×1：/.test(r.text), r.text)
+  assert.ok(/未被使用（1）：togglePin/.test(r.text), r.text)
+  ok('file: non-literal exposed object keys resolved + per-key usage grouped')
+}
+{
+  const all = await run('exposes:')
+  assert.equal(all.found, true)
+  assert.ok(all.text.startsWith('## Trace exposes:all'), all.text)
+  assert.ok(all.text.includes('`electronAPI`') && all.text.includes('`chartAPI`'), all.text)
+  assert.ok(all.text.includes('动态名') && all.text.includes('可能为：chatAPI、utilityAPI、desktopAPI'), all.text)
+  const one = await run('exposes:chartAPI')
+  assert.ok(one.found && one.text.includes('`chartAPI`') && !one.text.includes('`electronAPI`'), one.text)
+  const byFile = await run('exposes:preloads/chart.js')
+  assert.ok(byFile.found && byFile.text.includes('preloads/chart.js') && !byFile.text.includes('preloads/compat.js'), byFile.text)
+  const missing = await run('exposes:nope')
+  assert.equal(missing.found, false)
+  ok('exposes: aggregate, global filter, file filter, dynamic role-global name')
+}
+{
+  const r = await run('symbol:escapeHtml')
+  assert.equal(r.found, true)
+  assert.ok(r.text.includes('renderer/a.js') && r.text.includes('renderer/b.js'), r.text)
+  assert.ok(/定义 2 处 · 2 个文件/.test(r.text), r.text)
+  assert.ok(r.text.includes('view=body'), r.text)
+  const none = await run('symbol:definitelyMissing')
+  assert.equal(none.found, false)
+  ok('symbol: one call lists every definition across files')
 }
 
 // ---- failure modes --------------------------------------------------------
 
 {
   const bad = await tool.execute({ target: 'wat:foo' }, exec)
-  assert.ok(bad.error && /target like ipc:/.test(bad.error))
+  assert.ok(bad.error && /target like/.test(bad.error) && /ffi:/.test(bad.error))
   const empty = await tool.execute({ target: 'ipc:' }, exec)
   assert.ok(empty.error)
   ok('bad targets rejected with usage message')
@@ -337,7 +404,197 @@ const exec2 = { agent: { session: { header: { cwd: root2, id: 'trace2' } } }, to
   ok('literal-only workspace: graph still works, decls marked absent')
 }
 
+// ---- cross-file wrapper (preload DSL in one module, calls in another) -----
+// The shape VCPChat uses: `invoke()` lives in core/define.js, every api/*.js
+// file destructures it. Before the cross-file pass these calls produced no
+// edges at all, so every renderer-side channel looked callerless.
+
+const root3 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace3-'))
+const write3 = (rel, text) => {
+  const abs = path.join(root3, ...rel.split('/'))
+  fs.mkdirSync(path.dirname(abs), { recursive: true })
+  fs.writeFileSync(abs, text)
+}
+write3('preloads/core/define.js', `const { ipcRenderer } = require('electron')
+function invoke(channel, ...argSpec) {
+  return (...args) => ipcRenderer.invoke(channel, ...args)
+}
+function send(channel, ...argSpec) {
+  return (...args) => ipcRenderer.send(channel, ...args)
+}
+module.exports = { invoke, send }
+`)
+write3('preloads/api/desktop.js', `const { invoke, send } = require('../core/define')
+contextBridge.exposeInMainWorld('electronAPI', {
+  openDesktopWindow: invoke('desktop:open').roles('chat'),
+  closeWindow: send('desktop:close'),
+  local: invoke('desktop:local'),
+})
+function helper(ch) { return invoke(ch) }
+module.exports = {}
+`)
+write3('main/handlers.js', `ipcMain.handle('desktop:open', async () => {})
+ipcMain.on('desktop:close', () => {})
+ipcMain.handle('desktop:local', async () => {})
+`)
+const exec3 = { agent: { session: { header: { cwd: root3, id: 'trace3' } } }, token: {} }
+{
+  const r = await tool.execute({ target: 'ipc:desktop:open' }, exec3)
+  assert.equal(r.found, true)
+  assert.ok(r.text.includes('preloads/api/desktop.js'), r.text)
+  assert.ok(r.text.includes('（wrapper）'), r.text)
+  assert.ok(r.text.includes('### preload 暴露（1）'), r.text)
+  assert.ok(r.text.includes('`openDesktopWindow`'), r.text)
+  ok('cross-file wrapper: imported invoke() resolves to a caller edge + named entry')
+}
+{
+  const r = await tool.execute({ target: 'ipc:desktop:close' }, exec3)
+  assert.ok(r.text.includes('（wrapper）'), r.text)
+  assert.ok(r.text.includes('`closeWindow`'), r.text)
+  assert.ok(r.text.includes('ipcMain.on（literal）'), r.text)
+  ok('cross-file wrapper: send() carries command side through the module boundary')
+}
+{
+  const r = await tool.execute({ target: 'api:openDesktopWindow' }, exec3)
+  assert.equal(r.found, true)
+  assert.ok(r.text.includes('静态推导'), r.text)
+  assert.ok(r.text.includes('Trace ipc:desktop:open'), r.text)
+  ok('api: resolves a preload object key without a declaration file')
+}
+{
+  // A parameterised wrapper must stay unresolved — no phantom channel edges.
+  const r = await tool.execute({ target: 'ipc:desktop:ghost' }, exec3)
+  assert.equal(r.found, false)
+  ok('cross-file wrapper: dynamic parameter never becomes a channel')
+}
+{
+  const r = await tool.execute({ target: 'file:preloads/api/desktop.js' }, exec3)
+  assert.ok(r.text.includes('外部包装调用（3）'), r.text)
+  assert.ok(r.text.includes("invoke('desktop:open')"), r.text)
+  assert.ok(r.text.includes('是否 IPC 取决于 ../core/define'), r.text)
+  ok('file view: imported-wrapper calls are listed even before resolution')
+}
+
+// ---- Vue/Svelte single-file components ------------------------------------
+
+{
+  const root4 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-cmp-'))
+  const exec4 = { agent: { session: { header: { cwd: root4, id: 'cmp' } } }, token: {} }
+  const w = (rel, text) => {
+    const abs = path.join(root4, ...rel.split('/'))
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, text)
+  }
+  w('cmp/dep.ts', 'export const v = 1\n')
+  w('cmp/helper.ts', 'export const h = 1\n')
+  w('cmp/helper.js', 'export const h = 1\n')
+  // lang="ts" makes the script resolve with TS source substitution.
+  w('cmp/panel.vue', `<template><div/></template>\n<script lang="ts">\nimport { v } from './dep'\nimport { h } from './helper'\n</script>\n`)
+  // Vue external script declaration — a dependency edge on the component.
+  w('cmp/external.vue', `<script src="./logic.ts"></script>\n`)
+  w('cmp/logic.ts', 'export const l = 1\n')
+  // Svelte module script in plain JS: require keeps JS extension order.
+  w('cmp/anchor.svelte', `<script context="module">\nimport { v } from './dep'\nconst c = require('./helper')\n</script>\n<div/>\n`)
+  const deps = async (target) => {
+    const r = await tool.execute({ target }, exec4)
+    assert.equal(r.found, true, target)
+    return [...r.text.matchAll(/- → `([^`]+)`/g)].map(m => m[1])
+  }
+  assert.deepEqual(await deps('file:cmp/panel.vue'), ['cmp/dep.ts', 'cmp/helper.ts'])
+  assert.deepEqual(await deps('file:cmp/external.vue'), ['cmp/logic.ts'])
+  assert.deepEqual(await deps('file:cmp/anchor.svelte'), ['cmp/helper.js', 'cmp/dep.ts'])
+  const view = await tool.execute({ target: 'file:cmp/panel.vue' }, exec4)
+  assert.ok(view.text.includes('### 依赖（2）'), view.text)
+  assert.ok(view.text.includes('### IPC 注册（0）'), view.text)
+  const impact = await tool.execute({ target: 'impact:cmp/dep.ts' }, exec4)
+  assert.ok(impact.text.includes('cmp/panel.vue'), impact.text)
+  assert.ok(impact.text.includes('cmp/anchor.svelte'), impact.text)
+  ok('vue/svelte scripts expose dependency edges only; ts scripts prefer TS substitution, js keeps JS order')
+  try { fs.rmSync(root4, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmp */ }
+}
+
+// ---- impact/file evidence carries imported names ---------------------------
+
+{
+  const root5 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-imp-'))
+  const exec5 = { agent: { session: { header: { cwd: root5, id: 'imp' } } }, token: {} }
+  const w = (rel, text) => {
+    const abs = path.join(root5, ...rel.split('/'))
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, text)
+  }
+  w('lib/util.js', 'export const a = 1\nexport const b = 2\n')
+  w('app.js', "import { a, b } from './lib/util.js'\nconst m = require('./lib/util.js')\nconsole.log(a, b, m)\n")
+  const impact = await tool.execute({ target: 'impact:lib/util.js' }, exec5)
+  assert.equal(impact.found, true)
+  assert.ok(impact.text.includes('导入 {a, b'), impact.text)
+  assert.ok(impact.analysis.edges[0].imports?.includes('a'), JSON.stringify(impact.analysis.edges[0]))
+  const view = await tool.execute({ target: 'file:app.js' }, exec5)
+  assert.ok(view.text.includes('导入 {a, b'), view.text)
+  ok('impact/file rows carry the importer\'s bound names, answering which exports are used')
+  try { fs.rmSync(root5, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmp */ }
+}
+
+// ---- Electron preload wiring + diagnostic hygiene --------------------------
+
+{
+  const root6 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-pre-'))
+  const exec6 = { agent: { session: { header: { cwd: root6, id: 'pre' } } }, token: {} }
+  const w = (rel, text) => {
+    const abs = path.join(root6, ...rel.split('/'))
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, text)
+  }
+  for (const p of ['lit.js', 'join.js', 'chart.js']) w(`preloads/${p}`, 'window.x = 1\n')
+  w('main.js', `const path = require('path')
+const PRELOAD_ROLES = Object.freeze({ CHART: 'chart' })
+const resolveProjectPreload = (root, role) => path.join(root, 'preloads', role + '.js')
+const w1 = { webPreferences: { preload: 'preloads/lit.js' } }
+const w2 = { webPreferences: { preload: path.join(__dirname, 'preloads', 'join.js') } }
+const w3 = { webPreferences: { preload: resolveProjectPreload(__dirname, PRELOAD_ROLES.CHART) } }
+const w4 = { webPreferences: { preload: PRELOAD_ROLES.CHART } }
+const w5 = { webPreferences: { preload: 'ready' } }
+module.exports = { w1, w2, w3, w4, w5 }
+`)
+  w('noise.js', "require('left-pad')\nexport const n = 1\n")
+  // Cross-file const: main2.js destructures the table, so its own const
+  // resolution fails and the link graph must retry via preloadPaths' export.
+  w('preloadPaths.js', `const PRELOAD_ROLES = Object.freeze({ CHART: 'chart' })
+module.exports = { PRELOAD_ROLES }
+`)
+  w('main2.js', "const { PRELOAD_ROLES } = require('./preloadPaths')\nconst w = { webPreferences: { preload: PRELOAD_ROLES.CHART } }\nmodule.exports = { w }\n")
+  w('.workbuddy/_dsh/asar-out/broken.js', 'const const const broken(((\n')
+  w('.hostcache/_dsh/dump.js', 'const const const broken(((\n')
+  // Same-reason floods in an ordinary dot-directory collapse to two header rows.
+  w('.vendor/gen/min1.js', 'const const const broken(((\n')
+  w('.vendor/gen/min2.js', 'const const const broken(((\n')
+  w('.vendor/gen/min3.js', 'const const const broken(((\n')
+  const deps = async (target) => {
+    const r = await tool.execute({ target }, exec6)
+    assert.equal(r.found, true, target)
+    return r
+  }
+  const lit = await deps('impact:preloads/lit.js')
+  assert.ok(lit.text.includes('main.js'), lit.text)
+  assert.ok(lit.analysis.edges.some(e => e.from === 'main.js' && e.kind === 'preload' && e.evidence.confidence === 'certain'), JSON.stringify(lit.analysis.edges))
+  const chart = await deps('impact:preloads/chart.js')
+  assert.ok(chart.analysis.edges.some(e => e.from === 'main.js' && e.kind === 'preload' && e.evidence.confidence === 'candidate'), JSON.stringify(chart.analysis.edges))
+  const join = await deps('impact:preloads/join.js')
+  assert.ok(join.analysis.edges.some(e => e.from === 'main.js' && e.evidence.confidence === 'certain'), JSON.stringify(join.analysis.edges))
+  assert.equal(chart.partialFiles, 3, 'only .vendor/gen partials count; _dsh-marked containers stay outside the scan')
+  assert.ok(chart.scanned <= 10, `scanned=${chart.scanned}`)
+  assert.ok(/另有 \d+ 项外部包/.test(chart.text), chart.text)
+  assert.ok(chart.text.includes('已折叠') && chart.text.includes('同目录另有 2 个'), chart.text)
+  const certain = await tool.execute({ target: 'impact:preloads/chart.js', edgeMode: 'certain' }, exec6)
+  assert.equal(certain.analysis.totalFiles, 0, 'role-resolved preload wiring is a candidate, not certain')
+  const cross = await deps('impact:preloads/chart.js')
+  assert.ok(cross.analysis.edges.some(e => e.from === 'main2.js' && e.kind === 'preload' && e.evidence.confidence === 'candidate'), JSON.stringify(cross.analysis.edges))
+  ok('preload wiring closes the impact gap for preloads/ (literal/join/const/role); .workbuddy noise and external-package counts stay out of per-query diagnostics')
+  try { fs.rmSync(root6, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmp */ }
+}
+
 rmRoot()
 try { fs.rmSync(root2, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmp */ }
+try { fs.rmSync(root3, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmp */ }
 
 console.log(`\n${passed} trace groups passed`)

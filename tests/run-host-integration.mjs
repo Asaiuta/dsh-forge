@@ -5,11 +5,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { syncBuiltinESMExports } from 'node:module'
-import { apply } from '../lib/index.js'
+import { apply, Config, inject } from '../lib/index.js'
 import { createStatusCommand } from '../lib/tools.js'
 import { withFileLock } from '../lib/core.js'
 import { storeFor, recordBatch, readLedgerTail } from '../lib/ledger.js'
-import { createTraceTool } from '../lib/tools-trace.js'
+import { createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { localEnv } from '../scripts/local-env.mjs'
 
 const modules = localEnv('DSH_FORGE_DSH_MODULES')
@@ -22,6 +22,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
   const { SandboxPolicyService } = await load('dsh-sandbox-policy')
   const observationPolicy = await load('dsh-fs-observation-policy')
   const { ToolRuntime } = await load('dsh-tools')
+  const { Context } = await load('cordis')
   const runtime = Object.create(ToolRuntime.prototype)
   runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
   // DSH intentionally permits platform temp roots under workspace-write.
@@ -61,15 +62,34 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
   }
   const put = (file, text = 'function One() { return 1; }\n') => fs.writeFileSync(path.join(root, file), text)
   try {
+    const activation = new Context(), scope = new Context(), globalDefinitions = [], scopedDefinitions = [], sections = []
+    activation.provide('tools', { register(definition) { globalDefinitions.push(definition); return () => {} },
+      get(name, gotScope) { return (gotScope === scope ? scopedDefinitions.find(d=>d.name===name) : undefined) ?? globalDefinitions.find(d=>d.name===name) } })
+    scope.provide('tools', { register(definition) { scopedDefinitions.push(definition); return () => {} } })
+    activation.provide('commands', { register() { return () => {} } })
+    activation.provide('fs', { observeNativeRead() {} })
+    activation.provide('systemPrompt', { section(section) { sections.push(section); return () => {} } })
+    activation.provide('agents', { list: () => [{ctx:scope}] })
+    const mounted = activation.plugin({ name:'forge-loader-regression', Config, inject, apply }, { registration:'takeover', takeover:['read','glob','grep'], prewarm:false })
+    await new Promise(resolve=>setImmediate(resolve))
+    assert.equal(globalDefinitions.length,6); assert.equal(scopedDefinitions.length,3)
+    assert.equal(sections.length,1)
+    const activationGuidance = sections[0].text({scope})
+    assert.match(activationGuidance,/read view=outline/)
+    assert.match(activationGuidance,/Find files by path → glob with pattern/)
+    assert.match(activationGuidance,/Search file contents → grep with a regular-expression pattern/)
+    assert.ok(!activationGuidance.includes('mode=name') && !activationGuidance.includes('patterns for'))
+    mounted.dispose(); await new Promise(resolve=>setImmediate(resolve))
+    ok('the installed Cordis loader validates the complete plugin Config and activates all 9 takeover tools')
     for (const defaultMode of ['read-only', 'workspace-write', 'danger-full-access']) {
       const { call } = mount(defaultMode)
       for (const mode of [undefined, 'read-only', 'workspace-write', 'danger-full-access']) {
         put('one.js')
         const exec = execFor(mode), effective = mode || defaultMode
-        for (const [name, args] of [ ['ff_read',{path:'one.js'}], ['ff_read_symbol',{path:'one.js',symbol:'One'}],
-          ['ff_outline',{path:'one.js'}], ['fftrace',{target:'file:one.js'}], ['ffgrep',{pattern:'One'}],
-          ['fffind',{pattern:'one.js'}], ['fff_multi_grep',{patterns:['One','return']}],
-          ['ff_find_symbol',{name:'One'}], ['ff_project',{action:'list'}], ['ffhistory',{}] ]) {
+        for (const [name, args] of [ ['ff_read',{path:'one.js'}], ['ff_read',{path:'one.js',symbol:'One'}],
+          ['ff_read',{view:'outline',path:'one.js'}], ['fftrace',{target:'file:one.js'}], ['ffgrep',{pattern:'One'}],
+          ['fffind',{pattern:'one.js'}], ['ffgrep',{patterns:['One','return']}],
+          ['ff_read',{view:'definitions',symbol:'One'}], ['ffhistory',{}] ]) {
           await call(name,args,exec)
         }
         const mutation = () => call('ffedit', {path:'one.js',steps:[{start:1,text:'function One() { return 2; }'}],reason:'sandbox integration'},exec)
@@ -77,10 +97,10 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
           await assert.rejects(mutation,/read-only/)
           assert.match(fs.readFileSync(path.join(root,'one.js'),'utf8'),/return 1/)
         } else assert.equal((await mutation()).status,'applied')
-        ok(`installed sandbox default=${defaultMode}, session=${mode || 'default'}: 10 registered reads + write policy`)
+        ok(`installed sandbox default=${defaultMode}, session=${mode || 'default'}: 9 registered reads + write policy`)
       }
     }
-    const { call, observations, provider } = mount('workspace-write'), exec = execFor('workspace-write')
+    const { call, observations, provider, host } = mount('workspace-write'), exec = execFor('workspace-write')
     for (const file of ['batch-a.js','batch-b.js','glob.js','symbol.js']) put(file)
     await call('ff_read',{paths:['batch-a.js','batch-b.js']},exec)
     await call('ff_read',{glob:'glob.js'},exec)
@@ -97,13 +117,13 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     await call('ff_read',{path:'ticket.txt'},exec)
     const ticket=await call('ffedit',{path:'ticket.txt',steps:[{find:'A',replaceWith:'B'}],reason:'host ticket'},exec)
     assert.equal(ticket.status,'ticket')
-    const resolved=await call('ffresolve',{ticket:ticket.ticket,choice:0},exec)
+    const resolved=await call('ffedit',{ticket:ticket.ticket,choice:'0'},exec)
     assert.equal(resolved.status,'applied')
-    assert.ok((await call('ff_diff',{batch:resolved.batch},exec)).items.length)
+    assert.ok((await call('ffhistory',{batch:resolved.batch},exec)).items.length)
     const rollback=await call('ffrollback',{batch:String(resolved.batch),dryRun:false,reason:'host rollback'},exec)
     assert.ok(rollback.newBatch)
     assert.equal(fs.readFileSync(path.join(root,'ticket.txt'),'utf8'),'A\nA\n')
-    ok('all 15 registered tool success contracts, including ticket resolution, immutable diff and rollback, materialize in the actual SDK')
+    ok('every registered read tool success contract, including ticket resolution, immutable diff and rollback, materialize in the actual SDK')
 
     put('race.js')
     const raced = execFor('workspace-write'), before = observations.length
@@ -120,9 +140,13 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     try { await call('ff_read',{path:'race.js#One'},raced) }
     finally { fs.readSync = originalRead; syncBuiltinESMExports() }
     assert.equal(observations.slice(before).filter(item=>item.path.endsWith('race.js')).length,0)
-    await assert.rejects(()=>call('ffedit',{path:'race.js',steps:[{start:1,text:'function Plugin() {}'}],reason:'race'},raced),/write-intent refused/)
+    // ffedit performs its own observed planning read. Check the interrupted
+    // read's policy state directly, before another operation can refresh it.
+    const raceTarget = await provider.resolve(path.join(root,'race.js'))
+    const raceIntent = await host.waterfall('fs/write-intent', raceTarget, raced, () => undefined)
+    assert.equal(raceIntent.kind, 'createIfAbsent')
     assert.match(fs.readFileSync(path.join(root,'race.js'),'utf8'),/Human/)
-    ok('a changing file is never marked observed; subsequent unobserved edit preserves human bytes')
+    ok('a changing file is never marked observed; its write intent still refuses replacing existing bytes')
 
     put('alias-one.js','function First() {}\n');put('alias-two.js','function Second() {}\n')
     const alias=path.join(root,'alias.js');fs.symlinkSync(path.join(root,'alias-one.js'),alias)
@@ -143,7 +167,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     ok('a redirected symlink reads its fixed canonical target and does not observe a changed alias')
 
     for (const [name,args] of [['ff_read',{path:'alias.js'}],['ff_read',{path:'alias.js#First'}],
-      ['ff_outline',{path:'alias.js'}],['ff_read_symbol',{path:'alias.js',symbol:'First'}]]) {
+      ['ff_read',{view:'outline',path:'alias.js'}],['ff_read',{path:'alias.js',symbol:'First'}]]) {
       fs.unlinkSync(alias);fs.symlinkSync(path.join(root,'alias-one.js'),alias)
       let redirected=false,restored=false
       const readFile=fs.readFileSync,readFd=fs.readSync,mark=observations.length
@@ -166,11 +190,11 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
       assert.equal(observations.length,mark+1)
       assert.equal(observations.at(-1).targetKey,path.join(root,'alias-one.js'))
     }
-    ok('alias ABA during plain/symbol/outline/read_symbol reads cannot observe bytes from another target')
+    ok('alias ABA during plain/symbol/outline/ff_read#Symbol reads cannot observe bytes from another target')
 
     put('backing','export function Typed(value: number): number { return value; }\n')
     fs.symlinkSync(path.join(root,'backing'),path.join(root,'typed.ts'))
-    for (const [name,args] of [['ff_outline',{path:'typed.ts'}],['ff_read_symbol',{path:'typed.ts',symbol:'Typed'}],
+    for (const [name,args] of [['ff_read',{view:'outline',path:'typed.ts'}],['ff_read',{path:'typed.ts',symbol:'Typed'}],
       ['ff_read',{path:'typed.ts#Typed'}]]) {
       const value=await call(name,args,execFor('workspace-write'))
       assert.match(JSON.stringify(value),/Typed/)
@@ -182,18 +206,23 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     await call('ff_read',{path:'shared-lock.txt'},concurrentExec)
     const target=await provider.resolve(path.join(root,'shared-lock.txt'))
     const version=(await provider.stat(target)).version
-    let staged,release
+    let staged,release,waiting
     const ready=new Promise(resolve=>{staged=resolve}), blocked=new Promise(resolve=>{release=resolve})
+    const lockRequested=new Promise(resolve=>{waiting=resolve}), originalWithLock=provider.withLock
     provider.internals.inspectTemp=async()=>{staged();await blocked}
     const dsh=provider.writeText(target,'DSH\n',{kind:'replaceIfVersion',version},undefined,{mode:'workspace-write',workspaceRoot:root})
     await ready
+    provider.withLock=function(key,operation){if(key===target.targetKey)waiting();return originalWithLock.call(this,key,operation)}
     let forgeFinished=false
     const forge=call('ffedit',{path:'shared-lock.txt',steps:[{start:1,text:'FORGE'}],reason:'provider concurrency'},concurrentExec)
       .then(value=>({value}),error=>({error})).finally(()=>{forgeFinished=true})
-    await new Promise(resolve=>setTimeout(resolve,30))
-    assert.equal(forgeFinished,false)
-    release();await dsh
-    const outcome=await forge
+    let outcome
+    try {
+      await lockRequested
+      assert.equal(forgeFinished,false)
+      release();await dsh
+      outcome=await forge
+    } finally {release();provider.withLock=originalWithLock}
     assert.match(outcome.error?.message || '',/write-intent refused|file changed/)
     assert.equal(fs.readFileSync(path.join(root,'shared-lock.txt'),'utf8'),'DSH\n')
     provider.internals={}
@@ -226,11 +255,18 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     setImmediate(()=>abort.abort(new Error('trace cancelled')))
     await assert.rejects(()=>pending,/trace cancelled|resolve aborted/)
     const scanAbort=new AbortController()
+    resetTraceFactsCache() // Ensure there is an in-flight scan to cancel.
     const scanning=createTraceTool().execute({target:'file:one.js'},{...exec,signal:scanAbort.signal})
     setImmediate(()=>scanAbort.abort(new Error('scan cancelled')))
     await assert.rejects(()=>scanning,/scan cancelled/)
     assert.equal(fs.existsSync(path.join(root,'unexpected-execution')),false)
     ok('Trace defaults to static facts, accepts validated JSON data, never executes registry, and honors cancellation')
+    put('native.rs', '#[no_mangle]\npub extern "C" fn shared() {}\n')
+    fs.writeFileSync(path.join(root,'native.wasm'), Buffer.from('0061736d01000000010401600000020c0103656e7604726561640000070a01067368617265640000','hex'))
+    const ffi = await call('fftrace', {target:'ffi:shared'}, exec)
+    assert.equal(ffi.ffi.total, 2); assert.ok(ffi.ffi.matches.some(ref=>ref.lang==='binary'))
+    assert.ok(ffi.ffi.matches.some(ref=>ref.kind==='source-export'))
+    ok('FFI source and binary evidence materialize through the installed SDK output schema')
 
     const roots = ['A','B'].map(name=>{const dir=path.join(base,name);fs.mkdirSync(dir);return dir})
     const stores = roots.map(storeFor)

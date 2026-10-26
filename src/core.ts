@@ -68,10 +68,20 @@ export function historyDbPath(): string {
 // Guards
 // ---------------------------------------------------------------------------
 
-/** Windows drives, UNC roots, and POSIX `/` are all refused as index roots. */
+/**
+ * Windows drives, UNC roots, and POSIX `/` are all refused as index roots.
+ *
+ * The test is equality against the parsed root, NOT `root === dir`: for a
+ * single-segment absolute path (`C:\Users`, `D:\work`) `path.dir`
+ * *is* the drive root, so the older form refused every top-level directory on a
+ * drive. That is precisely the case the guidance promises — "pass path at any
+ * directory (another checkout, another drive)" — and it was measured failing in
+ * three real sessions (`refusing to index the filesystem root C:\Users`,
+ * `… D:\work`).
+ */
 export function isFsRoot(dir: string): boolean {
-  const parsed = path.parse(path.resolve(dir))
-  return parsed.root === parsed.dir
+  const resolved = path.resolve(dir)
+  return resolved === path.parse(resolved).root
 }
 
 export function isHomeDir(dir: string): boolean {
@@ -88,7 +98,13 @@ export function isHomeDir(dir: string): boolean {
 
 /** Structural slice of the DSH tool-execution context this module reads. */
 export interface ForgeExec {
-  agent?: { session?: { header?: { cwd?: string; id?: string } } }
+  agent?: {
+    session?: { header?: { cwd?: string; id?: string } }
+    /** Present on the real host agent (blackhole reads the same fields for
+     *  compaction routing); optional here — provenance labels degrade to
+     *  "session" when absent. */
+    options?: { provider?: string; model?: string }
+  }
   signal?: AbortSignal
   /** Host-owned capability; revalidates persisted ticket/history targets. */
   authorizeNativePaths?: (files: readonly string[]) => Promise<void>
@@ -106,6 +122,36 @@ export async function withNativeWrite<T>(exec: ForgeExec | undefined, files: rea
   return operation()
 }
 
+/**
+ * Read a file through the host's observation channel before any write.
+ *
+ * DSH's write-intent policy refuses a mutation whose target this session has
+ * not observed (`fs/observed`). A bare `readFileSync` reads the bytes but
+ * publishes nothing, so the write is refused with "read the current file
+ * through DSH/forge before editing" — measured on seven `ff_file` removals in
+ * one session, all of which succeeded once the model had run `ff_read` over the
+ * same paths first. `finish()` publishes the version the write is then checked
+ * against; for a file that does not exist yet it publishes `absent`, which is
+ * what the host's `createIfAbsent` guard needs.
+ *
+ * @param exec - tool execution context; without a host channel this degrades to
+ *   a plain read of `file`.
+ * @param file - absolute path of the file about to be read (and later written).
+ * @param read - reader taking the resolved path the host wants read.
+ * @returns whatever `read` returned.
+ */
+export async function observedRead<T>(
+  exec: ForgeExec | undefined,
+  file: string,
+  read: (path: string) => T | Promise<T>,
+): Promise<T> {
+  if (!exec?.beginNativeRead) return read(file)
+  const observed = await exec.beginNativeRead(file)
+  const value = await read(observed.path)
+  await observed.finish()
+  return value
+}
+
 /** Same resolution the built-in fs-search tools use. */
 export function workdirOf(exec: ForgeExec | undefined): string {
   return exec?.agent?.session?.header?.cwd ?? process.cwd()
@@ -117,7 +163,24 @@ export function workdirOf(exec: ForgeExec | undefined): string {
 
 const MAIN_SCAN_WAIT_MS = 20_000
 const AUX_SCAN_WAIT_MS = 5_000
-const AUX_POOL_MAX = 4
+// Raised from 4. A single session that scoped into `app`, `app/node_modules`,
+// `.../@deepseek-ai`, `.../dsh-compaction`, `.../dsh-compaction-basic` and
+// `tests` created six distinct aux roots, so roots were evicted and recreated
+// cold mid-run — each rebuild racing a 5 s budget on a 23k-file tree. That race
+// is what made the same call return 3816 matches once and 0 the next time.
+const AUX_POOL_MAX = 8
+
+/**
+ * Ceiling for a background pre-warm to reach the *fully ready* state.
+ *
+ * `main()` waits for the file scan only (`MAIN_SCAN_WAIT_MS`); the content
+ * index and bigram warmup keep running afterwards, and a query issued during
+ * that window is answered by a live fallback pass — measured on a 5k-file tree:
+ * the scan-only path still cost ~1.9 s per query, while the fully ready index
+ * answered in 1 ms. Pre-warming therefore has to wait for readiness, not for the
+ * scan, and it may take its time because nothing is blocked on it.
+ */
+const PREWARM_READY_WAIT_MS = 120_000
 
 export interface FinderLease {
   finder: FileFinderApi
@@ -216,6 +279,36 @@ export class FinderPool {
     this.#initing.clear()
   }
 
+  /**
+   * Build — or finish building — the index for a workspace root in the
+   * background, and resolve once queries are at steady state.
+   *
+   * The plugin is otherwise lazy ("nothing at session start"), which is correct
+   * for a profile that never searches but leaves the *first* real query paying
+   * for everything: measured on a 5k-file tree, 2.9 s cold, ~2.0 s on a second
+   * session even with the index already on disk (because only the scan was
+   * awaited, not the warmup), then 4 ms once a pre-warm had finished the same
+   * work off the critical path. Pre-warming moves that cost into idle time.
+   *
+   * Everything here is best-effort by construction: a destroyed pool, a refused
+   * root (filesystem root), or a slow engine all resolve quietly. The tool path
+   * rebuilds or reports the real failure when a query actually needs it, and a
+   * background failure must never surface as an unhandled rejection in the host.
+   *
+   * @param basePath - workspace root to index.
+   */
+  async warm(basePath: string): Promise<void> {
+    if (this.#destroyed) return
+    try {
+      const lease = await this.main(basePath)
+      if ('error' in lease) return
+      const ready = (lease.finder as { waitForIndexReady?: (timeoutMs?: number) => Promise<unknown> }).waitForIndexReady
+      if (typeof ready === 'function') await ready.call(lease.finder, PREWARM_READY_WAIT_MS)
+    } catch {
+      // Best-effort: see the doc comment.
+    }
+  }
+
   #safeDestroy(finder: FileFinderApi): void {
     try {
       finder.destroy()
@@ -271,8 +364,22 @@ export class FinderPool {
 
 export const GREP_LIMIT_DEFAULT = 30
 export const GREP_LIMIT_MAX = 200
+/**
+ * Per-file match cap handed to the engine.
+ *
+ * The engine collects matches a whole file at a time and only then stops at
+ * `pageSize`, so this cap — not `limit` — is what bounds a page when one file
+ * matches a lot: measured on a 500-match file, `pageSize: 5` still returned 501
+ * items. A cap of 200 (the engine default) therefore drops the rest of that file
+ * with `nextCursor: null`, i.e. the lines are gone and nothing says so. Raised
+ * an order of magnitude so only a genuinely pathological file reaches it; when
+ * one does, the page carries a note naming it.
+ */
+export const GREP_MAX_MATCHES_PER_FILE = 2_000
 export const FIND_LIMIT_DEFAULT = 30
 export const FIND_LIMIT_MAX = 200
+export const GLOB_LIMIT_DEFAULT = 100
+export const GLOB_LIMIT_MAX = 1000
 export const CONTEXT_MAX = 20
 export const LINE_MAX_CHARS = 500
 export const TIME_BUDGET_DEFAULT_MS = 10_000
@@ -382,8 +489,15 @@ export function parseConstraints(raw: string | undefined): { includes: string[];
   return { includes, excludes }
 }
 
-/** Glob → RegExp supporting `**`, `*`, `?`, and `{a,b}` alternation. */
-export function globToRegExp(glob: string): RegExp {
+/**
+ * Glob → RegExp supporting `**`, `*`, `?`, and `{a,b}` alternation.
+ *
+ * @param glob - the pattern.
+ * @param insensitive - `i` flag. True for forge's own constraints (a Windows
+ *   model typing `*.TS` means `*.ts`); **false** when the result has to answer
+ *   for ripgrep's `--glob`, whose case sensitivity follows the filesystem.
+ */
+export function globToRegExp(glob: string, insensitive = true): RegExp {
   let source = ''
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i]
@@ -409,12 +523,16 @@ export function globToRegExp(glob: string): RegExp {
       source += ch
     }
   }
-  return new RegExp(`^(?:${source})$`, 'i')
+  return new RegExp(`^(?:${source})$`, insensitive ? 'i' : '')
 }
 
 /** Parse `L10-20` / `L10` / `10-20` into a 1-based inclusive range; null when malformed. */
 export function parseLineRange(raw: string): { start: number; end: number } | null {
-  const match = /^L?(\d+)(?:\s*-\s*(\d+))?$/i.exec(raw.trim())
+  // The second bound may carry its own "L" too. Models write "L180-L420" as
+  // naturally as "L180-420" (the "L" reads as "line"), and a real session hit
+  // the rejection in exactly that form before retrying — the prefix is noise
+  // either way, so accept both.
+  const match = /^L?(\d+)(?:\s*-\s*L?(\d+))?$/i.exec(raw.trim())
   if (!match) return null
   const start = Number(match[1])
   const end = match[2] === undefined ? start : Number(match[2])
@@ -430,8 +548,11 @@ export interface ConstraintFilter {
 export function compileConstraintFilter(raw: string | undefined): ConstraintFilter | undefined {
   const { includes, excludes } = parseConstraints(raw)
   if (includes.length === 0 && excludes.length === 0) return undefined
-  const includeRes = includes.map(globToRegExp)
-  const excludeRes = excludes.map(globToRegExp)
+  // Wrapped, not passed by reference: `map` would hand the array index in as
+  // `insensitive`, and index 0 is falsy — which silently made the first glob
+  // case-SENSITIVE.
+  const includeRes = includes.map((glob) => globToRegExp(glob))
+  const excludeRes = excludes.map((glob) => globToRegExp(glob))
   const normalized = (p: string) => p.split(path.sep).join('/')
   return (relativePath: string) => {
     const p = normalized(relativePath)
@@ -448,6 +569,12 @@ export function compileConstraintFilter(raw: string | undefined): ConstraintFilt
 export interface GrepItem {
   file: string
   line: number
+  /**
+   * 0-based **byte** offset of the match within the line, as the engine reports
+   * it — not a 1-based character column. A caller that needs to point at the
+   * text must index by bytes (`Buffer.byteLength(line.slice(0, at), 'utf8')`),
+   * which is what `overlay.ts` does to stay in the same unit.
+   */
   col: number
   text: string
   git: string
@@ -533,6 +660,42 @@ export function renderFindItems(items: FindItem[], header: string[]): string {
     lines.push(`${item.path}${bits.length > 0 ? `  (${bits.join(', ')})` : ''}`)
   }
   return lines.join('\n')
+}
+
+/**
+ * Detect the "looked in the wrong place" find result, so the tool can say so
+ * instead of handing back a coincidence as if it were an answer.
+ *
+ * A name search only answers a name question. When the query names something
+ * that is not a file — a package, a symbol, a config value — fff still returns
+ * its best fuzzy coincidences, and a caller that gets one line back has no way
+ * to tell "found it" from "nothing here, here is my least-bad guess".
+ *
+ * Two conditions, both required, both measured rather than tuned:
+ *
+ * 1. **No literal occurrence.** No returned path contains the query (or, for a
+ *    multi-term query, every term) as a case-insensitive substring. This is a
+ *    fact about the result, not a threshold: a genuine prefix query such as
+ *    `guidanc` → `src/guidance.ts` matches literally and stays silent.
+ * 2. **A handful of hits at most.** A genuine typo query produces a *ranked
+ *    list* — the ranking is the answer, and annotating it is noise. Measured on
+ *    this corpus: `stroe` returned 50 candidates, while a query naming a
+ *    non-file (`dsh-forge`) returned exactly 1 coincidence at score 70 —
+ *    against 116 for a real prefix match and 219 for an exact one.
+ *
+ * @param query - the raw pattern the caller passed.
+ * @param items - the shaped results, in engine rank order.
+ * @param maxItems - most hits that can still count as "a couple of coincidences".
+ * @returns true when the caller should be told the name surface has no answer.
+ */
+export function weakNameMatch(query: string, items: FindItem[], maxItems = 3): boolean {
+  if (items.length === 0 || items.length > maxItems) return false
+  const terms = query.toLowerCase().split(/\s+/).filter((term) => term !== '')
+  if (terms.length === 0) return false
+  return items.every((item) => {
+    const path = item.path.toLowerCase()
+    return !terms.every((term) => path.includes(term))
+  })
 }
 
 // ---------------------------------------------------------------------------

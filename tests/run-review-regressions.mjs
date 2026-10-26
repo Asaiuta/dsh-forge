@@ -5,11 +5,14 @@ import path from 'node:path'
 import os from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 import { spawnSync } from 'node:child_process'
-import { createFindSymbolTool, createReadSymbolTool } from '../lib/tools-symbol.js'
+import { definitionsView } from './lib/read-views.mjs'
+import { createReadTool } from '../lib/tools-read.js'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { AstWorkerPool } from '../lib/ast-pool.js'
 import { parseFile, fileFacts, flattenSymbols } from '../lib/ast.js'
 import { storeFor, readKnownState, recordBatch, readLedgerTail, atomicWrite, prepareWorkspace } from '../lib/ledger.js'
-import { ProjectRegistry, listProjects } from '../lib/projects.js'
+// A ledger that already holds a project batch is still 'strict' for recovery:/n// projects are gone, but those ledgers must keep replaying instead of failing.
+const seedLegacyProject = store => recordBatch(store, { kind: 'project', reason: 'legacy project ledger', actor: 'test', nodes: [] })
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(),'forge-review-regressions-'))
 const previousData=process.env.DSH_FORGE_DATA_DIR, previousWorkers=process.env.DSH_FORGE_AST_WORKERS
@@ -20,7 +23,7 @@ let passed=0
 const ok=message=>console.log(`ok ${++passed} - ${message}`)
 try {
   fs.writeFileSync(path.join(root,'same.ts'),'interface Item { value: number }\nfunction Item() { return 7; }\n')
-  const read=createReadSymbolTool(), find=createFindSymbolTool(workers)
+  const read=symbolReader(createReadTool), find=definitionsView(createReadTool(workers))
   for(const count of ['0','2']) {
     process.env.DSH_FORGE_AST_WORKERS=count
     const result=await find.execute({name:'Item',kind:'function',limit:1},exec)
@@ -103,13 +106,13 @@ try {
 
   for (const kind of ['file','project']) for (const phase of ['partial','before-flush','complete']) {
     const work=path.join(root,`${kind}-${phase}`);fs.mkdirSync(work)
-    const registry=new ProjectRegistry()
-    await registry.create(work,'.','initial','','test','strict project')
+    await prepareWorkspace(storeFor(work))
+    if (kind==='project') seedLegacyProject(storeFor(work))
+    else recordBatch(storeFor(work),{kind:'edit',reason:'initial',actor:'test',nodes:[]})
     const strictStore=storeFor(work),target=path.join(work,'file.txt'),initial=fs.readFileSync(strictStore.ledgerFile)
     fs.writeFileSync(target,'BEFORE')
     const code=`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
       import {commitFiles,storeFor,putBlob} from ${JSON.stringify(new URL('../lib/ledger.js',import.meta.url).href)};
-      import {ProjectRegistry} from ${JSON.stringify(new URL('../lib/projects.js',import.meta.url).href)};
       const work=${JSON.stringify(work)},target=${JSON.stringify(target)},store=storeFor(work),write=fs.writeSync,flush=fs.fsyncSync;
       fs.writeSync=(fd,buffer,offset,length,position)=>{
         if(${phase==='partial'} && fs.fstatSync(fd).ino===fs.statSync(store.ledgerFile).ino){write(fd,buffer,offset,17,position);flush(fd);process.exit(77)}
@@ -118,8 +121,7 @@ try {
         return count};
       fs.fsyncSync=fd=>{flush(fd);if(${phase==='complete'} && fs.fstatSync(fd).ino===fs.statSync(store.ledgerFile).ino)process.exit(77)};
       syncBuiltinESMExports();
-      if(${kind==='project'})await new ProjectRegistry().create(work,'.','second','','child','append crash');
-      else {const before=Buffer.from('BEFORE'),after=Buffer.from('AFTER');
+      {const before=Buffer.from('BEFORE'),after=Buffer.from('AFTER');
         const node={file:'file.txt',op:'update',before:putBlob(store,before).id,after:putBlob(store,after).id,bytes:5,eol:'LF',bom:false};
         commitFiles(store,{kind:'edit',reason:'append crash',actor:'child',nodes:[node]},[{file:target,before,after}])}`
     const child=spawnSync(process.execPath,['--input-type=module','-e',code],{encoding:'utf8',timeout:30000,windowsHide:true})
@@ -129,15 +131,15 @@ try {
     const records=readLedgerTail(strictStore)
     assert.equal(records.length,phase==='partial'?1:2)
     assert.deepEqual(fs.readFileSync(strictStore.ledgerFile).subarray(0,initial.length),initial)
-    assert.equal(fs.readFileSync(target,'utf8'),kind==='file' && phase!=='partial'?'AFTER':'BEFORE')
-    assert.equal(listProjects(strictStore).length,kind==='project' && phase!=='partial'?2:1)
+    assert.equal(fs.readFileSync(target,'utf8'),phase!=='partial'?'AFTER':'BEFORE')
     assert.equal(fs.existsSync(path.join(strictStore.dir,'ledger-append.json')),false)
     assert.equal(fs.existsSync(path.join(strictStore.dir,'transaction.json')),false)
   }
-  ok('real hard exits mid-append, before flush and after flush recover strict project/file transactions with exact committed identities')
+  ok('real hard exits mid-append, before flush and after flush recover plain and strict-ledger transactions with exact committed identities')
 
   const protectedWork=path.join(root,'strict-unknown');fs.mkdirSync(protectedWork)
-  await new ProjectRegistry().create(protectedWork,'.','protected','','test','strict unknown')
+  await prepareWorkspace(storeFor(protectedWork))
+  seedLegacyProject(storeFor(protectedWork))
   const protectedStore=storeFor(protectedWork),protectedPrefix=fs.readFileSync(protectedStore.ledgerFile)
   fs.appendFileSync(protectedStore.ledgerFile,'{"t":"b"')
   await assert.rejects(()=>prepareWorkspace(protectedStore),/corrupt project ledger tail/)

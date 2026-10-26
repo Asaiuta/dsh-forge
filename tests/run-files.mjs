@@ -5,9 +5,7 @@ import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 import { createFileTool } from '../lib/tools-files.js'
-import { createProjectTool } from '../lib/tools-project.js'
-import { createRollbackTool } from '../lib/tools-edit.js'
-import { createDiffTool } from '../lib/tools-history.js'
+import { createHistoryTool, createRollbackTool } from '../lib/tools-edit.js'
 import { FinderPool } from '../lib/core.js'
 import { storeFor, readLedgerTail, workspaceKey, putBlob, recordBatch } from '../lib/ledger.js'
 import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
@@ -18,15 +16,13 @@ fs.mkdirSync(path.join(workspace, 'src'), { recursive: true })
 process.env.DSH_FORGE_DATA_DIR = path.join(sandbox, 'data')
 const exec = { agent: { session: { header: { cwd: workspace, id: 'files' } } }, token: {} }
 const file = name => path.join(workspace, name)
-const tool = createFileTool(), projects = createProjectTool(), pool = new FinderPool(), rollback = createRollbackTool(pool)
+const tool = createFileTool(), pool = new FinderPool(), rollback = createRollbackTool(pool)
 const call = args => tool.execute({ reason: 'test', ...args }, exec)
 const undo = batch => rollback.execute({ batch: String(batch), reason: 'undo', dryRun: false }, exec)
 let passed = 0
 const ok = label => console.log(`ok ${++passed} - ${label}`)
 async function main() {
-  const project = (await projects.execute({ action: 'create', name: 'files', root: 'src', reason: 'start' }, exec)).projects[0]
-  const id = project.id
-  const created = await call({ action: 'create', path: 'src/a.txt', content: 'initial\r\n', projectId: id })
+  const created = await call({ action: 'create', path: 'src/a.txt', content: 'initial\r\n' })
   assert.ok(created.batch)
   const runtime = Object.create(ToolRuntime.prototype); runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
   runtime.createSuccessResult(exec, defineTool(tool), created)
@@ -38,14 +34,14 @@ async function main() {
 
   const binary = Buffer.from([0, 255, 77, 10, 128])
   fs.writeFileSync(file('src/blob.bin'), binary)
-  const removed = await call({ action: 'remove', path: 'src/blob.bin', projectId: id })
+  const removed = await call({ action: 'remove', path: 'src/blob.bin' })
   assert.equal(fs.existsSync(file('src/blob.bin')), false)
-  const diff = await createDiffTool().execute({ batch: removed.batch }, exec)
-  assert.equal(diff.items[0].binary, true)
+  const diff = await createHistoryTool().execute({ batch: removed.batch }, exec)
+  assert.equal(diff.items[0].diffs[0].binary, true)
   await undo(removed.batch); assert.deepEqual(fs.readFileSync(file('src/blob.bin')), binary)
   ok('remove retains recoverable exact binary bytes and immutable binary diff')
 
-  const moved = await call({ action: 'move', path: 'src/blob.bin', destination: 'src/moved.bin', projectId: id })
+  const moved = await call({ action: 'move', path: 'src/blob.bin', destination: 'src/moved.bin' })
   assert.equal(fs.existsSync(file('src/blob.bin')), false); assert.deepEqual(fs.readFileSync(file('src/moved.bin')), binary)
   assert.equal(readLedgerTail(storeFor(workspace)).find(batch => batch.id === moved.batch).nodes.length, 2)
   await undo(moved.batch)
@@ -57,12 +53,12 @@ async function main() {
   fs.writeFileSync(file('src/source.js'), '/** A */\r\nfunction A() {\r\n  return 1\r\n}\r\nfunction B() {}\r\n')
   fs.writeFileSync(file('src/target.js'), '\uFEFF// target\r\n')
   const originalSource = fs.readFileSync(file('src/source.js')), originalTarget = fs.readFileSync(file('src/target.js'))
-  const copied = await call({ action: 'copy_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1, projectId: id })
+  const copied = await call({ action: 'copy_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1 })
   assert.ok(copied.batch, copied.error)
   assert.deepEqual(fs.readFileSync(file('src/source.js')), originalSource)
   assert.ok(fs.readFileSync(file('src/target.js'), 'utf8').includes('/** A */\r\nfunction A()'))
   await undo(copied.batch); assert.deepEqual(fs.readFileSync(file('src/target.js')), originalTarget)
-  const transferred = await call({ action: 'move_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1, projectId: id })
+  const transferred = await call({ action: 'move_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1 })
   assert.ok(transferred.batch, transferred.error)
   assert.equal(fs.readFileSync(file('src/source.js'), 'utf8').includes('function A'), false)
   await undo(transferred.batch)
@@ -150,9 +146,9 @@ async function main() {
   }
   ok('Rust attributes, C++ templates and JS exported variables travel with their symbols and preserve neighbors')
 
-  const timeline1 = await call({ action: 'create', path: 'src/timeline.txt', content: 'one\n', projectId: id })
-  const timeline2 = await call({ action: 'create', path: 'src/timeline.txt', content: 'two\n', overwrite: true, projectId: id })
-  const point = await rollback.execute({ throughBatch: timeline1.batch, path: 'timeline.txt', projectId: id, dryRun: false, reason: 'point restore' }, exec)
+  const timeline1 = await call({ action: 'create', path: 'src/timeline.txt', content: 'one\n' })
+  const timeline2 = await call({ action: 'create', path: 'src/timeline.txt', content: 'two\n', overwrite: true })
+  const point = await rollback.execute({ throughBatch: timeline1.batch, path: 'timeline.txt', dryRun: false, reason: 'point restore' }, exec)
   assert.equal(point.status, 'applied', point.error)
   assert.equal(fs.readFileSync(file('src/timeline.txt'), 'utf8'), 'one\n')
   await undo(point.newBatch)
@@ -160,10 +156,10 @@ async function main() {
   assert.match((await rollback.execute({ batch: String(timeline2.batch), throughBatch: timeline1.batch, reason: 'invalid' }, exec)).error, /exactly one/)
   ok('throughBatch restores file state at a named ledger boundary and its own rollback redoes the current bytes')
 
-  const boundary = await call({ action: 'create', path: 'src/external-time.txt', content: 'AT_BOUNDARY', projectId: id })
+  const boundary = await call({ action: 'create', path: 'src/external-time.txt', content: 'AT_BOUNDARY' })
   fs.writeFileSync(file('src/external-time.txt'), 'EXTERNAL_AFTER_BOUNDARY')
-  await call({ action: 'create', path: 'src/external-time.txt', content: 'CURRENT', overwrite: true, projectId: id })
-  const boundaryUndo = await rollback.execute({ throughBatch: boundary.batch, path: 'external-time.txt', projectId: id, dryRun: false, reason: 'external boundary' }, exec)
+  await call({ action: 'create', path: 'src/external-time.txt', content: 'CURRENT', overwrite: true })
+  const boundaryUndo = await rollback.execute({ throughBatch: boundary.batch, path: 'external-time.txt', dryRun: false, reason: 'external boundary' }, exec)
   assert.equal(boundaryUndo.status, 'applied', boundaryUndo.error)
   assert.equal(fs.readFileSync(file('src/external-time.txt'), 'utf8'), 'AT_BOUNDARY')
   await undo(boundaryUndo.newBatch)
@@ -183,11 +179,10 @@ async function main() {
   ok('second-file failure compensates the first deletion and leaves no committed batch')
 
   assert.match((await call({ action: 'create', path: '../escape', content: 'x' })).error, /inside/)
-  assert.match((await call({ action: 'create', path: 'outside-project.txt', content: 'x', projectId: id })).error, /outside project/)
   assert.match((await call({ action: 'create', path: 'missing/parent.txt', content: 'x' })).error, /parent/)
   fs.writeFileSync(file('src/invalid.js'), Buffer.from([65, 255, 10]))
   assert.ok((await call({ action: 'copy_code', path: 'src/invalid.js', symbol: 'A', destination: 'src/target.js', after: 0 })).error)
-  ok('workspace/project containment, absent parents and invalid source encoding fail before writes')
+  ok('workspace containment, absent parents and invalid source encoding fail before writes')
 
   fs.writeFileSync(file('src/human.txt'), 'HUMAN\n')
   const link = file('src/link.txt')
@@ -288,6 +283,37 @@ async function main() {
   const moveSame = await call({ action: 'move_code', path: 'lib.js', fromLines: 'L1-3', destination: 'lib.js', after: 2 })
   assert.ok(moveSame.error.includes('inside the source block'))
   ok('same-file move into the source block refuses')
+  // --- host write-intent observation ---------------------------------------
+  // DSH refuses a mutation whose target the session has not observed
+  // (`fs/write-intent` → "read the current file through DSH/forge before
+  // editing"). A bare readFileSync publishes nothing, so every target of a batch
+  // must go through `beginNativeRead` before the write is attempted — a recorded
+  // session lost seven `ff_file` removals to this until the model happened to
+  // `ff_read` the same paths first.
+  {
+    const observed = []
+    const observing = {
+      ...exec,
+      beginNativeRead: async (target) => {
+        observed.push(path.relative(workspace, target).split(path.sep).join('/'))
+        return { path: target, finish: async () => {} }
+      },
+    }
+    fs.writeFileSync(file('src/obs-1.txt'), 'one\n')
+    fs.writeFileSync(file('src/obs-2.txt'), 'two\n')
+    observed.length = 0
+    const removedOne = await tool.execute({ reason: 'observe', action: 'remove', path: 'src/obs-1.txt' }, observing)
+    assert.ok(removedOne.batch, removedOne.error)
+    assert.deepEqual(observed, ['src/obs-1.txt'], 'a remove observes its target before writing')
+    observed.length = 0
+    const movedOne = await tool.execute({ reason: 'observe', action: 'move', path: 'src/obs-2.txt', destination: 'src/obs-3.txt' }, observing)
+    assert.ok(movedOne.batch, movedOne.error)
+    assert.deepEqual(observed.slice().sort(), ['src/obs-2.txt', 'src/obs-3.txt'], 'a move observes both sides')
+    observed.length = 0
+    await tool.execute({ reason: 'observe', action: 'create', path: 'src/obs-4.txt', content: 'four\n' }, observing)
+    assert.deepEqual(observed, ['src/obs-4.txt'], 'a create observes the absent target too')
+    ok('every ff_file target is observed through the host before it is written')
+  }
   console.log(`${passed} file groups passed`)
 }
 main().catch(error => { console.error(error); process.exitCode = 1 }).finally(() => { pool.disposeAll(); fs.rmSync(sandbox, { recursive: true, force: true }) })

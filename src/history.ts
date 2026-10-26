@@ -4,7 +4,7 @@ import { getBlob, readLedgerTail, type LedgerBatch, type LedgerNode, type StoreP
 export function nodeId(batch: number, index: number): string { return `b${batch}:n${index}` }
 export function readNode(store: StorePaths, address: string): { batch: LedgerBatch; node: LedgerNode; index: number } {
   const match = /^b([1-9][0-9]*):n([0-9]+)$/.exec(address)
-  if (!match) throw new Error('node requires b<batch>:n<zero-based index> from ff_diff')
+  if (!match) throw new Error('node requires b<batch>:n<zero-based index> from ffhistory')
   const batch = readLedgerTail(store, Number.MAX_SAFE_INTEGER).find(batch => batch.id === Number(match[1]))
   const index = Number(match[2])
   if (!batch || !batch.nodes[index]) throw new Error(`node not found: ${address}`)

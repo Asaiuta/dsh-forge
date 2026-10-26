@@ -21,7 +21,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
-import { createGrepTool, createFindTool, createMultiGrepTool } from '../lib/tools.js'
+import { createGrepTool, createFindTool } from '../lib/tools.js'
 import { localEnv } from '../scripts/local-env.mjs'
 
 const CORPUS = localEnv('DSH_FORGE_BENCH_CORPUS') ?? localEnv('DSH_FORGE_DSH_MODULES', { required: true })
@@ -62,7 +62,7 @@ async function main() {
   const exec = { agent: { session: { header: { cwd: CORPUS } } } }
   const grep = createGrepTool(pool)
   const find = createFindTool(pool)
-  const multi = createMultiGrepTool(pool)
+  const multi = grep // fff_multi_grep merged into ffgrep
 
   const rssBefore = process.memoryUsage.rss()
   const indexStart = performance.now()
@@ -154,7 +154,7 @@ async function main() {
   }
   const multiWarmP50 = percentile(multiMs, 50)
   const rgMultiP50 = percentile(rgMultiMs, 50)
-  console.log(`\nfff_multi_grep warm: p50 ${multiWarmP50.toFixed(2)}ms  rg -e -e -e spawn: p50 ${rgMultiP50.toFixed(2)}ms`)
+  console.log(`\nffgrep patterns warm: p50 ${multiWarmP50.toFixed(2)}ms  rg -e -e -e spawn: p50 ${rgMultiP50.toFixed(2)}ms`)
 
   // --- floors --------------------------------------------------------------
   let floors = 0

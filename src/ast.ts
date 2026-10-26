@@ -19,7 +19,7 @@
 
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { readBoundedFile } from './fs-paths.ts'
 import path from 'node:path'
 import { extractFacts } from './facts.ts'
@@ -85,7 +85,11 @@ async function getParser(lang: LangName): Promise<import('web-tree-sitter').Pars
   if (!pending) {
     pending = (async () => {
       const mod = await getTsModule()
-      const wasm = path.join(grammarDir(), `tree-sitter-${lang}.wasm`)
+      // The Lua grammar in tree-sitter-wasms 0.1.13 retains scanner state
+      // across independent parses. Use the maintained grammar for Lua only.
+      const wasm = lang === 'lua' && !process.env.DSH_FORGE_GRAMMAR_DIR?.trim()
+        ? createRequire(import.meta.url).resolve('@tree-sitter-grammars/tree-sitter-lua/tree-sitter-lua.wasm')
+        : path.join(grammarDir(), `tree-sitter-${lang}.wasm`)
       if (!existsSync(wasm)) {
         throw new Error(`grammar not found: ${wasm} — set DSH_FORGE_GRAMMAR_DIR or reinstall tree-sitter-wasms`)
       }
@@ -188,6 +192,9 @@ const PY: FamilySpec = {
 const RS: FamilySpec = {
   declarations: {
     function_item: 'function', struct_item: 'struct', enum_item: 'enum',
+    // Bodyless trait method declarations (`fn name(&self) -> &str;`) are a
+    // distinct node; without it a trait's required interface is invisible.
+    function_signature_item: 'function',
     trait_item: 'trait', type_item: 'type', mod_item: 'module', foreign_mod_item: 'module',
     const_item: 'variable', static_item: 'variable', field_declaration: 'field', enum_variant: 'field',
   },
@@ -221,7 +228,7 @@ const CSHARP: FamilySpec = {
   wrappers: [], qualifiers: [], comments: ['comment'],
 }
 const LUA: FamilySpec = {
-  declarations: { function_definition_statement: 'function', local_function_definition_statement: 'function' },
+  declarations: { function_declaration: 'function' },
   wrappers: [], qualifiers: [], comments: ['comment'],
 }
 
@@ -373,29 +380,30 @@ class Collector {
       if (scope !== 'function' && target?.type === 'identifier') this.emit(node, target.text, scope === 'class' ? 'field' : 'variable', prefix, parent)
       return
     }
-    if (this.lang === 'lua' && ['local_variable_declaration', 'variable_assignment'].includes(node.type)) {
+    if (this.lang === 'lua' && ['variable_declaration', 'assignment_statement'].includes(node.type)) {
       if (scope === 'function') return
-      const targets = node.children.find(child => child.type === 'variable_list')?.children.filter(child => child.type === 'variable') ?? []
-      const values = node.children.find(child => child.type === 'expression_list')?.children.filter(child => child.isNamed) ?? []
+      const assignment = node.type === 'variable_declaration' ? node.namedChildren.find(child => child?.type === 'assignment_statement') : node
+      const targets = assignment?.namedChildren.find(child => child?.type === 'variable_list')?.namedChildren.filter((child): child is import('web-tree-sitter').Node => child !== null) ?? []
+      const values = assignment?.namedChildren.find(child => child?.type === 'expression_list')?.namedChildren ?? []
       targets.forEach((target, index) => {
         const value = values[index]
-        const symbol = this.emit(node, target.text.replaceAll(':', '.'), value?.type === 'table' ? 'object' : value?.type === 'function_definition' ? 'function' : 'variable', prefix, parent)
+        const symbol = this.emit(node, target.text.replaceAll(':', '.'), value?.type === 'table_constructor' ? 'object' : value?.type === 'function_definition' ? 'function' : 'variable', prefix, parent)
         if (targets.length > 1) symbol.sharedDeclaration = true
         if (value) {
           const inner = new Collector(spec, this.lang, this.sep)
-          for (const child of value.children) inner.collect(child, symbol.qualifiedName, value, value.type === 'table' ? 'class' : 'function')
+          for (const child of value.children) inner.collect(child, symbol.qualifiedName, value, value.type === 'table_constructor' ? 'class' : 'function')
           symbol.children = inner.out
         }
       })
       return
     }
     if (this.lang === 'lua' && node.type === 'field') {
-      const key = node.childForFieldName('key'), value = node.childForFieldName('value')
+      const key = node.childForFieldName('name'), value = node.childForFieldName('value')
       if (key?.type === 'identifier') {
-        const symbol = this.emit(node, key.text, value?.type === 'function_definition' ? 'method' : value?.type === 'table' ? 'object' : 'field', prefix, parent)
+        const symbol = this.emit(node, key.text, value?.type === 'function_definition' ? 'method' : value?.type === 'table_constructor' ? 'object' : 'field', prefix, parent)
         if (value) {
           const inner = new Collector(spec, this.lang, this.sep)
-          for (const child of value.children) inner.collect(child, symbol.qualifiedName, value, value.type === 'table' ? 'class' : 'function')
+          for (const child of value.children) inner.collect(child, symbol.qualifiedName, value, value.type === 'table_constructor' ? 'class' : 'function')
           symbol.children = inner.out
         }
       }
@@ -433,10 +441,14 @@ class Collector {
     // impl Store { fn put_blob() } → Store::put_blob
     if (this.lang === 'rust' && node.type === 'impl_item') {
       const targetType = node.childForFieldName('type')
-      const implPrefix = targetType ? (prefix ? `${prefix}::${targetType.text}` : targetType.text) : prefix
+      // The generic argument list must not leak into the prefix, so
+      // `impl<'a> AudioBlockRef<'a>` yields `AudioBlockRef::new`, not
+      // `AudioBlockRef<'a>::new`. Mirrors ProjectForge's split-on-'<' + trim.
+      const baseType = targetType ? targetType.text.split('<')[0].trim() : null
+      const implPrefix = baseType ? (prefix ? `${prefix}::${baseType}` : baseType) : prefix
       const inner = new Collector(spec, this.lang, '::')
       for (const child of node.children) inner.collect(child, implPrefix, node, 'class')
-      const sym = this.emit(node, `impl ${targetType?.text ?? '?'}`, 'impl', prefix, parent)
+      const sym = this.emit(node, `impl ${baseType ?? '?'}`, 'impl', prefix, parent)
       sym.children = inner.out
       return
     }
@@ -569,6 +581,9 @@ export interface ParsedFile {
   /** The normalized text itself (transient — NOT retained by the cache). */
   text: string
   symbols: AstSymbol[]
+  /** startLine (1-based) -> first line of that symbol (≤500 chars). Lets the
+   *  search track render signatures without a whole-file re-read. */
+  signatures: Map<number, string>
   /** True when the tree contains ERROR/MISSING nodes (best-effort parse). */
   partial: boolean
 }
@@ -576,7 +591,11 @@ export interface ParsedFile {
 interface CacheEntry {
   hash: string
   lang: LangName
+  /** Freshness stamps of the bytes the parse was read from (search fast path). */
+  mtimeMs: number
+  size: number
   symbols: AstSymbol[]
+  signatures: Map<number, string>
   partial: boolean
 }
 
@@ -596,6 +615,37 @@ function readAstText(absPath: string): { text: string } | { error: string } {
   }
 }
 
+/** Stat without throwing — null means "unreadable; the read path will report it". */
+function statSafe(p: string): { mtimeMs: number; size: number } | null {
+  try {
+    const st = statSync(p)
+    return { mtimeMs: st.mtimeMs, size: st.size }
+  } catch {
+    return null
+  }
+}
+
+/** startLine -> first line text, so the search track renders signatures without
+ *  keeping whole-file text in the cache. */
+function signatureMap(text: string, symbols: AstSymbol[]): Map<number, string> {
+  const lines = text.split('\n')
+  const map = new Map<number, string>()
+  for (const sym of walkSymbols(symbols)) {
+    if (!map.has(sym.startLine)) map.set(sym.startLine, (lines[sym.startLine - 1] ?? '').slice(0, 500))
+  }
+  return map
+}
+
+/** Text-free parse result returned by the mtime+cache search fast path. */
+export interface SymbolParse {
+  absPath: string
+  lang: LangName
+  hash: string
+  symbols: AstSymbol[]
+  signatures: Map<number, string>
+  partial: boolean
+}
+
 /**
  * Parse (or fetch from the content-anchored cache) a single file. ALWAYS
  * re-reads from disk: the hash of current content decides cache reuse, so a
@@ -612,13 +662,17 @@ export async function parseFile(absPath: string, options: { readPath?: string } 
   if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ffgrep for everything else` }
   // The caller's address supplies the language; a provider may pin byte reads
   // to a canonical target with a different extension (including no extension).
-  const input = readAstText(options.readPath ?? absPath)
+  const readPath = options.readPath ?? absPath
+  const st = statSafe(readPath)
+  const input = readAstText(readPath)
   if ('error' in input) return input
   const text = input.text
   const hash = createHash('sha256').update(text).digest('hex')
   const cached = fileCache.get(absPath)
   if (cached && cached.hash === hash && cached.lang === lang) {
-    return { value: { absPath, lang, hash, text, symbols: cached.symbols, partial: cached.partial } }
+    // Refresh the freshness stamps so a later mtime fast path only pays a stat.
+    if (st) { cached.mtimeMs = st.mtimeMs; cached.size = st.size }
+    return { value: { absPath, lang, hash, text, symbols: cached.symbols, signatures: cached.signatures, partial: cached.partial } }
   }
 
   // Per-file size cap, mirroring PF's findSymbols (2MB → truncated): bundled
@@ -638,16 +692,41 @@ export async function parseFile(absPath: string, options: { readPath?: string } 
     if (typeof (tree as unknown as { delete?: () => void }).delete === 'function') {
       (tree as unknown as { delete: () => void }).delete()
     }
-    fileCache.set(absPath, { hash, lang, symbols, partial })
+    const signatures = signatureMap(text, symbols)
+    fileCache.set(absPath, { hash, lang, mtimeMs: st?.mtimeMs ?? 0, size: st?.size ?? 0, symbols, signatures, partial })
     if (fileCache.size > 5000) {
       const first = fileCache.keys().next().value
       if (first !== undefined) fileCache.delete(first)
     }
-    return { value: { absPath, lang, hash, text, symbols, partial } }
+    return { value: { absPath, lang, hash, text, symbols, signatures, partial } }
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause)
     return { error: `AST engine unavailable for ${lang}: ${message} — use ffgrep instead` }
   }
+}
+
+/**
+ * Search-track parse: reuse a cached parse when (mtime, size) are unchanged,
+ * skipping the read + sha256 the content-anchored path always pays. Ranges can
+ * in principle lag an edit that preserves both mtime and size — which is why
+ * editing callers keep using parseFile (content-hash). Navigation-only.
+ *
+ * Falls back to parseFile on a stale or missing cache entry.
+ */
+export async function parseFileSearch(absPath: string): Promise<{ value?: SymbolParse; error?: string }> {
+  const lang = detectLanguage(absPath)
+  if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ffgrep for everything else` }
+  const st = statSafe(absPath)
+  if (st) {
+    const cached = fileCache.get(absPath)
+    if (cached && cached.lang === lang && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      return { value: { absPath, lang, hash: cached.hash, symbols: cached.symbols, signatures: cached.signatures, partial: cached.partial } }
+    }
+  }
+  const parsed = await parseFile(absPath)
+  if (parsed.error) return { error: parsed.error }
+  const value = parsed.value!
+  return { value: { absPath, lang: value.lang, hash: value.hash, symbols: value.symbols, signatures: value.signatures, partial: value.partial } }
 }
 
 /** Test hook: drop all cached parses. */
@@ -673,22 +752,26 @@ export interface FactsParse {
 interface FactsCacheEntry {
   hash: string
   bridgeKey: string
+  mtimeMs: number
+  size: number
   facts: import('./facts.ts').FileFacts
   partial: boolean
 }
 
 const factsCache = new Map<string, FactsCacheEntry>()
 
-export async function fileFacts(absPath: string, bridgeGlobals: readonly string[]): Promise<{ error?: string; value?: FactsParse }> {
+export async function fileFacts(absPath: string, bridgeGlobals: readonly string[] | null): Promise<{ error?: string; value?: FactsParse }> {
   const lang = detectLanguage(absPath)
   if (!lang) return { error: `unsupported language for ${path.basename(absPath)}` }
+  const st = statSafe(absPath)
   const input = readAstText(absPath)
   if ('error' in input) return input
   const text = input.text
   const hash = createHash('sha256').update(text).digest('hex')
-  const bridgeKey = bridgeGlobals.join('|')
+  const bridgeKey = JSON.stringify(bridgeGlobals)
   const cached = factsCache.get(absPath)
   if (cached && cached.hash === hash && cached.bridgeKey === bridgeKey) {
+    if (st) { cached.mtimeMs = st.mtimeMs; cached.size = st.size }
     return { value: { lang, hash, text, facts: cached.facts, partial: cached.partial } }
   }
   if (Buffer.byteLength(text, 'utf8') > MAX_AST_FILE_BYTES) {
@@ -699,11 +782,9 @@ export async function fileFacts(absPath: string, bridgeGlobals: readonly string[
     const tree = parser.parse(text)
     if (!tree) return { error: `tree-sitter failed to parse ${absPath}` }
     const partial = tree.rootNode.hasError
-    const facts = extractFacts(tree, lang, bridgeGlobals)
-    if (typeof (tree as unknown as { delete?: () => void }).delete === 'function') {
-      (tree as unknown as { delete: () => void }).delete()
-    }
-    factsCache.set(absPath, { hash, bridgeKey, facts, partial })
+    let facts: import('./facts.ts').FileFacts
+    try { facts = extractFacts(tree, lang, bridgeGlobals) } finally { tree.delete() }
+    factsCache.set(absPath, { hash, bridgeKey, mtimeMs: st?.mtimeMs ?? 0, size: st?.size ?? 0, facts, partial })
     if (factsCache.size > 5000) {
       const first = factsCache.keys().next().value
       if (first !== undefined) factsCache.delete(first)
@@ -714,22 +795,51 @@ export async function fileFacts(absPath: string, bridgeGlobals: readonly string[
   }
 }
 
+/** Text-free facts result for the read-only link scan (fftrace). */
+export interface FactSearch {
+  lang: LangName
+  hash: string
+  facts: import('./facts.ts').FileFacts
+  partial: boolean
+}
+
+/**
+ * Search-track facts: reuse cached facts when (mtime, size, bridge set) hold,
+ * skipping the read + sha256. fftrace is read-only, so a stale link map (only
+ * possible after an edit preserving mtime AND size) is acceptable; the content
+ * path in fileFacts stays the correctness anchor. Falls back to fileFacts.
+ */
+export async function fileFactsSearch(absPath: string, bridgeGlobals: readonly string[] | null): Promise<{ error?: string; value?: FactSearch }> {
+  const lang = detectLanguage(absPath)
+  if (!lang) return { error: `unsupported language for ${path.basename(absPath)}` }
+  const bridgeKey = JSON.stringify(bridgeGlobals)
+  const st = statSafe(absPath)
+  if (st) {
+    const cached = factsCache.get(absPath)
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size && cached.bridgeKey === bridgeKey) {
+      return { value: { lang, hash: cached.hash, facts: cached.facts, partial: cached.partial } }
+    }
+  }
+  const parsed = await fileFacts(absPath, bridgeGlobals)
+  if (parsed.error) return { error: parsed.error }
+  const value = parsed.value!
+  return { value: { lang: value.lang, hash: value.hash, facts: value.facts, partial: value.partial } }
+}
+
 /** Test hook: drop cached facts. */
 export function resetFactsCache(): void {
   factsCache.clear()
 }
 
-/** Facts from an in-memory text (HTML inline script bodies — no file, no cache). */
-export async function factsFromText(text: string, bridgeGlobals: readonly string[]): Promise<{ facts: import('./facts.ts').FileFacts; partial: boolean } | null> {
+/** Facts from inline JS/TS text — no file or cache. */
+export async function factsFromText(text: string, bridgeGlobals: readonly string[] | null, lang: 'javascript' | 'typescript' | 'tsx' = 'javascript'): Promise<{ facts: import('./facts.ts').FileFacts; partial: boolean } | null> {
   try {
-    const parser = await getParser('javascript')
+    const parser = await getParser(lang)
     const tree = parser.parse(text)
     if (!tree) return null
     const partial = tree.rootNode.hasError
-    const facts = extractFacts(tree, 'javascript', bridgeGlobals)
-    if (typeof (tree as unknown as { delete?: () => void }).delete === 'function') {
-      (tree as unknown as { delete: () => void }).delete()
-    }
+    let facts: import('./facts.ts').FileFacts
+    try { facts = extractFacts(tree, lang, bridgeGlobals) } finally { tree.delete() }
     return { facts, partial }
   } catch {
     return null

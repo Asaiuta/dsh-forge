@@ -15,6 +15,7 @@ declare module 'web-tree-sitter' {
     readonly type: string
     readonly text: string
     readonly children: Node[]
+    readonly namedChildren: Array<Node | null>
     readonly childCount: number
     readonly parent: Node | null
     /** Stable per-tree node identity (wrappers are not reference-stable). */
@@ -25,6 +26,8 @@ declare module 'web-tree-sitter' {
     readonly endIndex: number
     readonly hasError: boolean
     childForFieldName(fieldName: string): Node | null
+    childrenForFieldName(fieldName: string): (Node | null)[]
+    descendantsOfType(types: string | string[]): Array<Node | null>
   }
 
   export interface Tree {

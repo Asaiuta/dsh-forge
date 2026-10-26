@@ -35,8 +35,8 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 import { dataDir, withNativeWrite, type ForgeExec } from './core.ts'
+import { markWritten } from './overlay.ts'
 import { isSymbolicLink } from './fs-paths.ts'
-import { isProjectRecord, type ProjectLink, type ProjectRecord } from './project-model.ts'
 
 /** Replace one file via a flushed sibling; the original survives failed writes. */
 export function atomicWrite(file: string, bytes: Buffer | string): void {
@@ -172,10 +172,6 @@ export interface LedgerBatch {
   actor: string
   reverted?: number
   transaction?: string
-  projectId?: ProjectLink['projectId']
-  todoId?: ProjectLink['todoId']
-  /** Full validated project revision; the ledger is the sole durable truth. */
-  projectRecord?: ProjectRecord
   nodes: LedgerNode[]
 }
 
@@ -290,14 +286,12 @@ export function recordExternalState(
   raw: Buffer,
   eol: LedgerNode['eol'],
   bom: boolean,
-  link?: ProjectLink,
 ): { batch: LedgerBatch; blobId: string } {
   const { id } = putBlob(store, raw)
   const batch = recordBatch(store, {
     kind: 'external',
     reason: 'external modification detected before edit (hash mismatch vs ledger)',
     actor: 'system:external',
-    ...link,
     nodes: [{ file: relFile, op: 'external', before: null, after: id, bytes: raw.length, eol, bom }],
   })
   return { batch, blobId: id }
@@ -341,7 +335,9 @@ function validateRecord(rec: LedgerBatch, previousId: number, line: number): voi
     || rec.nodes.some(node => !node || typeof node.file !== 'string' || !['update', 'create', 'delete', 'external'].includes(node.op)
       || ![node.before, node.after].every(hash => hash === null || typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash))
       || !Number.isSafeInteger(node.bytes) || node.bytes < 0 || !['LF', 'CRLF', 'CR'].includes(node.eol) || typeof node.bom !== 'boolean')
-    || rec.kind === 'project' && (!isProjectRecord(rec.projectRecord) || rec.projectRecord.id !== rec.projectId || rec.nodes.length !== 0)) {
+    // 'project' is legacy: the feature is gone, but ledgers that still hold
+    // project batches must keep replaying instead of failing validation.
+    || rec.kind === 'project' && rec.nodes.length !== 0) {
     throw new Error(`invalid ledger record at line ${line}; history preserved, writing refused`)
   }
 }
@@ -424,22 +420,11 @@ function ledgerView(store: StorePaths): LedgerView {
   return view
 }
 
-/** Persist the strict contract BEFORE the first durable project revision. */
-export function requireProjectLedger(store: StorePaths): void {
-  ensureWorkspaceMeta(store)
-  readLedgerTail(store, Number.MAX_SAFE_INTEGER)
-  const metaFile = path.join(store.dir, 'workspace.json')
-  const meta = JSON.parse(readFileSync(metaFile, 'utf8'))
-  if (meta.projectLedger !== true) atomicWrite(metaFile, JSON.stringify({ ...meta, projectLedger: true }))
-}
-
 export interface HistoryFilter {
   path?: string
   keyword?: string
   actor?: string
   kind?: BatchKind
-  projectId?: string
-  todoId?: string
   limit: number
 }
 
@@ -451,8 +436,6 @@ export function searchHistory(store: StorePaths, filter: HistoryFilter): LedgerB
   const out: LedgerBatch[] = []
   for (const batch of batches) {
     if (filter.kind && batch.kind !== filter.kind) continue
-    if (filter.projectId && batch.projectId !== filter.projectId) continue
-    if (filter.todoId && batch.todoId !== filter.todoId) continue
     if (filter.actor && batch.actor !== filter.actor) continue
     if (filter.path && !batch.nodes.some((n) => n.file.includes(filter.path!))) continue
     if (filter.keyword && !batch.reason.toLowerCase().includes(filter.keyword.toLowerCase())) continue
@@ -570,6 +553,10 @@ export function recoverStore(store: StorePaths): void {
     if (diskHash(plan.file) !== plan.expected) throw new Error(`transaction recovery file changed: ${plan.file}; recovery journal retained`)
     if (plan.bytes === null) rmSync(plan.file, { force: true })
     else atomicWrite(plan.file, plan.bytes)
+    // Recovery writes files the index has also not seen yet; same reason as
+    // commitFiles. A rollback that leaves search answering from the pre-rollback
+    // content is the exact failure this overlay exists to prevent.
+    markWritten(plan.file, plan.bytes)
   }
   rmSync(journalFile)
 }
@@ -599,6 +586,11 @@ export function commitFiles(store: StorePaths, batch: Omit<LedgerBatch, 't' | 'i
       if (diskHash(change.file) !== expected) throw new Error(`file changed at commit: ${change.file}`)
       if (change.after === null) rmSync(change.file, { force: true })
       else atomicWrite(change.file, change.after)
+      // The index will not know about this write for 2.3-4.3 s (measured), so
+      // record it here: search answers for this file come from these bytes until
+      // the overlay expires. Marked after the write, so a failed write can never
+      // shadow the file it did not change.
+      markWritten(change.file, change.after)
     }
     const committed = recordBatch(store, { ...batch, transaction: journal.transaction })
     try { rmSync(journalFile) } catch { /* next access completes cleanup */ }

@@ -1,13 +1,27 @@
-/** Bounded persistent worker prototype. Content is still read/hashed on every query. */
+/** Bounded persistent AST workers shared by symbol searches and Trace extraction. */
 import { Worker } from 'node:worker_threads'
 import { availableParallelism } from 'node:os'
+import type { TraceFileOutcome } from './trace-facts.ts'
 
 interface Hit { qualifiedName: string; kind: string; startLine: number; endLine: number; occurrence: number; commentStartLine?: number; signature: string }
 interface WorkerResult { index: number; file: string; parsed: boolean; items: Hit[] }
-interface Reply { id: number; results?: WorkerResult[]; timedOut?: boolean; cancelled?: boolean; error?: string }
+interface TraceResult extends TraceFileOutcome { index: number }
+interface WorkFile { file: string; index: number }
+interface Reply { id: number; results?: WorkerResult[]; traceResults?: TraceResult[]; timedOut?: boolean; cancelled?: boolean; error?: string }
 interface Slot { worker: Worker; pending: Map<number, { resolve(reply: Reply): void; reject(cause: Error): void; cleanup(): void }> }
+/** True when DSH_FORGE_AST_WORKERS is unset/empty — parallelism is then the
+ *  default and is gated only by corpus size, not by an explicit 0. */
+export function astWorkerAuto(): boolean {
+  const raw = process.env.DSH_FORGE_AST_WORKERS
+  return raw === undefined || raw.trim() === ''
+}
+
+/** Effective worker count: auto (min of core count and 8) by default, or the
+ *  explicit 0..8 value. 0 means sequential. */
 export function astWorkerCount(): number {
-  const value = Number(process.env.DSH_FORGE_AST_WORKERS ?? 0)
+  const raw = process.env.DSH_FORGE_AST_WORKERS
+  if (raw === undefined || raw.trim() === '') return Math.min(availableParallelism(), 8)
+  const value = Number(raw)
   if (!Number.isInteger(value) || value < 0 || value > 8) throw new Error('DSH_FORGE_AST_WORKERS must be an integer from 0 to 8')
   return Math.min(value, availableParallelism())
 }
@@ -50,42 +64,71 @@ export class AstWorkerPool {
       for (const char of file) hash = (Math.imul(hash, 31) + char.charCodeAt(0)) >>> 0
       groups[hash % count].push({ file, index })
     })
-    const replies = await Promise.all(groups.map((group, index) => {
+    const replies = await this.run(groups, { name, kinds, deadline }, signal)
+    return { results: replies.flatMap(reply => reply.results ?? []).sort((a, b) => a.index - b.index), timedOut: replies.some(reply => reply.timedOut) }
+  }
+  async facts(files: Array<{ file: string; bytes: number }>, signal?: AbortSignal): Promise<TraceFileOutcome[]> {
+    const count = Math.min(astWorkerCount(), files.length)
+    if (count === 0) throw new Error('parallel AST is disabled')
+    const groups: WorkFile[][] = Array.from({ length: count }, () => [])
+    const loads = Array<number>(count).fill(0)
+    // Large bundles dominate extraction. Balance by bytes instead of leaving
+    // several large files on one worker through a path hash.
+    files.map((item, index) => ({ ...item, index })).sort((a, b) => b.bytes - a.bytes).forEach(item => {
+      const slot = loads.indexOf(Math.min(...loads))
+      loads[slot] += Math.max(item.bytes, 1024)
+      groups[slot].push({ file: item.file, index: item.index })
+    })
+    const replies = await this.run(groups, { kind: 'trace', deadline: Date.now() + 5 * 60_000 }, signal)
+    const results = replies.flatMap(reply => reply.traceResults ?? []).sort((a, b) => a.index - b.index)
+    if (replies.some(reply => reply.timedOut) || results.length !== files.length) throw new Error('Trace worker scan did not complete')
+    return results.map(({ index: _index, ...outcome }) => outcome)
+  }
+  private async run(groups: WorkFile[][], payload: { kind?: 'trace'; name?: string; kinds?: string[] | null; deadline: number }, signal?: AbortSignal): Promise<Reply[]> {
+    if (this.closed) throw new Error('AST worker pool was disposed')
+    signal?.throwIfAborted()
+    const groupController = new AbortController()
+    const combined = signal ? AbortSignal.any([signal, groupController.signal]) : groupController.signal
+    const replies = await Promise.allSettled(groups.map((group, index) => {
       if (!group.length) return Promise.resolve({ id: 0, results: [], timedOut: false })
       const slot = this.getSlot(index), id = this.nextId++
       return new Promise<Reply>((resolve, reject) => {
         const cancellation = new Int32Array(new SharedArrayBuffer(4))
         let settled = false
-        const finish = (cause?: Error) => {
-          if (settled) return
-          settled = true
-          Atomics.store(cancellation, 0, 1)
-          slot.pending.delete(id)
-          cleanup()
-          if (!slot.pending.size) slot.worker.unref()
-          if (cause) reject(cause)
-        }
         let aborted: Error | undefined
         const abort = () => {
-          aborted = signal?.reason instanceof Error ? signal.reason : new Error('AST query aborted')
+          aborted = combined.reason instanceof Error ? combined.reason : new Error('AST query aborted')
           Atomics.store(cancellation, 0, 1)
           // Wait for the worker acknowledgement: cancellation owns no background work.
         }
-        const timeout = () => finish(new Error('AST worker request timed out'))
-        const timer = setTimeout(timeout, Math.max(1, deadline - Date.now() + 1000))
-        const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
+        const timeout = () => {
+          aborted = new Error('AST worker request timed out')
+          Atomics.store(cancellation, 0, 1)
+          // A file parse is synchronous inside the worker. Termination is the
+          // hard bound only when no unrelated request shares the slot. Otherwise
+          // await acknowledgement so an expired queued call cannot kill its peer.
+          if (slot.pending.size === 1) {
+            if (this.slots[index] === slot) delete this.slots[index]
+            void slot.worker.terminate()
+          }
+        }
+        const timer = setTimeout(timeout, Math.max(1, payload.deadline - Date.now() + 1000))
+        const cleanup = () => { clearTimeout(timer); combined.removeEventListener('abort', abort) }
         slot.pending.set(id, {
           resolve: reply => { if (!settled) { settled = true; cleanup(); if (aborted || reply.cancelled) reject(aborted ?? new Error('AST query cancelled')); else resolve(reply) } },
-          reject: cause => { if (!settled) { settled = true; cleanup(); reject(cause) } },
+          reject: cause => { if (!settled) { settled = true; cleanup(); reject(aborted ?? cause) } },
           cleanup,
         })
-        signal?.addEventListener('abort', abort, { once: true })
+        combined.addEventListener('abort', abort, { once: true })
+        if (combined.aborted) abort()
         slot.worker.ref()
-        slot.worker.postMessage({ id, files: group, name, kinds, deadline, cancellation })
-      })
+        slot.worker.postMessage({ id, files: group, ...payload, cancellation })
+      }).catch(cause => { groupController.abort(cause); throw cause })
     }))
     signal?.throwIfAborted()
-    return { results: replies.flatMap(reply => reply.results ?? []).sort((a, b) => a.index - b.index), timedOut: replies.some(reply => reply.timedOut) }
+    const failed = replies.find(reply => reply.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
+    return replies.map(reply => (reply as PromiseFulfilledResult<Reply>).value)
   }
   async dispose(): Promise<void> {
     this.closed = true
@@ -95,6 +138,7 @@ export class AstWorkerPool {
 }
 let defaultPool = new AstWorkerPool()
 export const parallelFind = (files: string[], name: string, kinds: string[] | null, deadline: number, signal?: AbortSignal) => defaultPool.find(files, name, kinds, deadline, signal)
+export const parallelTrace = (files: Array<{ file: string; bytes: number }>, signal?: AbortSignal) => defaultPool.facts(files, signal)
 export async function disposeAstWorkers(): Promise<void> {
   const previous = defaultPool
   defaultPool = new AstWorkerPool()

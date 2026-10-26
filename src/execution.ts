@@ -1,6 +1,6 @@
 /** Shared-local provider adapter: policy checks precede byte transactions. */
 import path from 'node:path'
-import { canonicalTarget } from './projects.ts'
+import { canonicalTarget } from './fs-paths.ts'
 import { workdirOf, type ForgeExec } from './core.ts'
 
 interface FsTarget { targetKey: unknown; displayPath: string }

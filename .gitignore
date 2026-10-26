@@ -5,6 +5,10 @@ node_modules/
 # Anchored: tests/lib/ is source and must stay tracked.
 /lib/
 
+# Optional native sidecar: source and Cargo.lock are kept; local builds are generated.
+/rust_indexer/target/
+/rust_indexer/bin/
+
 # Generated test corpus. make-fixture.mjs recreates it, and it deliberately
 # contains a nested git repository for the .gitignore-resolution tests.
 tests/.fixture/
@@ -12,6 +16,10 @@ tests/.fixture/
 # Machine-local paths for the test chain and maintenance scripts.
 # Copy .env.example to .env — never commit it.
 .env
+
+# One-off probe scripts kept while measuring engine behaviour. They live inside
+# the indexed tree, so they also pollute our own searches — never committed.
+/.tmp-analysis/
 
 # Logs
 *.log
@@ -24,3 +32,11 @@ Thumbs.db
 
 # Scratch
 *.tmp
+
+# Machine-local scratch: pnpm's content-addressable store when it is pointed at
+# the repo root, and the per-run mkdtemp fixture trees of the host-integration
+# suite. `.findroot-fixture` is run-ast.mjs's out-of-workspace tree, which proves
+# ff_find_symbol's `path` really leaves the workspace.
+.pnpm-store/
+tests/.host-fixture-*/
+tests/.findroot-fixture/

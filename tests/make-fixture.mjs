@@ -7,11 +7,17 @@
  * substring) — never hardcoded, so content shifts cannot silently desync the
  * evals.
  *
+ * The rebuild is **incremental**: files whose bytes already match are left
+ * alone, only strays are removed. A cold `rm -rf` of the tree costs ~65 s on
+ * hosts with an on-access filesystem filter (RaiDrive CBFS), and sandboxed
+ * runners reject deletes past a per-turn threshold — both problems vanish when
+ * a repeat build deletes nothing.
+ *
  * @module dsh-forge/tests/make-fixture
  */
 
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,15 +30,46 @@ function mark(lines, token) {
   return idx + 1
 }
 
+/** Relative paths written by the current build, used to prune strays. */
+let expected = new Set()
+
 function writeLines(relPath, lines, crlf = false) {
   const abs = path.join(FIXTURE_DIR, relPath)
-  mkdirSync(path.dirname(abs), { recursive: true })
   const eol = crlf ? '\r\n' : '\n'
-  writeFileSync(abs, lines.join(eol) + eol, 'utf8')
+  const text = lines.join(eol) + eol
+  expected.add(path.normalize(relPath))
+  let current = null
+  try {
+    current = readFileSync(abs, 'utf8')
+  } catch { /* missing or unreadable: rewrite */ }
+  if (current === text) return
+  mkdirSync(path.dirname(abs), { recursive: true })
+  writeFileSync(abs, text, 'utf8')
+}
+
+/**
+ * Delete files the current build no longer produces (and only those).
+ * A full `rm -rf` of the fixture costs ~65 s on hosts with an on-access
+ * filesystem filter, and trips bulk-delete guards in sandboxed runners, so
+ * the rebuild is incremental: canonical content is rewritten, everything
+ * else is left untouched.
+ */
+function prune() {
+  if (!existsSync(FIXTURE_DIR)) return
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === '.git') continue
+      const abs = path.join(dir, entry.name)
+      const rel = path.normalize(path.relative(FIXTURE_DIR, abs))
+      if (entry.isDirectory()) walk(abs)
+      else if (!expected.has(rel)) rmSync(abs, { force: true })
+    }
+  }
+  walk(FIXTURE_DIR)
 }
 
 export function buildFixture() {
-  rmSync(FIXTURE_DIR, { recursive: true, force: true })
+  expected = new Set()
   mkdirSync(FIXTURE_DIR, { recursive: true })
   const truth = {}
 
@@ -230,13 +267,17 @@ export function buildFixture() {
     '*.log',
   ])
 
+  prune()
+
   // Git init + single commit so fff sees a real repository with clean status.
   const git = (args) => execFileSync('git', args, { cwd: FIXTURE_DIR, stdio: 'pipe' })
-  git(['init', '-q'])
+  if (!existsSync(path.join(FIXTURE_DIR, '.git'))) git(['init', '-q'])
   git(['config', 'user.email', 'forge@example.com'])
   git(['config', 'user.name', 'forge-fixture'])
-  git(['add', '-A'])
-  git(['commit', '-q', '-m', 'fixture'])
+  if (git(['status', '--porcelain']).toString().trim() !== '') {
+    git(['add', '-A'])
+    git(['commit', '-q', '-m', 'fixture'])
+  }
   return truth
 }
 

@@ -15,7 +15,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { FinderPool } from '../lib/core.js'
-import { createGrepTool, createFindTool, createMultiGrepTool } from '../lib/tools.js'
+import { createGrepTool, createFindTool } from '../lib/tools.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
 
 const truth = buildFixture()
@@ -82,7 +82,7 @@ async function main() {
   const exec = { agent: { session: { header: { cwd: FIXTURE_DIR } } } }
   const grep = createGrepTool(pool)
   const find = createFindTool(pool)
-  const multi = createMultiGrepTool(pool)
+  const multi = grep // fff_multi_grep merged into ffgrep
 
   // Warm the index once (first call pays the scan; wait it out).
   const warm = await grep.execute({ pattern: 'putBlob', limit: 200 }, exec)

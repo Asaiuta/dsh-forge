@@ -1,6 +1,6 @@
 /**
  * Cold-scan helper for the ProjectForge comparison: fresh process, walks a
- * directory and parseFile()s every code file exactly the way ff_find_symbol
+ * directory and parseFile()s every code file exactly the way the definitions view
  * does (sequential, content-anchored cache cold), then prints the timing.
  *
  * Usage: node tests/lib/cold-scan.mjs <rootDir>

@@ -121,7 +121,7 @@ export interface EditOptions {
   expectWindow?: number
   /**
    * Ticket resolution pinning: apply the target step at these verified
-   * coordinates instead of re-scanning (ffresolve). The pinned block is
+   * coordinates instead of re-scanning (ticket reply). The pinned block is
    * trim-verified against current content; a mismatch fails the step.
    */
   pinnedTarget?: { stepIndex: number; start: number; end: number }
@@ -195,6 +195,62 @@ export function lineSimilarity(a: string, b: string): number {
   const max = Math.max(x.length, y.length)
   if (max === 0) return 1
   return 1 - levenshtein(x, y) / max
+}
+
+/**
+ * Diagnose a block that matched nowhere: find where it *almost* matched and
+ * name the first line that diverges.
+ *
+ * Measured 2026-10-17 (`c90ba7775a15`): two refusals in one repair loop printed
+ * only `target block not found` plus "did you mean L55 (100%)". The suggestion
+ * was literally accurate — the block's first line was at L55 — but it answered
+ * the wrong question. Six of that block's seven lines matched the file exactly
+ * and the seventh was a truncated quote of a long comment; nothing said so, the
+ * model re-guessed twice more, and the file was only repaired after it went back
+ * and read the region again. The engine already knows which line diverged; the
+ * failure was that it never said.
+ *
+ * The anchor is scored with the same similarity the suggestions use, so the
+ * diagnosis lands where the suggestion points. Divergence is then classified
+ * into the shapes seen in practice — a truncated quote, invented text, a
+ * blank-line disagreement — because each implies a different repair, and the
+ * diagnosis quotes the file so the model can copy it.
+ *
+ * @param lines - current file lines.
+ * @param findLines - the block's lines, prefixes already stripped.
+ * @returns One line naming the first divergence, or null when no plausible
+ *   anchor exists and the plain not-found plus suggestions must stand alone.
+ */
+export function diagnoseMissingBlock(lines: string[], findLines: string[]): string | null {
+  if (findLines.length < 2) return null
+  const anchor = findLines.findIndex((line) => line.trim() !== '')
+  if (anchor < 0) return null
+  let best = -1
+  let bestScore = 0
+  for (let i = 0; i < lines.length; i++) {
+    const score = lineSimilarity(lines[i], findLines[anchor])
+    if (score > bestScore) {
+      bestScore = score
+      best = i
+    }
+  }
+  if (best < 0 || bestScore < 0.6) return null
+  const start = best - anchor
+  for (let k = 0; k < findLines.length; k++) {
+    const row = start + k
+    if (row < 0 || row >= lines.length) return `the block runs past the ${row < 0 ? 'start' : 'end'} of the file (${lines.length} lines)`
+    const raw = lines[row]
+    const want = findLines[k].trim()
+    const have = raw.trim()
+    if (have === want) continue
+    const where = `block line ${k + 1} vs L${row + 1}`
+    const actual = raw.replace(/\r+$/, '').slice(0, 160)
+    if (want !== '' && have.startsWith(want)) return `${where} is a truncated quote — the file reads "${actual}" (quote it in full, or end the block before it)`
+    if (have !== '' && want.startsWith(have)) return `${where} adds text the file does not have — the file reads "${actual}"`
+    if (want === '' || have === '') return `${where} disagrees about a blank line — the file has ${have === '' ? 'a blank line' : `"${actual}"`}`
+    return `${where} differs — expected "${want.slice(0, 120)}", file has "${actual}"`
+  }
+  return null
 }
 
 function suggestionsFor(lines: string[], probe: string, exclude: number[]): StepSuggestion[] {
@@ -337,7 +393,7 @@ export type TargetResolution =
 
 /**
  * Resolve one target step against current content — shared by the planner
- * and by ffresolve's pinned-candidate verification.
+ * and by the ticket's pinned-candidate verification.
  */
 export function resolveTarget(lines: string[], find: string, replaceWith: string): TargetResolution {
   const { text: findText } = stripLinePrefixes(find)
@@ -457,7 +513,12 @@ function planStep(lines: string[], step: EditStep, index: number, options: EditO
     }
     const resolution = resolveTarget(lines, findRaw, step.replaceWith ?? '')
     if (resolution.kind === 'missing') {
-      report.reason = `target block not found (exact or trim-tolerant): "${(splitBlock(findRaw)[0] ?? '').trim().slice(0, 120)}"`
+      // Quote the block's first line as matching sees it (prefixes stripped),
+      // then name the first divergence rather than only where the block *starts*.
+      const findLines = splitBlock(stripLinePrefixes(findRaw).text)
+      const diagnosis = diagnoseMissingBlock(lines, findLines)
+      report.reason = `target block not found (exact or trim-tolerant): "${(findLines[0] ?? '').trim().slice(0, 120)}"`
+        + (diagnosis ? ` — ${diagnosis}` : '')
       report.suggestions = resolution.suggestions
       return { kind: 'failed', report }
     }
@@ -577,7 +638,7 @@ function applyLineSteps(originalText: string, steps: EditStep[], options: EditOp
       if (mode === 'atomic') {
         return {
           ok: false,
-          reason: `step ${i}: ${planned.report.reason} — resolve with ffresolve`,
+          reason: `step ${i}: ${planned.report.reason} — resend ffedit with the ticket and a choice`,
           reports,
           ambiguity: { stepIndex: planned.stepIndex, candidates: planned.candidates },
         }
@@ -592,7 +653,11 @@ function applyLineSteps(originalText: string, steps: EditStep[], options: EditOp
       const boundary = planned.op.boundary
       if (inserts.has(boundary)) {
         const report = planned.op.report
-        report.reason = `two insert steps target the same boundary (after line ${boundary})`
+        // The refusal is right (insert order at one boundary is not inferable, and
+        // overlap is never guessed), but it cost a resend in the recorded session
+        // because it named neither the other step nor a way out.
+        report.reason = `two insert steps share the same boundary (after line ${boundary}: steps ${inserts.get(boundary)!.stepIndex} and `
+          + `${planned.op.stepIndex}) — merge them into one insert step whose text joins both blocks with \\n, or move one to a different after=`
         if (mode === 'atomic') {
           reports.push(report)
           return { ok: false, reason: `step ${i} failed: ${report.reason}`, reports }

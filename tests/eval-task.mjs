@@ -4,7 +4,7 @@
  * Measures what line-B/perf evals cannot: the cost of completing a WHOLE
  * locate task under each toolchain, using the real tools on both sides.
  *
- *   forge   = ffgrep(enclosing:true) → ff_read_symbol by the returned symbol
+ *   forge   = ffgrep(enclosing:true) → ff_read by the returned symbol
  *             address (edit-ready evidence: symbol body only)
  *   builtin = content grep rows (no symbol knowledge) → whole-file reads
  *             until the target is seen (the only way builtin can confirm)
@@ -29,7 +29,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
 import { createGrepTool } from '../lib/tools.js'
-import { createReadSymbolTool } from '../lib/tools-symbol.js'
+import { createReadTool } from '../lib/tools-read.js'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { createEditTool } from '../lib/tools-edit.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
 
@@ -68,7 +69,7 @@ const TASKS = [
 
 const pool = new FinderPool()
 const ffgrep = createGrepTool(pool)
-const ffReadSymbol = createReadSymbolTool()
+const ffReadSymbol = symbolReader(createReadTool)
 const ffedit = createEditTool(pool)
 const exec = { agent: { session: { header: { cwd: FIXTURE_DIR, id: 'eval-task' } } }, token: {} }
 

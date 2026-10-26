@@ -1,26 +1,33 @@
 /**
- * dsh-forge symbol tools (stage 2): Outline / FindSymbol / symbol-addressed
- * read, plus the grep→symbol weld. Thin factories over src/ast.ts — the AST
- * module owns all tree-sitter interaction; these only shape tool I/O.
+ * dsh-forge symbol implementations (stage 2): the outline and
+ * workspace-definition searches that back `ff_read`'s `outline` and
+ * `definitions` views, plus the grep→symbol weld. Thin over src/ast.ts — the
+ * AST module owns all tree-sitter interaction; these only shape the values.
  *
- * Tool names carry the ff- prefix like the fff tools: one retrieval suite,
- * two engines. Editing stays stage 3.
+ * These were two separate tools (`ff_outline` / `ff_find_symbol`) until the
+ * 2026-10-15 surface merge. They shared `./ast.ts`, `path` and `symbol`
+ * addresses, and `ff_outline`'s output *was* `ff_read`'s address format — so
+ * they are now views of one read tool. The item shapes below are unchanged,
+ * which keeps the model-facing text and the test assertions identical.
+ *
+ * Editing stays stage 3.
  *
  * @module dsh-forge/tools-symbol
  */
 
 import path from 'node:path'
-import { astWorkerCount, parallelFind, type AstWorkerPool } from './ast-pool.ts'
+import { astWorkerAuto, astWorkerCount, parallelFind, type AstWorkerPool } from './ast-pool.ts'
+import { indexerCanParse, indexerFindSymbols, indexerParseBatch, indexerReady } from './indexer-client.ts'
 import ignore, { type Ignore } from 'ignore'
-import { readdirSync, readFileSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import {
-  type AstSymbol,
-  type ParsedFile,
+  type SymbolParse,
   detectLanguage,
   enclosingSymbol,
   findSymbol,
   outlineView,
   parseFile,
+  parseFileSearch,
   symbolOccurrences,
 } from './ast.ts'
 import {
@@ -50,12 +57,34 @@ function resolveFilePath(exec: ForgeExec | undefined, raw: string): string {
   return path.normalize(abs)
 }
 
-function text(value: string): Array<{ type: 'text'; text: string }> {
-  return [{ type: 'text', text: value }]
+/**
+ * Resolve the definitions view's search root. Mirrors the two branches of
+ * `resolveScope` in src/tools.ts, but without the fff index: this tool walks
+ * the disk itself, so `path` moves the walk rather than re-rooting a finder.
+ *
+ * A directory re-roots the walk (note `walkFiles` still refuses to DESCEND
+ * into `node_modules` — point at that subtree directly to search it). A file
+ * narrows the walk to that one file, which makes `glob` moot.
+ */
+function resolveSymbolRoot(
+  exec: ForgeExec | undefined,
+  raw: unknown,
+): { root: string; only?: string } | ToolFailure {
+  if (typeof raw !== 'string' || raw.trim() === '') return { root: workdirOf(exec) }
+  const abs = resolveFilePath(exec, raw.trim())
+  let st: { isDirectory(): boolean; isFile(): boolean }
+  try {
+    st = statSync(abs)
+  } catch {
+    return failure(`path not found: ${abs}`)
+  }
+  if (st.isDirectory()) return { root: abs }
+  if (st.isFile()) return { root: path.dirname(abs), only: abs }
+  return failure(`unsupported path kind: ${abs}`)
 }
 
 // ---------------------------------------------------------------------------
-// Workspace walk (for FindSymbol — independent of the fff index)
+// Workspace walk (for the definitions view — independent of the fff index)
 // ---------------------------------------------------------------------------
 
 const IGNORE_DIRS = new Set([
@@ -120,307 +149,209 @@ function* walkFiles(root: string, ignores: Ignore | null, deadline: number, base
 }
 
 // ---------------------------------------------------------------------------
-// ff_outline
+// outline view
 // ---------------------------------------------------------------------------
 
-const SYMBOL_ITEM_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    name: { type: 'string', required: true },
-    qualifiedName: { type: 'string', required: true },
-    kind: { type: 'string', required: true },
-    startLine: { type: 'integer', required: true },
-    endLine: { type: 'integer', required: true },
-    commentStartLine: { type: 'integer' },
-    level: { type: 'integer', required: true },
-  },
-} as const
-
-export function createOutlineTool() {
-  return {
-    name: 'ff_outline',
-    description:
-      'List one file\'s definitions with current line ranges and qualifiedName addresses for ff_read_symbol. ' +
-      'For workspace definitions use ff_find_symbol. Symbol tools support JS/TS/TSX/Python/Rust/Go/C/C++/Java/C#/Lua; other types use ffgrep/ff_read.',
-    parameters: {
-      path: { type: 'string', required: true, description: 'Absolute/workspace-relative file.' },
-      depth: { type: 'integer', description: 'Max nesting levels; 1=top level, omitted=all.' },
-      kind: { type: 'string', description: 'Comma-separated kinds, e.g. "function,method".' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          items: { type: 'array', required: true, items: SYMBOL_ITEM_SCHEMA },
-          lang: { type: 'string', required: true },
-          partial: { type: 'boolean' },
-        },
-      },
-      render: (_args: unknown, value: { items: Array<AstSymbol & { level: number }>; lang: string; partial?: boolean }) => {
-        if (value.items.length === 0) return text('no symbols found')
-        const lines = value.items.map((s) => {
-          const pad = '  '.repeat(s.level - 1)
-          const range = s.commentStartLine !== undefined ? `L${s.commentStartLine}-${s.endLine}` : `L${s.startLine}-${s.endLine}`
-          return `${pad}${s.qualifiedName} (${s.kind}) ${range}`
-        })
-        if (value.partial) lines.push('[parse had errors — ranges best-effort]')
-        return text(lines.join('\n'))
-      },
-    },
-    isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const rawPath = typeof args.path === 'string' ? args.path : ''
-      if (rawPath === '') return failure('path is required')
-      const abs = resolveFilePath(exec, rawPath)
-      const observed = await exec?.beginNativeRead?.(abs)
-      const parsed = await parseFile(abs, { readPath: observed?.path })
-      if (parsed.error) return failure(parsed.error)
-      const value = parsed.value!
-      const depth = args.depth === undefined ? undefined : clampInt(args.depth, 99, 1, 20)
-      const kind = typeof args.kind === 'string' && args.kind.trim() !== '' ? args.kind : undefined
-      const items = outlineView(value.symbols, { depth, kind }).map(({ children, startOffset, endOffset, sharedDeclaration, listMember, commentStartOffset, ...item }) => item)
-      await observed?.finish()
-      return { items, lang: value.lang, ...(value.partial ? { partial: true } : {}) }
-    },
-  } as const
+/**
+ * `ff_read view=outline`: definitions of ONE file, with current line ranges
+ * and qualifiedName addresses that `view=body` accepts back. The item shape is
+ * the one the former `ff_outline` tool returned, so the rendered text and the
+ * existing assertions are unchanged.
+ */
+export async function outlineOf(
+  exec: ForgeExec | undefined,
+  rawPath: unknown,
+  depthArg: unknown,
+  kindArg: unknown,
+): Promise<{ items: Array<Record<string, unknown>>; lang: string; partial?: boolean } | ToolFailure> {
+  const raw = typeof rawPath === 'string' ? rawPath : ''
+  if (raw.trim() === '') return failure('view=outline requires path')
+  const abs = resolveFilePath(exec, raw)
+  const observed = await exec?.beginNativeRead?.(abs)
+  const parsed = await parseFile(abs, { readPath: observed?.path })
+  if (parsed.error) return failure(parsed.error)
+  const value = parsed.value!
+  const depth = depthArg === undefined ? undefined : clampInt(depthArg, 99, 1, 20)
+  const kind = typeof kindArg === 'string' && kindArg.trim() !== '' ? kindArg : undefined
+  const items: Array<Record<string, unknown>> = outlineView(value.symbols, { depth, kind })
+    .map(({ children, startOffset, endOffset, sharedDeclaration, listMember, commentStartOffset, ...item }) => item)
+  await observed?.finish()
+  return { items, lang: value.lang, ...(value.partial ? { partial: true } : {}) }
 }
 
 // ---------------------------------------------------------------------------
-// ff_find_symbol
+// definitions view
 // ---------------------------------------------------------------------------
 
 /**
  * Identity annotation: #occurrence = 1-based index of a definition among the
  * SAME (file, qualifiedName) group before kind/limit filtering. It survives
  * line drift, but declaration reordering changes occurrence numbers.
+ *
+ * `ff_read view=definitions`: symbol DEFINITIONS (not references) across a
+ * search root. `path` re-roots that search anywhere on the host, including
+ * subtrees the workspace excludes — node_modules, another drive, another
+ * checkout. Item shape unchanged from the former `ff_find_symbol` tool.
  */
-export function createFindSymbolTool(workers?: AstWorkerPool) {
-  return {
-    name: 'ff_find_symbol',
-    description:
-      'Find workspace symbol DEFINITIONS, not references (use ffgrep). Returns current ranges, signatures and occurrence addresses. ' +
-      'Read hits with ff_read_symbol, or ff_read for a batch. Same languages as ff_outline.',
-    parameters: {
-      name: { type: 'string', required: true, description: 'Simple/qualified name, e.g. putBlob, Store.putBlob or Store::put_blob.' },
-      kind: { type: 'string', description: 'Comma-separated kinds, e.g. "function,method".' },
-      glob: { type: 'string', description: 'File glob, e.g. "src/**/*.ts"; omitted=whole workspace.' },
-      limit: { type: 'integer', description: 'Max definitions; default 50, max 200.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          items: {
-            type: 'array',
-            required: true,
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                file: { type: 'string', required: true },
-                qualifiedName: { type: 'string', required: true },
-                kind: { type: 'string', required: true },
-                startLine: { type: 'integer', required: true },
-                endLine: { type: 'integer', required: true },
-                commentStartLine: { type: 'integer' },
-                occurrence: { type: 'integer', required: true },
-                signature: { type: 'string', required: true },
-              },
-            },
-          },
-          stats: { type: 'string', required: true },
-          truncated: { type: 'boolean' },
-        },
-      },
-      render: (_args: unknown, value: { items: Array<Record<string, unknown>>; stats: string; truncated?: boolean }) => {
-        if (value.items.length === 0) return text(`no definitions matched (${value.stats})`)
-        const lines = value.items.map((s) =>
-          `${s.file}#${s.qualifiedName} (${s.kind}) L${s.startLine}-${s.endLine}${Number(s.occurrence) > 1 ? ` #${s.occurrence}` : ''}`,
-        )
-        lines.push(`[${value.stats}]`)
-        return text(lines.join('\n'))
-      },
-    },
-    isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const name = typeof args.name === 'string' ? args.name.trim() : ''
-      if (name === '') return failure('name is required')
-      const limit = clampInt(args.limit, 50, 1, 200)
-      const kindFilter = typeof args.kind === 'string' && args.kind.trim() !== ''
-        ? args.kind.split(',').map((k) => k.trim())
-        : null
-      const glob = typeof args.glob === 'string' && args.glob.trim() !== '' ? globToRegExp(args.glob.trim()) : null
-      const root = workdirOf(exec)
-      const ignores = loadIgnorePatterns(root)
-      const deadline = performance.now() + FIND_SYMBOL_BUDGET_MS
+export async function findDefinitions(
+  exec: ForgeExec | undefined,
+  args: Record<string, unknown>,
+  workers?: AstWorkerPool,
+): Promise<{ items: Array<Record<string, unknown>>; stats: string; truncated?: boolean } | ToolFailure> {
+  const name = typeof args.name === 'string' ? args.name.trim() : ''
+  if (name === '') return failure('name is required')
+  const limit = clampInt(args.limit, 50, 1, 200)
+  const kindFilter = typeof args.kind === 'string' && args.kind.trim() !== ''
+    ? args.kind.split(',').map((k) => k.trim())
+    : null
+  const scope = resolveSymbolRoot(exec, args.path)
+  if (isFailure(scope)) return scope
+  const root = scope.root
+  // A file scope is already maximally specific — a glob on top of it would
+  // be tested against the bare basename and silently match nothing.
+  const glob = scope.only === undefined && typeof args.glob === 'string' && args.glob.trim() !== ''
+    ? globToRegExp(args.glob.trim())
+    : null
+  const ignores = loadIgnorePatterns(root)
+  const started = performance.now()
+  const deadline = started + FIND_SYMBOL_BUDGET_MS
 
-      const items: Array<Record<string, unknown>> = []
-      let filesScanned = 0
-      let truncated = false
-      if (astWorkerCount() > 0) {
-        const files: string[] = []
-        for (const hit of walkFiles(root, ignores, deadline)) {
-          if ('skipped' in hit) { truncated = true; break }
-          const relative = path.relative(root, hit.absPath).split(path.sep).join('/')
-          if (!glob || glob.test(relative)) files.push(hit.absPath)
-        }
-        try {
-          const search = workers ? workers.find.bind(workers) : parallelFind
-          const result = await search(files, name, kindFilter, Date.now() + Math.max(1, deadline - performance.now()), exec?.signal)
-          for (const row of result.results) {
-            if (row.parsed) filesScanned++
-            for (const item of row.items) items.push({ ...item, file: path.relative(root, row.file).split(path.sep).join('/') })
-          }
-          truncated ||= result.timedOut || items.length > limit
-          const elapsed = Math.round(performance.now() - (deadline - FIND_SYMBOL_BUDGET_MS))
-          const page = items.slice(0, limit)
-          return { items: page, stats: `scanned ${filesScanned} code files in ${elapsed}ms (parallel WASM)${truncated ? ', result truncated' : ''}`, ...(truncated ? { truncated: true } : {}) }
-        } catch (cause) { return failure(`parallel AST failed: ${cause instanceof Error ? cause.message : String(cause)}; set DSH_FORGE_AST_WORKERS=0 for sequential parsing`) }
-      }
+  // Collect candidates once, then decide sequential vs parallel. Auto
+  // parallelism engages only above a corpus floor so tiny workspaces never
+  // pay worker-spawn latency; an explicit DSH_FORGE_AST_WORKERS value is
+  // honoured regardless of size.
+  const PARALLEL_MIN_FILES = 16
+  const files: string[] = []
+  let truncated = false
+  for (const hit of walkFiles(root, ignores, deadline)) {
+    if ('skipped' in hit) { truncated = true; break }
+    if (scope.only !== undefined && hit.absPath !== scope.only) continue
+    const relative = path.relative(root, hit.absPath).split(path.sep).join('/')
+    if (!glob || glob.test(relative)) files.push(hit.absPath)
+  }
 
-      outer:
-      for (const hit of walkFiles(root, ignores, deadline)) {
-        exec?.signal?.throwIfAborted()
-        if ('skipped' in hit) {
-          truncated = true
-          break
+  const items: Array<Record<string, unknown>> = []
+  let filesScanned = 0
+  const nativeOptions = { signal: exec?.signal, deadline: Date.now() + Math.max(0, deadline - performance.now()) }
+
+  // Rust sidecar fast path: the sidecar matches the sidecar-supported subset
+  // natively (one round trip, only hits serialized — a warm query pays a stat
+  // per file, no re-parse), while any future unsupported languages keep
+  // the WASM parse. Hits are merged back in walk order so the result lines up
+  // exactly with the pure-WASM paths below. Any failure → fall through.
+  if (await indexerReady(nativeOptions)) {
+    const supported: string[] = []
+    const unsupported = new Set<string>()
+    for (const f of files) {
+      if (indexerCanParse(detectLanguage(f))) supported.push(f)
+      else unsupported.add(f)
+    }
+    if (supported.length > 0) {
+      const result = await indexerFindSymbols(supported, name, kindFilter, nativeOptions)
+      if (result) {
+        const hitsByPath = new Map<string, Array<typeof result.items[number]>>()
+        for (const hit of result.items) {
+          const row = hitsByPath.get(hit.absPath)
+          if (row) row.push(hit)
+          else hitsByPath.set(hit.absPath, [hit])
         }
-        const rel = path.relative(root, hit.absPath).split(path.sep).join('/')
-        if (glob && !glob.test(rel)) continue
-        const parsed = await parseFile(hit.absPath)
-        if (parsed.error || !parsed.value) continue
-        filesScanned++
-        const file = parsed.value
-        const occurrences = symbolOccurrences(file.symbols)
-        const matched = findSymbol(file.symbols, name, false)
-        for (const sym of matched) {
-          if (kindFilter && !kindFilter.includes(sym.kind)) continue
-          const lines = file.text.split('\n')
-          items.push({
-            file: rel,
-            qualifiedName: sym.qualifiedName,
-            kind: sym.kind,
-            occurrence: occurrences.get(sym)!,
-            startLine: sym.startLine,
-            endLine: sym.endLine,
-            ...(sym.commentStartLine !== undefined ? { commentStartLine: sym.commentStartLine } : {}),
-            signature: clip(lines[sym.startLine - 1] ?? ''),
-          })
-          if (items.length >= limit) {
-            truncated = true
-            break outer
+        let scanned = result.parsed
+        outer:
+        for (const abs of files) {
+          exec?.signal?.throwIfAborted()
+          if (performance.now() > deadline) { truncated = true; break }
+          const rel = path.relative(root, abs).split(path.sep).join('/')
+          const hits = hitsByPath.get(abs)
+          if (hits) {
+            for (const hit of hits) {
+              items.push({
+                file: rel,
+                qualifiedName: hit.qualifiedName,
+                kind: hit.kind,
+                occurrence: hit.occurrence,
+                startLine: hit.startLine,
+                endLine: hit.endLine,
+                ...(hit.commentStartLine !== undefined ? { commentStartLine: hit.commentStartLine } : {}),
+                signature: clip(hit.signature),
+              })
+              if (items.length >= limit) { truncated = true; break outer }
+            }
+          } else if (unsupported.has(abs)) {
+            const parsed = await parseFileSearch(abs)
+            if (parsed.error || !parsed.value) continue
+            scanned++
+            const occurrences = symbolOccurrences(parsed.value.symbols)
+            for (const sym of findSymbol(parsed.value.symbols, name, false)) {
+              if (kindFilter && !kindFilter.includes(sym.kind)) continue
+              items.push({
+                file: rel,
+                qualifiedName: sym.qualifiedName,
+                kind: sym.kind,
+                occurrence: occurrences.get(sym)!,
+                startLine: sym.startLine,
+                endLine: sym.endLine,
+                ...(sym.commentStartLine !== undefined ? { commentStartLine: sym.commentStartLine } : {}),
+                signature: clip(parsed.value.signatures.get(sym.startLine) ?? ''),
+              })
+              if (items.length >= limit) { truncated = true; break outer }
+            }
           }
         }
+        const elapsed = Math.round(performance.now() - started)
+        return { items, stats: `scanned ${scanned} code files in ${elapsed}ms (rust sidecar)${truncated ? ', result truncated' : ''}`, ...(truncated ? { truncated: true } : {}) }
       }
-      const elapsed = Math.round(performance.now() - (deadline - FIND_SYMBOL_BUDGET_MS))
-      const stats = `scanned ${filesScanned} code files in ${elapsed}ms${truncated ? ', result truncated' : ''}`
-      return { items, stats, ...(truncated ? { truncated: true } : {}) }
-    },
-  } as const
-}
+    }
+  }
 
-// ---------------------------------------------------------------------------
-// ff_read_symbol
-// ---------------------------------------------------------------------------
+  const useParallel = astWorkerCount() > 0 && (files.length >= PARALLEL_MIN_FILES || !astWorkerAuto())
 
-export function createReadSymbolTool() {
-  return {
-    name: 'ff_read_symbol',
-    description:
-      'Read one current definition with its leading comment. Use occurrence/line to resolve same-name candidates; use ff_read for batches or line ranges. ' +
-      'Same languages as ff_outline. Read before editing.',
-    parameters: {
-      path: { type: 'string', required: true, description: 'Absolute/workspace-relative file.' },
-      symbol: { type: 'string', required: true, description: 'Simple/qualified name from ff_find_symbol/ff_outline.' },
-      body: { type: 'boolean', description: 'Drop leading comment, keeping signature; default false.' },
-      context: { type: 'integer', description: 'Lines around definition, 0-20; default 0.' },
-      line: { type: 'integer', description: '1-based declaration line hint; nearest match wins.' },
-      occurrence: { type: 'integer', description: '1-based same-name declaration index; overrides line. Re-query after declarations reorder.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          file: { type: 'string', required: true },
-          qualifiedName: { type: 'string', required: true },
-          kind: { type: 'string', required: true },
-          startLine: { type: 'integer', required: true },
-          endLine: { type: 'integer', required: true },
-          occurrence: { type: 'integer', required: true },
-          text: { type: 'string', required: true },
-        },
-      },
-      render: (_args: unknown, value: { file: string; qualifiedName: string; startLine: number; endLine: number; occurrence: number; text: string }) =>
-        text(`${value.file}#${value.qualifiedName} L${value.startLine}-${value.endLine} (#${value.occurrence})\n${value.text}`),
-    },
-    isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const rawPath = typeof args.path === 'string' ? args.path : ''
-      const symbol = typeof args.symbol === 'string' ? args.symbol : ''
-      if (rawPath === '') return failure('path is required')
-      if (symbol === '') return failure('symbol is required')
-      const abs = resolveFilePath(exec, rawPath)
-      const observed = await exec?.beginNativeRead?.(abs)
-      const parsed = await parseFile(abs, { readPath: observed?.path })
-      if (parsed.error) return failure(parsed.error)
-      const file = parsed.value!
-      const body = args.body === true
-      const context = clampInt(args.context, 0, 0, 20)
-      const lineHint = args.line === undefined ? undefined : clampInt(args.line, 0, 0, 10_000_000)
-      const occurrenceHint = args.occurrence === undefined ? undefined : clampInt(args.occurrence, 0, 0, 1_000_000)
-
-      const candidates = findSymbol(file.symbols, symbol, false)
-      // A returned qualifiedName is an address, including top-level names.
-      // Prefer its exact group before falling back to broad name discovery.
-      const qualified = candidates.filter(item => item.qualifiedName.replace(/::/g, '.') === symbol.trim().replace(/::/g, '.'))
-      let matches = qualified.length ? qualified : candidates
-      if (matches.length === 0) return failure(`symbol "${symbol}" not found in ${rawPath}`)
-      // Identity layer: occurrence indexes same-name definitions by declaration
-      // order — stable under line drift, reassigned when declaration order
-      // changes. Positional layer: line hint stays as
-      // the convenience alternative.
-      const ordered = [...matches].sort((a, b) => a.startOffset - b.startOffset)
-      if (ordered.length > 1 && occurrenceHint !== undefined) {
-        const picked = ordered[occurrenceHint - 1]
-        if (!picked) {
-          return failure(`occurrence ${occurrenceHint} out of range: "${symbol}" has ${ordered.length} definitions in ${rawPath} — ` +
-            ordered.map((m, i) => `#${i + 1} ${m.qualifiedName} L${m.startLine}`).join(', '))
-        }
-        matches = [picked]
-      } else if (matches.length > 1 && lineHint !== undefined) {
-        const nearest = [...matches].sort((a, b) => Math.abs(a.startLine - lineHint) - Math.abs(b.startLine - lineHint))[0]
-        matches = [nearest]
+  if (useParallel) {
+    try {
+      const search = workers ? workers.find.bind(workers) : parallelFind
+      const result = await search(files, name, kindFilter, Date.now() + Math.max(1, deadline - performance.now()), exec?.signal)
+      for (const row of result.results) {
+        if (row.parsed) filesScanned++
+        for (const item of row.items) items.push({ ...item, file: path.relative(root, row.file).split(path.sep).join('/') })
       }
-      if (matches.length > 1) {
-        return {
-          error: `symbol "${symbol}" is ambiguous in ${rawPath} (${matches.length} definitions) — candidates: ` +
-            ordered.map((m, i) => `#${i + 1} ${m.qualifiedName} L${m.startLine}`).join(', ') +
-            ' — re-send with occurrence=<n> (line-independent) or line=<approx line> to pick one',
-        }
-      }
-      const sym = matches[0]
-      const resolvedOccurrence = ordered.length > 1 ? ordered.indexOf(sym) + 1 : 1
-      const start = body || sym.commentStartLine === undefined ? sym.startLine : sym.commentStartLine
-      const lines = file.text.split('\n')
-      const from = Math.max(0, start - 1 - (context > 0 ? context : 0))
-      const to = Math.min(lines.length, sym.endLine + context)
-      const textOut = lines.slice(from, to).join('\n')
-      await observed?.finish()
-      return {
-        file: rawPath,
+      truncated ||= result.timedOut || items.length > limit
+      const elapsed = Math.round(performance.now() - started)
+      const page = items.slice(0, limit)
+      return { items: page, stats: `scanned ${filesScanned} code files in ${elapsed}ms (parallel WASM)${truncated ? ', result truncated' : ''}`, ...(truncated ? { truncated: true } : {}) }
+    } catch (cause) { return failure(`parallel AST failed: ${cause instanceof Error ? cause.message : String(cause)}; set DSH_FORGE_AST_WORKERS=0 for sequential parsing`) }
+  }
+
+  outer:
+  for (const abs of files) {
+    exec?.signal?.throwIfAborted()
+    if (performance.now() > deadline) { truncated = true; break }
+    const rel = path.relative(root, abs).split(path.sep).join('/')
+    const parsed = await parseFileSearch(abs)
+    if (parsed.error || !parsed.value) continue
+    filesScanned++
+    const value = parsed.value
+    const occurrences = symbolOccurrences(value.symbols)
+    const matched = findSymbol(value.symbols, name, false)
+    for (const sym of matched) {
+      if (kindFilter && !kindFilter.includes(sym.kind)) continue
+      items.push({
+        file: rel,
         qualifiedName: sym.qualifiedName,
         kind: sym.kind,
-        startLine: start,
+        occurrence: occurrences.get(sym)!,
+        startLine: sym.startLine,
         endLine: sym.endLine,
-        occurrence: resolvedOccurrence,
-        text: textOut,
+        ...(sym.commentStartLine !== undefined ? { commentStartLine: sym.commentStartLine } : {}),
+        signature: clip(value.signatures.get(sym.startLine) ?? ''),
+      })
+      if (items.length >= limit) {
+        truncated = true
+        break outer
       }
-    },
-  } as const
+    }
+  }
+  const elapsed = Math.round(performance.now() - started)
+  const stats = `scanned ${filesScanned} code files in ${elapsed}ms${truncated ? ', result truncated' : ''}`
+  return { items, stats, ...(truncated ? { truncated: true } : {}) }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,20 +360,27 @@ export function createReadSymbolTool() {
 
 /**
  * Attach the innermost enclosing symbol to each grep hit whose file is in a
- * supported language. Uses the content-anchored parse cache, so repeated hits
- * in the same file cost one parse. Failures degrade silently (no annotation).
+ * supported language. Uses the search-track mtime+cache parse path, so repeated
+ * hits in the same file cost one stat. Failures degrade silently (no annotation).
  */
 export async function attachEnclosingSymbols(
   items: Array<{ file: string; line: number; in?: { name: string; startLine: number; endLine: number } }>,
   basePath: string,
 ): Promise<void> {
-  const parsedByPath = new Map<string, ParsedFile | null>()
+  const unique = [...new Set(items.map((i) => path.resolve(basePath, i.file)))]
+  let sidecar: Map<string, SymbolParse> | null = null
+  if (await indexerReady()) sidecar = await indexerParseBatch(unique)
+  const parsedByPath = new Map<string, SymbolParse | null>()
   for (const item of items) {
     const key = item.file
     if (!parsedByPath.has(key)) {
       const abs = path.resolve(basePath, item.file)
-      const parsed = await parseFile(abs)
-      parsedByPath.set(key, parsed.value ?? null)
+      let value = sidecar?.get(abs) ?? null
+      if (!value) {
+        const parsed = await parseFileSearch(abs)
+        value = parsed.value ?? null
+      }
+      parsedByPath.set(key, value)
     }
     const parsed = parsedByPath.get(key)
     if (!parsed) continue

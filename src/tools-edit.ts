@@ -1,5 +1,5 @@
 /**
- * dsh-forge construction tools (stage 3): ffedit / ffresolve / ffhistory /
+ * dsh-forge construction tools (stage 3): ffedit (ticket replies included) / ffhistory /
  * ffrollback. Thin factories — the pure engine lives in src/edit-engine.ts,
  * persistence in src/ledger.ts, tickets in src/tickets.ts.
  *
@@ -43,10 +43,8 @@ import {
   type TextEncoding,
 } from './ledger.ts'
 import { createTicket, deleteTicket, loadTicket } from './tickets.ts'
-import { isSymbolicLink } from './fs-paths.ts'
-import { canonicalWorkspace, resolveProjectLink } from './projects.ts'
-import type { ProjectLink } from './project-model.ts'
-import { historyContentMatches, nodeId, readNode } from './history.ts'
+import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
+import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
 import { detectLanguage, enclosingSymbol, parseFile, syntaxValid } from './ast.ts'
 import {
   type FinderPool,
@@ -56,6 +54,7 @@ import {
   takeQueryFor,
   withFileLock,
   withFileLocks,
+  observedRead,
   withNativeWrite,
   workdirOf,
 } from './core.ts'
@@ -95,7 +94,7 @@ function causeMessage(cause: unknown): string {
 const MAX_STEPS = 50
 
 // ---------------------------------------------------------------------------
-// Core write pipeline (shared by ffedit and ffresolve)
+// Core write pipeline (shared by the edit path and the ticket path)
 // ---------------------------------------------------------------------------
 
 interface ApplyParams {
@@ -106,10 +105,9 @@ interface ApplyParams {
   reason: string
   actor: string
   mode: 'atomic' | 'bestEffort'
-  link?: ProjectLink
   /** Refuse the write when the planned text introduces syntax errors into a file that parsed cleanly. */
   revertOnSyntaxError?: boolean
-  /** ffresolve: ticket-verified target coordinates. */
+  /** Ticket reply: verified target coordinates. */
   pinned?: Array<StepCandidate & { stepIndex: number }>
   noWrite?: boolean
 }
@@ -149,7 +147,6 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   const store = storeFor(workspaceForFile(abs, workdir))
   const workspace = store.root
   await prepareWorkspace(store, params.exec)
-  if (params.link) resolveProjectLink(store, params.link.projectId, params.link.todoId, abs)
   const rel = relForward(workspace, abs)
   const exists = existsSync(abs)
 
@@ -160,7 +157,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   if (exists) {
     let raw: string
     try {
-      rawBuf = readFileSync(abs)
+      rawBuf = await observedRead<Buffer>(params.exec, abs, (file) => readFileSync(file))
       raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(rawBuf)
     } catch (cause) {
       return { ok: false, error: `cannot read ${abs}: ${causeMessage(cause)}`, reports: [] }
@@ -206,7 +203,6 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
         sourceHash: hash,
         workdir,
         decisions: params.pinned ?? [],
-        ...params.link,
       })
       return {
         ok: false,
@@ -271,12 +267,11 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
       if ((existsSync(abs) ? sha256(readFileSync(abs)) : '') !== hash) throw new Error('file changed while planning; nothing written')
       if (rawBuf) {
         const known = readKnownState(store, rel)
-        if (known && known.hash !== hash) externalBatchId = recordExternalState(store, rel, rawBuf, enc.eol, enc.bom, params.link).batch.id
+        if (known && known.hash !== hash) externalBatchId = recordExternalState(store, rel, rawBuf, enc.eol, enc.bom).batch.id
       }
       const after = putBlob(store, newRaw).id
       return commitFiles(store, {
         kind: 'edit', reason, actor,
-        ...params.link,
         nodes: [{ file: rel, op, before, after, bytes: newRaw.length, eol: enc.eol, bom: enc.bom }],
       }, [{ file: abs, before: rawBuf, after: newRaw }])
     })
@@ -334,10 +329,10 @@ const STEP_ITEM_SCHEMA = {
     end: { type: 'integer', description: 'replace/delete: inclusive last line; default start.' },
     after: { type: 'integer', description: 'Required for insert: original line to insert after; 0 = file start.' },
     find: { type: 'string', description: 'Required for target: nonempty literal block.' },
-    replaceWith: { type: 'string', description: 'Required for target: replacement; empty string deletes.' },
-    text: { type: 'string', description: 'Required for replace/insert: text with newline separators.' },
-    expect: { type: 'string', description: 'Expected start/after line; re-anchor within ±20 lines if shifted.' },
-    inline: { type: 'boolean', description: 'target: force single-line substring match. Also auto-selected if whole-line matching fails; requires atomic mode.' },
+    replaceWith: { type: 'string', description: 'Required for target: replacement; empty deletes.' },
+    text: { type: 'string', description: 'Required for replace/insert: newline-separated text.' },
+    expect: { type: 'string', description: 'Expected start/after line; re-anchor within ±20 lines.' },
+    inline: { type: 'boolean', description: 'target: force single-line substring match (auto when whole-line fails); requires atomic mode.' },
   },
 } as const
 
@@ -357,17 +352,18 @@ export function createEditTool(pool: FinderPool) {
   return {
     name: 'ffedit',
     description:
-      'Edit text after reading it. All steps use ORIGINAL snapshot lines; overlaps fail. Prefer expect anchors or target matching; ambiguity returns a ticket for ffresolve. ' +
-      'Replacement text that quotes the range\'s first and last lines preserves those boundary lines. Create files with insert after=0. ' +
+      'Edit text after reading it. For one literal replacement pass find/replaceWith directly; multi-step edits use steps. All steps use ORIGINAL snapshot lines; overlaps fail. Prefer expect anchors or target matching. An ambiguous target writes nothing: it returns a ticket, and you apply the saved batch by resending ffedit with that ticket plus choice (never steps). ' +
+      'Replacement text quoting the range\'s first and last lines keeps them. Create files with insert after=0. ' +
       'Preserves UTF-8 CRLF/LF/BOM; refuses binary files. Changes are snapshotted for ffrollback. For symbol edits or code transfers use ff_file.',
     parameters: {
-      path: { type: 'string', required: true, description: 'File path (absolute or workspace-relative).' },
-      steps: { type: 'array', required: true, items: STEP_ITEM_SCHEMA, description: '1–50 steps in original snapshot coordinates.' },
-      reason: { type: 'string', required: true, description: 'Why this change; recorded in history.' },
-      mode: { type: 'string', enum: ['atomic', 'bestEffort'], description: 'Default atomic: failure writes nothing. bestEffort skips failed steps; inspect reports.' },
-      revertOnSyntaxError: { type: 'boolean', description: 'Reject new syntax errors in previously clean files. Default false; already-invalid files remain report-only.' },
-      projectId: { type: 'string', description: 'Associate with a durable project; file must be inside its root.' },
-      todoId: { type: 'string', description: 'Associate with a project task; requires projectId.' },
+      path: { type: 'string', description: 'File path (absolute or workspace-relative). Required unless answering a ticket.' },
+      find: { type: 'string', description: 'Shorthand for one step: literal block to locate (whole-line match).' },
+      replaceWith: { type: 'string', description: 'Replacement for find; empty deletes the block.' },
+      steps: { type: 'array', items: STEP_ITEM_SCHEMA, description: '1–50 steps; omit with the find/replaceWith shorthand.' },
+      reason: { type: 'string', description: 'Why this change; recorded in history. Required unless answering a ticket.' },
+      revertOnSyntaxError: { type: 'boolean', description: 'Default false: reject introduced syntax errors in a clean file; dirty files stay report-only.' },
+      ticket: { type: 'string', description: 'Ticket id from an ambiguous ffedit. Applies that saved batch; requires a path-less resend carrying choice.' },
+      choice: { type: 'string', description: 'Ticket only: one candidate index ("2"), several unique indexes ("2,3" or "#2 #3"), or "all" for every candidate.' },
     },
     output: {
       schema: {
@@ -408,7 +404,7 @@ export function createEditTool(pool: FinderPool) {
       render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; note?: string }) => {
         const lines: string[] = []
         if (value.status === 'ticket') {
-          lines.push(`ambiguous target — ticket ${value.ticket} signed; pick a candidate with ffresolve {ticket: "${value.ticket}", choice: <index>}`)
+          lines.push(`ambiguous target — nothing written; ticket ${value.ticket} signed. Apply it with ffedit {ticket: "${value.ticket}", choice: <index>} (no path, no steps)`)
           for (const c of value.candidates ?? []) {
             lines.push(`  [${c.index}] L${c.start}-${c.end}${c.symbol ? ` in ${c.symbol}` : ''}: ${c.preview}`)
           }
@@ -433,23 +429,58 @@ export function createEditTool(pool: FinderPool) {
     },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
+      const ticketId = typeof args.ticket === 'string' ? args.ticket.trim() : ''
+      if (ticketId !== '') {
+        // Answering a ticket is the same tool, a different job: the saved batch
+        // is replayed against the original snapshot, so a resend that also
+        // carries steps would apply two intents at once. Any other argument is
+        // refused by name — a silently ignored `all` is how a caller ends up
+        // believing it answered a question it did not answer.
+        const foreign = Object.keys(args).filter((key) => args[key] !== undefined && key !== 'ticket' && key !== 'choice')
+        if (foreign.length > 0) {
+          return failure(`a ticket reply takes only {ticket, choice} — drop ${foreign.map((key) => `"${key}"`).join(', ')}`)
+        }
+        return decideTicket(pool, ticketId, args, exec)
+      }
       const rawPath = typeof args.path === 'string' ? args.path.trim() : ''
-      if (rawPath === '') return failure('path is required')
+      if (rawPath === '') return failure('path is required unless you are answering a ticket')
       const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
       if (reason === '') {
         return failure('reason is required for every construction step (development-history ledger). Re-send with e.g. {"path": ..., "steps": [...], "reason": "fix: guard empty token in putBlob"}')
       }
-      if (!Array.isArray(args.steps) || args.steps.length === 0) return failure('steps requires 1-50 step objects')
-      if (args.steps.length > MAX_STEPS) return failure(`steps accepts at most ${MAX_STEPS} steps`)
-      const steps: EditStep[] = args.steps.filter((s): s is EditStep => typeof s === 'object' && s !== null)
-      if (steps.length !== args.steps.length) return failure('every step must be an object')
-      const mode = args.mode === 'bestEffort' ? 'bestEffort' : 'atomic'
+      if (args.choice !== undefined) {
+        return failure('choice only applies to a ticket reply — pass ticket with it')
+      }
+      if (args.steps !== undefined && (args.find !== undefined || args.replaceWith !== undefined)) {
+        return failure('provide either steps or the find/replaceWith single-step shorthand, not both')
+      }
+      let steps: EditStep[]
+      if (args.steps === undefined) {
+        // Single-step sugar mirroring the built-in edit's shape: a flat
+        // find/replaceWith call is lowered to one target step, so the common
+        // one-block replacement needs no steps array. Ambiguity still returns
+        // a ticket — sugar never bypasses the governance path.
+        if (typeof args.find !== 'string' || args.find === '') return failure('steps requires 1-50 step objects (or a single find/replaceWith pair)')
+        if (typeof args.replaceWith !== 'string') return failure('replaceWith is required with find — use an empty string to delete the matched block')
+        steps = [{ op: 'target', find: args.find, replaceWith: args.replaceWith }]
+      } else {
+        if (!Array.isArray(args.steps) || args.steps.length === 0) return failure('steps requires 1-50 step objects')
+        if (args.steps.length > MAX_STEPS) return failure(`steps accepts at most ${MAX_STEPS} steps`)
+        steps = args.steps.filter((s): s is EditStep => typeof s === 'object' && s !== null)
+        if (steps.length !== args.steps.length) return failure('every step must be an object')
+      }
+      // One contract, not a knob: a batch either lands whole or writes nothing.
+      // `bestEffort` exists in the engine for internal callers, but exposing it
+      // here let a caller ask for a half-applied file, which is the opposite of
+      // what a ledger-backed edit tool promises.
+      if (args.mode !== undefined) {
+        return failure('mode is not a parameter: ffedit is atomic — a batch that cannot land whole writes nothing. Split it into separate calls instead.')
+      }
       const abs = resolveFilePath(exec, rawPath)
       const workdir = canonicalWorkspace(workdirOf(exec))
       return withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
         try {
-          const link = resolveProjectLink(storeFor(workdir), args.projectId, args.todoId, abs)
-          return shapeApplyResult(await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode, link, exec, revertOnSyntaxError: args.revertOnSyntaxError === true }))
+          return shapeApplyResult(await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode: 'atomic', exec, revertOnSyntaxError: args.revertOnSyntaxError === true }))
         } catch (cause) { return failure(causeMessage(cause)) }
       }))
     },
@@ -457,131 +488,86 @@ export function createEditTool(pool: FinderPool) {
 }
 
 // ---------------------------------------------------------------------------
-// ffresolve
+// Ticket decisions — ffedit's second half, deliberately not a second tool
 // ---------------------------------------------------------------------------
 
-export function createResolveTool(pool: FinderPool) {
-  return {
-    name: 'ffresolve',
-    description:
-      'Resolve an ffedit ticket and apply the full saved batch; do not resend steps. Provide exactly one of choice, choices, all=true. Overlapping selections fail. ' +
-      'If stale or another step is ambiguous, follow the returned ticket/error; re-read before a fresh ffedit.',
-    parameters: {
-      ticket: { type: 'string', required: true, description: 'Ticket ID from ffedit/ffresolve.' },
-      choice: { type: 'integer', description: 'One candidate index, 0-based.' },
-      choices: { type: 'array', items: { type: 'integer' }, description: 'Nonempty list of candidate indexes, 0-based.' },
-      all: { type: 'boolean', description: 'true selects every candidate.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          status: { type: 'string', required: true },
-          workspace: { type: 'string' },
-          batch: { type: 'integer' },
-          hash: { type: 'string' },
-          created: { type: 'boolean' },
-          externalBatch: { type: 'integer' },
-          reason: { type: 'string' },
-          applied: { type: 'integer' },
-          skipped: { type: 'integer' },
-          ticket: { type: 'string' },
-          candidates: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                index: { type: 'integer', required: true },
-                start: { type: 'integer', required: true },
-                end: { type: 'integer', required: true },
-                startOffset: { type: 'integer' }, endOffset: { type: 'integer' },
-                symbol: { type: 'string' },
-                preview: { type: 'string', required: true },
-              },
-            },
-          },
-          reports: { type: 'array', items: { type: 'object', additionalProperties: true } },
-          syntaxWarning: { type: 'string' },
-          note: { type: 'string' },
-        },
-      },
-      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; syntaxWarning?: string; note?: string }) => {
-        if (value.status === 'ticket') {
-          const lines = [`another decision is required — ticket ${value.ticket}; pick with ffresolve {ticket: "${value.ticket}", choice: <index>}`]
-          for (const c of value.candidates ?? []) {
-            lines.push(`  [${c.index}] L${c.start}-${c.end}${c.symbol ? ` in ${c.symbol}` : ''}: ${c.preview}`)
-          }
-          return text(lines.join('\n'))
-        }
-        const lines = [`resolved — applied ${value.applied ?? 0} step(s)${value.batch ? `, batch #${value.batch}` : ''}`]
-        for (const r of value.reports ?? []) {
-          const bits: string[] = [r.op, r.status]
-          if (r.drift) bits.push(`drift ${r.drift > 0 ? '+' : ''}${r.drift}`)
-          if (r.symbol) bits.push(`in ${r.symbol}`)
-          if (r.reason) bits.push(r.reason)
-          lines.push(`  step ${r.index}: ${bits.join(', ')}`)
-        }
-        if (value.syntaxWarning) lines.push(`[warn] ${value.syntaxWarning}`)
-        if (value.note) lines.push(`[${value.note}]`)
-        return text(lines.join('\n'))
-      },
-    },
-    isConcurrencySafe: () => false,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const id = typeof args.ticket === 'string' ? args.ticket.trim() : ''
-      if (id === '') return failure('ticket is required')
-      const ticket = loadTicket(id)
-      if ('error' in ticket) return failure(ticket.error)
-      if ([args.choice !== undefined, args.choices !== undefined, args.all === true].filter(Boolean).length !== 1) return failure('provide exactly one of choice, choices or all=true')
-      const choices = args.all === true ? ticket.candidates.map((_, index) => index) : Array.isArray(args.choices) ? args.choices : [args.choice]
-      if (choices.length < 1 || new Set(choices).size !== choices.length || choices.some(choice => !Number.isInteger(choice) || Number(choice) < 0 || Number(choice) >= ticket.candidates.length)) {
-        return failure(`choice must be unique integers from 0-${ticket.candidates.length - 1}`)
-      }
-      const chosen = choices.map(choice => ticket.candidates[Number(choice)])
-      const step = ticket.steps[ticket.stepIndex]
-      const abs = ticket.file
-      const workdir = ticket.workdir
-      await exec?.authorizeNativePaths?.([workdir, abs])
-      return withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
-        let link: ProjectLink | undefined
-        try { link = resolveProjectLink(storeFor(workdir), ticket.projectId, ticket.todoId, abs) }
-        catch (cause) { return failure(causeMessage(cause)) }
-        const live = loadTicket(id)
-        if ('error' in live) return failure(live.error)
-        // All choices refer to one original snapshot; any drift requires a new decision.
-        const stillThere = existsSync(abs) && sha256(readFileSync(abs)) === ticket.sourceHash
-          && chosen.every(candidate => candidate.startOffset !== undefined ? new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(abs)).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').slice(candidate.startOffset, candidate.endOffset) === step.find
-            : verifyCandidateStillMatches(abs, step.find ?? '', candidate.start, candidate.end))
-        if (stillThere) {
-          const result = await applyBatch(pool, {
-            abs,
-            workdir,
-            steps: ticket.steps,
-            reason: ticket.reason,
-            actor: actorOf(exec),
-            mode: 'atomic',
-            ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}),
-            exec,
-            link,
-            pinned: [...ticket.decisions, ...chosen.map(candidate => ({ ...candidate, stepIndex: ticket.stepIndex }))],
-          })
-          if (result.ok || 'ticket' in result) {
-            // Success consumes the ticket; a NEW ambiguity (another target step
-            // of the same batch) supersedes it with the fresh ticket.
-            deleteTicket(id)
-          }
-          return shapeApplyResult(result)
-        }
-        // Invalidated — re-plan against current content.
+/**
+ * Read a ticket selection: one index, a comma/space separated list, or `all`.
+ *
+ * Three parameters used to say this (`choice`, `choices`, `all`). One string
+ * says it with the same reach, and matches how `ffrollback` already takes a
+ * batch id — the caller writes what it sees in the candidate list verbatim.
+ *
+ * @param raw - `choice` as supplied; integers and integer arrays stay accepted
+ *   so a stored replay of an older call keeps working.
+ * @param total - candidate count, used to expand `all`.
+ * @returns the selected indexes, or an error message to hand back unchanged.
+ */
+function parseTicketChoice(raw: unknown, total: number): number[] | string {
+  const list = (text: string): number[] | string => {
+    const parts = text.split(/[\s,、]+/).map((part) => part.replace(/^#/, '')).filter(Boolean)
+    if (parts.length === 0) return `choice must be an index, a list of unique indexes ("2,3"), or "all" — got: ${JSON.stringify(raw)}`
+    const indexes = parts.map(Number)
+    if (indexes.some((value) => !Number.isInteger(value))) return `choice must be indexes — got: ${JSON.stringify(raw)}`
+    return indexes
+  }
+  if (typeof raw === 'number' && Number.isInteger(raw)) return [raw]
+  if (Array.isArray(raw) && raw.every((value) => Number.isInteger(value))) return raw as number[]
+  if (typeof raw !== 'string') return `choice must be an index, a list of unique indexes ("2,3"), or "all" — got: ${JSON.stringify(raw)}`
+  const text = raw.trim().toLowerCase()
+  return text === 'all' ? Array.from({ length: total }, (_, index) => index) : list(text)
+}
+
+/**
+ * Apply the batch a ticket parked, measured against the snapshot its candidates
+ * came from. A stale snapshot or an overlapping selection fails instead of
+ * half-applying; a fresh ambiguity supersedes the ticket with a new one.
+ */
+async function decideTicket(pool: FinderPool, id: string, args: Record<string, unknown>, exec: ForgeExec | undefined) {
+  const ticket = loadTicket(id)
+  if ('error' in ticket) return failure(ticket.error)
+  const choices = parseTicketChoice(args.choice, ticket.candidates.length)
+  if (typeof choices === 'string') return failure(choices)
+  if (choices.length < 1 || new Set(choices).size !== choices.length || choices.some(choice => !Number.isInteger(choice) || Number(choice) < 0 || Number(choice) >= ticket.candidates.length)) {
+    return failure(`choice must be unique integers from 0-${ticket.candidates.length - 1}`)
+  }
+  const chosen = choices.map(choice => ticket.candidates[Number(choice)])
+  const step = ticket.steps[ticket.stepIndex]
+  const abs = ticket.file
+  const workdir = ticket.workdir
+  await exec?.authorizeNativePaths?.([workdir, abs])
+  return withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
+    const live = loadTicket(id)
+    if ('error' in live) return failure(live.error)
+    // All choices refer to one original snapshot; any drift requires a new decision.
+    const stillThere = existsSync(abs) && sha256(readFileSync(abs)) === ticket.sourceHash
+      && chosen.every(candidate => candidate.startOffset !== undefined ? new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(abs)).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').slice(candidate.startOffset, candidate.endOffset) === step.find
+        : verifyCandidateStillMatches(abs, step.find ?? '', candidate.start, candidate.end))
+    if (stillThere) {
+      const result = await applyBatch(pool, {
+        abs,
+        workdir,
+        steps: ticket.steps,
+        reason: ticket.reason,
+        actor: actorOf(exec),
+        mode: 'atomic',
+        ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}),
+        exec,
+        pinned: [...ticket.decisions, ...chosen.map(candidate => ({ ...candidate, stepIndex: ticket.stepIndex }))],
+      })
+      if (result.ok || 'ticket' in result) {
+        // Success consumes the ticket; a NEW ambiguity (another target step
+        // of the same batch) supersedes it with the fresh ticket.
         deleteTicket(id)
-        const fresh = await applyBatch(pool, { abs, workdir, steps: ticket.steps, reason: ticket.reason,
-          actor: actorOf(exec), mode: 'atomic', noWrite: true, link })
-        return 'ticket' in fresh ? shapeApplyResult(fresh) : failure(!fresh.ok && 'error' in fresh ? fresh.error : 'ticket invalidated; re-send ffedit against current content')
-      }))
-    },
-  } as const
+      }
+      return shapeApplyResult(result)
+    }
+    // Invalidated — re-plan against current content.
+    deleteTicket(id)
+    const fresh = await applyBatch(pool, { abs, workdir, steps: ticket.steps, reason: ticket.reason,
+      actor: actorOf(exec), mode: 'atomic', noWrite: true })
+    return 'ticket' in fresh ? shapeApplyResult(fresh) : failure(!fresh.ok && 'error' in fresh ? fresh.error : 'ticket invalidated; re-send ffedit against current content')
+  }))
 }
 
 /** Project the engine result onto the tool output shape. Hard failures keep
@@ -633,14 +619,16 @@ export function createHistoryTool() {
   return {
     name: 'ffhistory',
     description:
-      'Search persistent change history, newest first. Returns batch/node IDs for ff_diff or ffrollback. Filters combine; narrow project/path if content scanning is truncated.',
+      'Search persistent change history, newest first: what changed, when, by which actor and why. ' +
+      'Pass batch or node for that batch\'s immutable snapshot diffs instead of a listing (independent of the files and of Git). ' +
+      'Returns IDs for ffrollback. Filters combine; narrow project/path if content scanning is truncated.',
     parameters: {
+      batch: { type: 'integer', description: 'Positive batch ID from a previous call: return its nodes\' snapshot diffs, not a listing.' },
+      node: { type: 'string', description: 'One node address, e.g. b12:n0: return just that node\'s diff. Mutually exclusive with batch.' },
       path: { type: 'string', description: 'Substring filter on file paths.' },
       keyword: { type: 'string', description: 'Case-insensitive substring filter on reasons.' },
       actor: { type: 'string', description: 'Exact actor (session id) filter.' },
       kind: { type: 'string', enum: ['edit', 'rollback', 'external', 'project'], description: 'Batch-kind filter.' },
-      projectId: { type: 'string', description: 'Exact durable project ID filter.' },
-      todoId: { type: 'string', description: 'Exact durable task ID filter.' },
       content: { type: 'string', description: 'Case-insensitive literal in UTF-8 before/after snapshots; 32MB scan budget.' },
       limit: { type: 'integer', description: 'Max batches (default 20, max 100).' },
     },
@@ -661,19 +649,36 @@ export function createHistoryTool() {
                 kind: { type: 'string', required: true },
                 actor: { type: 'string', required: true },
                 reason: { type: 'string', required: true },
-                projectId: { type: 'string' }, todoId: { type: 'string' },
                 files: { type: 'array', required: true, items: { type: 'string' } },
+                diffs: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      node: { type: 'string', required: true },
+                      file: { type: 'string', required: true },
+                      before: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+                      after: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+                      diff: { type: 'string', required: true },
+                      binary: { type: 'boolean', required: true },
+                      truncated: { type: 'boolean', required: true },
+                    },
+                  },
+                },
               },
             },
           },
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[] }>; note?: string }) => {
+      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: Array<{ node: string; diff: string; truncated: boolean }> }>; note?: string }) => {
         if (value.items.length === 0) return text('no ledger entries matched')
-        const lines = value.items.map((b) =>
-          `#${b.batch} ${b.ts} ${b.kind} by ${b.actor.slice(0, 12)}… — ${b.reason}\n    ${b.files.join(', ')}`,
-        )
+        const lines = value.items.map((b) => {
+          const head = `#${b.batch} ${b.ts} ${b.kind} by ${b.actor.slice(0, 12)}… — ${b.reason}\n    ${b.files.join(', ')}`
+          if (!b.diffs?.length) return head
+          return [head, ...b.diffs.map((d) => `${d.node}${d.truncated ? ' [truncated]' : ''}\n${d.diff}`)].join('\n')
+        })
         if (value.note) lines.push(`[${value.note}]`)
         return text(lines.join('\n'))
       },
@@ -681,6 +686,46 @@ export function createHistoryTool() {
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const store = storeFor(canonicalWorkspace(workdirOf(exec)))
+      // Diff mode, absorbed from the former ff_diff: one batch (or one node of
+      // it) resolved from the same ledger this tool already searches, with the
+      // immutable snapshots attached to the batch entry. Listing filters do
+      // not apply here — the address is the selector.
+      if (args.batch !== undefined || args.node !== undefined) {
+        if (args.batch !== undefined && args.node !== undefined) return failure('provide exactly one of batch or node')
+        try {
+          const pick = (): { batch: NonNullable<ReturnType<typeof readLedgerTail>[number]>; picks: Array<{ node: LedgerNode; index: number }> } | ToolFailure => {
+            if (typeof args.node === 'string') {
+              const read = readNode(store, args.node)
+              return { batch: read.batch, picks: [{ node: read.node, index: read.index }] }
+            }
+            if (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1) return failure('batch must be a positive integer')
+            const found = readLedgerTail(store, Number.MAX_SAFE_INTEGER).find((b) => b.id === args.batch)
+            if (!found) return failure(`batch ${String(args.batch)} not found`)
+            if (found.nodes.length > 50) return failure('batch has more than 50 nodes; query individual nodes')
+            return { batch: found, picks: found.nodes.map((node, index) => ({ node, index })) }
+          }
+          const selected = pick()
+          if ('error' in selected) return selected
+          const b = selected.batch
+          return {
+            items: [{
+              batch: b.id,
+              ts: new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19),
+              kind: b.kind,
+              actor: b.actor,
+              reason: b.reason,
+              files: b.nodes.map((n) => `${n.file} (${n.op}, ${n.bytes}B)`),
+              diffs: selected.picks.map(({ node, index }) => ({
+                node: nodeId(b.id, index),
+                file: node.file,
+                before: node.before,
+                after: node.after,
+                ...snapshotDiff(snapshot(store, node.before), snapshot(store, node.after), node.file),
+              })),
+            }],
+          }
+        } catch (cause) { return failure(causeMessage(cause)) }
+      }
       const limit = clampInt(args.limit, 20, 1, 100)
       const content = typeof args.content === 'string' && args.content.trim() ? args.content : undefined
       const budget = { remaining: 32 * 1024 * 1024 }
@@ -689,8 +734,6 @@ export function createHistoryTool() {
         keyword: typeof args.keyword === 'string' && args.keyword.trim() !== '' ? args.keyword.trim() : undefined,
         actor: typeof args.actor === 'string' && args.actor.trim() !== '' ? args.actor.trim() : undefined,
         kind: args.kind === 'edit' || args.kind === 'rollback' || args.kind === 'external' || args.kind === 'project' ? args.kind : undefined,
-        projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
-        todoId: typeof args.todoId === 'string' ? args.todoId : undefined,
         limit: content ? Number.MAX_SAFE_INTEGER : limit,
       })
       if (content) {
@@ -707,7 +750,6 @@ export function createHistoryTool() {
           kind: b.kind,
           actor: b.actor,
           reason: b.reason,
-          ...(b.projectId ? { projectId: b.projectId } : {}), ...(b.todoId ? { todoId: b.todoId } : {}),
           files: b.nodes.map((n) => `${n.file} (${n.op}, ${n.bytes}B)`),
         })),
       }
@@ -735,16 +777,15 @@ export function createRollbackTool(pool: FinderPool) {
   return {
     name: 'ffrollback',
     description:
-      'Restore full file snapshots, overwriting later changes; files created after the selected state are deleted. Current bytes are saved for redo via ffrollback. ' +
+      'Restore full file snapshots, overwriting later changes; files created after the selected state are deleted. Current bytes are saved for redo. ' +
       'Provide exactly one of batch or throughBatch. Project/task records remain. Inspect the default dry run, then resend with dryRun=false.',
     parameters: {
-      batch: { type: 'string', description: 'Undo this batch: string ID from ffhistory, e.g. "12", or "last".' },
+      batch: { type: 'string', description: 'Undo this batch: string ID from ffhistory ("12", or "last").' },
       throughBatch: { type: 'integer', description: 'Restore files to the state after this batch; 0 = initial state.' },
-      projectId: { type: 'string', description: 'Scope throughBatch to this project; ignored with batch.' },
       path: { type: 'string', description: 'Restrict files by path substring.' },
-      dryRun: { type: 'boolean', description: 'Default true: plan only. false writes the rollback.' },
+      dryRun: { type: 'boolean', description: 'Default true (plan only); false writes the rollback.' },
       reason: { type: 'string', required: true, description: 'Why this rollback; recorded in history.' },
-      node: { type: 'string', description: 'With batch only: select one node, e.g. b12:n0; must belong to that batch.' },
+      node: { type: 'string', description: 'With batch only: one node (e.g. b12:n0) that belongs to that batch.' },
     },
     output: {
       schema: {
@@ -803,7 +844,6 @@ export function createRollbackTool(pool: FinderPool) {
           if (!Number.isSafeInteger(boundary) || boundary < 0 || boundary > (batches.at(-1)?.id ?? 0)) return failure('throughBatch must be an existing ledger boundary or 0')
           if (args.node !== undefined) return failure('node cannot be combined with throughBatch')
           const later = batches.filter(batch => batch.id > boundary && batch.kind !== 'project')
-          const linkedFiles = new Set(later.filter(batch => args.projectId === undefined || batch.projectId === args.projectId).flatMap(batch => batch.nodes.map(node => node.file)))
           const selected = new Map<string, { node: LedgerNode; batch: (typeof batches)[number] }>()
           const atBoundary = new Map<string, LedgerNode>()
           for (const batch of batches) {
@@ -812,7 +852,7 @@ export function createRollbackTool(pool: FinderPool) {
           }
           for (const batch of later) {
             for (const node of batch.nodes) {
-              if (linkedFiles.has(node.file) && (!pathFilter || node.file.includes(pathFilter)) && !selected.has(node.file)) {
+              if ((!pathFilter || node.file.includes(pathFilter)) && !selected.has(node.file)) {
                 const previous = atBoundary.get(node.file)
                 selected.set(node.file, { node: { ...node, op: 'update', before: previous ? previous.after : node.before }, batch })
               }
@@ -820,11 +860,8 @@ export function createRollbackTool(pool: FinderPool) {
           }
           // Boundary history wins over a later edit's baseline, which may already
           // contain an external modification. With no earlier node, use baseline.
-          const projectIds = new Set(later.filter(batch => batch.nodes.some(node => selected.has(node.file))).map(batch => batch.projectId))
-          if (projectIds.size > 1) return failure('point rollback spans multiple project links; restrict path to files with one consistent project link')
-          const first = [...selected.values()][0]
           target = { t: 'b', id: boundary, ts: Date.now(), kind: 'rollback', reason, actor: actorOf(exec),
-            ...(first?.batch.projectId ? { projectId: first.batch.projectId } : {}), nodes: [...selected.values()].map(item => item.node) }
+            nodes: [...selected.values()].map(item => item.node) }
         } else if (rawBatch === 'last') {
           target = batches.filter(batch => batch.kind !== 'project').at(-1) ?? null
         } else {
@@ -917,8 +954,7 @@ export function createRollbackTool(pool: FinderPool) {
                 file: item.rel, op: item.action === 'delete' ? 'delete' : 'update',
                 before: item.currentBlob, after: item.targetBlob, bytes: item.bytes, eol: item.eol, bom: item.bom,
               }))
-              const link = resolveProjectLink(store, target.projectId, target.todoId)
-              const batch = commitFiles(store, { kind: 'rollback', reason, actor: actorOf(exec), reverted: target.id, nodes: ledgerNodes, ...link }, changes)
+              const batch = commitFiles(store, { kind: 'rollback', reason, actor: actorOf(exec), reverted: target.id, nodes: ledgerNodes }, changes)
               return { status: 'applied', revertedBatch: target.id, newBatch: batch.id, dryRun: false,
                 items: plan.map(p => ({ file: p.rel, action: p.action, detail: p.detail })) }
             })

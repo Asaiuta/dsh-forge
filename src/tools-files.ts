@@ -1,8 +1,8 @@
 /** File and symbol transfers commit all affected raw bytes in one recoverable batch. */
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
-import { canonicalTarget, canonicalWorkspace, resolveProjectLink, within } from './projects.ts'
-import { parseLineRange, type ForgeExec, workdirOf, withFileLock, withFileLocks, withNativeWrite } from './core.ts'
+import { canonicalTarget, canonicalWorkspace, within } from './fs-paths.ts'
+import { observedRead, parseLineRange, type ForgeExec, workdirOf, withFileLock, withFileLocks, withNativeWrite } from './core.ts'
 import { commitFiles, detectEncoding, encodeText, prepareWorkspace, putBlob, readKnownState, recordExternalState, storeFor, type FileChange, type LedgerNode } from './ledger.ts'
 import { findSymbol, parseFile, normalizeText, symbolSpan, syntaxValid, detectLanguage } from './ast.ts'
 import { applyEditSteps } from './edit-engine.ts'
@@ -50,29 +50,27 @@ export function createFileTool() {
   return {
     name: 'ff_file',
     description: 'Create/remove/move files, transfer code, or edit one symbol in an atomic batch recoverable with ffrollback. Paths stay inside the workspace; parents must exist. Read before writing. ' +
-      'Transfers require symbol OR fromLines and exactly one destination anchor. edit_symbol uses an exact symbol span; shared declarations and list-member deletion/move require ffedit. Symbol languages: see ff_outline.',
+      'Transfers need symbol OR fromLines plus exactly one destination anchor. edit_symbol uses an exact symbol span; shared declarations and list-member deletion/move require ffedit.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code', 'edit_symbol'], description: 'Operation; only its relevant fields are used.' },
+      action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code', 'edit_symbol'], description: 'Operation; only the fields it needs are used.' },
       path: { type: 'string', required: true, description: 'File path, absolute or workspace-relative; source for move/transfers.' },
-      destination: { type: 'string', description: 'Required for move/transfers: destination file path.' },
-      content: { type: 'string', description: 'Required for create and edit_symbol except delete: literal UTF-8 text.' },
-      overwrite: { type: 'boolean', description: 'create/move: allow replacing an existing destination. Default false.' },
-      symbol: { type: 'string', description: 'Required for edit_symbol; transfer alternative to fromLines. Unique simple/qualified name from ff_outline.' },
+      destination: { type: 'string', description: 'Required for move/transfers.' },
+      content: { type: 'string', description: 'Required for create/edit_symbol except delete: literal UTF-8 text.' },
+      overwrite: { type: 'boolean', description: 'create/move: allow overwriting the destination. Default false.' },
+      symbol: { type: 'string', description: 'Required for edit_symbol; transfer alternative to fromLines. Unique name from ff_read view=outline.' },
       body: { type: 'boolean', description: 'Symbol span: drop leading comment, keep signature. Default false.' },
-      fromLines: { type: 'string', description: 'Transfer source range, e.g. "L10-20"; alternative to symbol.' },
-      after: { type: 'integer', description: 'Transfer: insert after original destination line; 0 = file start.' },
-      before: { type: 'integer', description: 'Transfer: insert before original destination line, 1-based.' },
+      fromLines: { type: 'string', description: 'Transfer source range ("L10-20"); alternative to symbol.' },
+      after: { type: 'integer', description: 'Transfer: insert after the original destination line; 0 = file start.' },
+      before: { type: 'integer', description: 'Transfer: insert before the original destination line, 1-based.' },
       afterSymbol: { type: 'string', description: 'Transfer: insert after this unique destination symbol.' },
       beforeSymbol: { type: 'string', description: 'Transfer: insert before this unique symbol and its leading comment.' },
-      indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfer: auto (default) adjusts space indentation; none preserves it.' },
+      indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfer: auto (default) fits space indentation; none preserves it.' },
       edit: { type: 'string', enum: ['replace', 'delete', 'insert_before', 'insert_after'], description: 'Required for edit_symbol: operation on the selected span.' },
       reason: { type: 'string', required: true, description: 'Why this change; recorded in history.' },
-      projectId: { type: 'string', description: 'Associate with a project; both files must be inside its root.' },
-      todoId: { type: 'string', description: 'Associate with a project task; requires projectId.' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: {
       batch: { type: 'integer', required: true }, files: { type: 'array', items: { type: 'string' }, required: true },
-      projectId: { type: 'string' }, todoId: { type: 'string' }, note: { type: 'string' },
+      note: { type: 'string' },
     } }, render: (_args: unknown, value: { batch: number; files: string[]; note?: string }) => [{ type: 'text' as const,
       text: `batch #${value.batch}\n${value.files.join('\n')}${value.note ? `\n[${value.note}]` : ''}` }] },
     isConcurrencySafe: () => false,
@@ -94,9 +92,7 @@ export function createFileTool() {
         return await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
           await prepareWorkspace(store, exec)
           exec?.signal?.throwIfAborted()
-          const link = resolveProjectLink(store, args.projectId, args.todoId, source)
-          if (destination && link) resolveProjectLink(store, link.projectId, link.todoId, destination)
-          const original = read(source)
+          const original = await observedRead(exec, source, read)
           let changes: FileChange[]
           let transferNote: string | undefined
           switch (action) {
@@ -113,7 +109,7 @@ export function createFileTool() {
             case 'move': {
               if (!original) throw new Error('file not found')
               if (source === destination) throw new Error('source and destination must differ')
-              const previous = read(destination!)
+              const previous = await observedRead(exec, destination!, read)
               if (previous && args.overwrite !== true) throw new Error('destination exists; explicit overwrite=true required')
               changes = [{ file: source, before: original, after: null }, { file: destination!, before: previous, after: original }]
               break
@@ -181,7 +177,7 @@ export function createFileTool() {
               const block = sourceTextNormalized.slice(span.start, span.end).replace(/\n$/, '')
               const srcStartLine = sourceTextNormalized.slice(0, span.start).split('\n').length
               const srcEndLine = sourceTextNormalized.slice(0, span.end).split('\n').length
-              const previous = source === destination ? original : read(destination!)
+              const previous = source === destination ? original : await observedRead(exec, destination!, read)
               const targetText = previous === null ? '' : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(previous)
               if (targetText.includes('\0')) throw new Error('destination is binary')
               const targetEnc = detectEncoding(targetText)
@@ -272,12 +268,12 @@ export function createFileTool() {
               const file = path.relative(store.root, change.file).split(path.sep).join('/')
               const enc = detectEncoding((change.after ?? change.before ?? Buffer.alloc(0)).toString('utf8'))
               const known = readKnownState(store, file)
-              if (change.before && known && putBlob(store, change.before).id !== known.hash) recordExternalState(store, file, change.before, enc.eol, enc.bom, link)
+              if (change.before && known && putBlob(store, change.before).id !== known.hash) recordExternalState(store, file, change.before, enc.eol, enc.bom)
               return { file, op: change.after === null ? 'delete' : change.before === null ? 'create' : 'update', before: change.before === null ? null : putBlob(store, change.before).id,
                 after: change.after === null ? null : putBlob(store, change.after).id, bytes: change.after?.length ?? 0, eol: enc.eol, bom: enc.bom }
             })
-            const batch = commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, ...link, nodes }, changes)
-            return { batch: batch.id, files: nodes.map(node => node.file), ...link, ...(transferNote ? { note: transferNote } : {}) }
+            const batch = commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, nodes }, changes)
+            return { batch: batch.id, files: nodes.map(node => node.file), ...(transferNote ? { note: transferNote } : {}) }
           })
         }))
       } catch (cause) { return { error: cause instanceof Error ? cause.message : String(cause) } }

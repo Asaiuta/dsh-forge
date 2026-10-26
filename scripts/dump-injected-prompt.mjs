@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import { promptSurface } from './prompt-surface.mjs'
 
-// Preserve property names (including the ff_project parameter named description).
+// Preserve property names: a schema may legitimately have a field called description.
 function contract(schema) {
   const { description, ...rest } = schema
   if (rest.parameters) rest.parameters = contract(rest.parameters)
@@ -13,10 +13,15 @@ function contract(schema) {
   return rest
 }
 
-const surface = await promptSurface()
+const pluginAt = process.argv.indexOf('--plugin')
+if (pluginAt >= 0 && !process.argv[pluginAt + 1]) throw new Error('--plugin requires a compiled index.js path')
+const surface = await promptSurface({
+  ...(process.argv.includes('--takeover') ? { config: { registration: 'takeover' } } : {}),
+  ...(pluginAt >= 0 ? { plugin: process.argv[pluginAt + 1] } : {}),
+})
 const out = {
   generatedAt: new Date().toISOString(),
-  note: 'Native is JSON of compiled tool schemas. PTC texts include output schemas; metrics subtract the empty SDK preamble. Tokenizers compare changes, not actual DeepSeek usage. Commands are listed separately. No model request is made.',
+  note: 'Offline plugin contribution: compiled native schemas, SDK-generated PTC declarations, and the registered guidance rendered in a simulated agent scope. This is not the full production request. PTC metrics subtract the empty SDK preamble. Tokenizers compare changes, not actual DeepSeek usage. Commands are separate. No model request is made.',
   ...surface,
 }
 const compareAt = process.argv.indexOf('--compare')
@@ -41,4 +46,5 @@ else {
   console.log('\n=== native schemas ===\n' + JSON.stringify(out.schemas, null, 2))
   console.log('\n=== PTC TypeScript ===\n' + out.texts.ptcTypescript)
   console.log('\n=== PTC Python ===\n' + out.texts.ptcPython)
+  console.log('\n=== scoped plugin guidance ===\n' + out.texts.guidance)
 }

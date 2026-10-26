@@ -12,13 +12,13 @@
  * dsh-forge chains:
  *   grep        ffgrep(pattern)
  *   grep+enc    ffgrep(pattern, enclosing:true)
- *   grep→read   ffgrep(enclosing) → ff_read_symbol
- *   find        ff_find_symbol(name)
- *   find→read   ff_find_symbol(name) → ff_read_symbol
- *   outline→read ff_outline(file) → ff_read_symbol
+ *   grep→read   ffgrep(enclosing) → ff_read#Symbol
+ *   find        ff_read view=definitions(symbol)
+ *   find→read   ff_read view=definitions(symbol) → ff_read#Symbol
+ *   outline→read ff_read view=outline(path) → ff_read#Symbol
  *   read#sym    ff_read("file#Qualified.Symbol")
  *   fffind      fffind(fileName)
- *   multi       fff_multi_grep(patterns[])
+ *   multi       ffgrep(patterns[])
  *
  * ProjectForge chains:
  *   pf FindSymbol   indexer findSymbols(name)
@@ -42,9 +42,10 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { FinderPool } from '../lib/core.js'
-import { createGrepTool, createFindTool, createMultiGrepTool } from '../lib/tools.js'
-import { createOutlineTool, createFindSymbolTool, createReadSymbolTool } from '../lib/tools-symbol.js'
+import { createGrepTool, createFindTool } from '../lib/tools.js'
 import { createReadTool } from '../lib/tools-read.js'
+import { outlineView, definitionsView } from './lib/read-views.mjs'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
 import { localEnv } from '../scripts/local-env.mjs'
 
@@ -101,10 +102,10 @@ const SCENARIOS = [
 const pool = new FinderPool()
 const grep = createGrepTool(pool)
 const fffind = createFindTool(pool)
-const multiGrep = createMultiGrepTool(pool)
-const outline = createOutlineTool()
-const findSymbol = createFindSymbolTool()
-const readSymbol = createReadSymbolTool()
+const multiGrep = grep // fff_multi_grep merged into ffgrep
+const outline = outlineView(createReadTool())
+const findSymbol = definitionsView(createReadTool())
+const readSymbol = symbolReader(createReadTool)
 const read = createReadTool()
 
 const exec = { agent: { session: { header: { cwd: FIXTURE_DIR, id: 'eval-coverage' } } }, token: {} }

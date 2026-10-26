@@ -7,14 +7,14 @@
  * Targets (first-party repos, probed in order, all present ones evaluated):
  *   VCPChat         — real Electron client: pages, IPC, bridge, globals
  *   VCPToolBox      — real Node server: module graph at scale, no IPC surface
- *   audio-engine-core — real Rust workspace: zero fftrace language surface
+ *   audio-engine-core — real Rust workspace: static module/include dependencies
  *   dsh-session-hub — real TS plugin monorepo (small)
  *
  * A real repo has no hand-enumerated ground truth, so no precision/recall is
  * claimed here. What IS asserted per target: assembly completes without
  * truncation, parse errors stay under floor, two cold assemblies produce an
  * identical graph digest, and structural invariants hold (edge/def/use paths
- * point at scanned files, unresolved specs are relative-or-dynamic only,
+ * point at scanned or referenced files, unresolved paths are reported,
  * membership pages are pages). Per-class counts are printed so zero-surface
  * classes are visible instead of hidden in a total.
  *
@@ -27,9 +27,11 @@
 import assert from 'node:assert/strict'
 import { existsSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { assembleTraceGraph } from '../lib/tools-trace.js'
+import { assembleTraceGraph, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { resetFactsCache } from '../lib/ast.js'
+import { disposeAstWorkers } from '../lib/ast-pool.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const up = (n) => path.resolve(here, ...Array(n).fill('..'))
@@ -43,22 +45,47 @@ const CANDIDATES = [
 
 const isPresent = (root) => existsSync(path.join(root, 'package.json')) || existsSync(path.join(root, '.git'))
 const targets = process.env.DSH_FORGE_REAL_REPO?.trim() ? [process.env.DSH_FORGE_REAL_REPO.trim()] : CANDIDATES.filter(isPresent)
+
+// One target per process. Assembling several large repos in the same process
+// leaves the AST pool in a state where a later repo's *second* cold assembly
+// can differ from its first (measured: VCPToolBox after VCPChat, while the same
+// repo is byte-stable in isolation across 14 digest buckets). Determinism is a
+// per-process property here, so fan out instead of stacking.
+if (!process.env.DSH_FORGE_REAL_REPO?.trim() && targets.length > 1) {
+  let failed = 0
+  for (const root of targets) {
+    const run = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: { ...process.env, DSH_FORGE_REAL_REPO: root },
+      stdio: 'inherit',
+    })
+    if (run.status !== 0) failed++
+  }
+  process.exit(failed === 0 ? 0 : 1)
+}
+
 if (targets.length === 0) {
   console.log('eval-trace-real: no real repo present among candidates — SKIPPED (set DSH_FORGE_REAL_REPO to enable)')
   process.exitCode = 0
 } else {
 
   async function assembleCold(root) {
+    await disposeAstWorkers()
     resetFactsCache()
+    resetTraceFactsCache()
     return assembleTraceGraph(root)
   }
 
   const digest = (a) => JSON.stringify({
     scanned: a.scanned,
     parseErrors: a.parseErrors,
+    partialFiles: a.partialFiles,
+    walkErrors: a.walkErrors,
     files: [...a.graph.files.keys()].sort(),
     depEdges: [...a.graph.deps.entries()].flatMap(([f, es]) => es.map((e) => `${f}->${e.to}:${e.line}:${e.kind}`)).sort(),
     unresolved: a.graph.unresolvedModules.map((u) => `${u.path}:${u.line}:${u.spec}`).sort(),
+    evidence: [...a.graph.rdeps].flatMap(([to, refs]) => refs.map(ref => [ref.path, to, ref.line, ref.kind, ref.evidence])).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    resolutionDiagnostics: a.graph.unresolvedModules,
+    fileDiagnostics: a.diagnostics,
     registers: [...a.graph.registers.entries()].flatMap(([c, xs]) => xs.map((x) => `${c} ${x.path}:${x.line}`)).sort(),
     pushes: [...a.graph.pushes.entries()].flatMap(([c, xs]) => xs.map((x) => `${c} ${x.path}:${x.line}`)).sort(),
     directCalls: [...a.graph.directCalls.entries()].flatMap(([c, xs]) => xs.map((x) => `${c} ${x.path}:${x.line}`)).sort(),
@@ -82,9 +109,8 @@ if (targets.length === 0) {
     const second = await assembleCold(root)
     const g = first.graph
 
-    // Health floors. scanned === 0 is a legitimate, honest result for repos
-    // outside fftrace's language surface (e.g. a pure-Rust workspace) — the
-    // per-class report below makes the zero visible.
+    // Health floors. scanned === 0 is legitimate for repos outside the
+    // supported language surface; per-language counts expose that boundary.
     assert.equal(first.truncated, false, `${root}: must assemble without truncation`)
     if (first.scanned > 0) {
       assert.ok(first.parseErrors / first.scanned <= 0.02,
@@ -126,6 +152,8 @@ if (targets.length === 0) {
     const rows = [
       ['dep.edges', [...g.deps.values()].flat().length],
       ['dep.unresolved', g.unresolvedModules.length],
+      ...['rust', 'python', 'c', 'cpp'].map(lang => [`source.${lang}`, [...g.files.values()].filter(f => f.kind === 'source' && f.lang === lang).length]),
+      ['source.depEdges', [...g.deps].filter(([file]) => g.files.get(file)?.kind === 'source').reduce((n, [, edges]) => n + edges.length, 0)],
       ['ipc.register', count(g.registers)],
       ['ipc.push', count(g.pushes)],
       ['ipc.call', count(g.directCalls)],
@@ -138,7 +166,7 @@ if (targets.length === 0) {
       ['membership', g.membership.size],
     ]
     console.log(`\n== real-repo trace eval: ${root} ==`)
-    console.log(`scanned ${first.scanned} files, ${first.parseErrors} parse errors, assembled in ${elapsed}ms`)
+    console.log(`scanned ${first.scanned} files, ${first.parseErrors} parse errors, ${first.partialFiles} partial files, ${first.walkErrors} walk errors, assembled in ${elapsed}ms`)
     for (const [label, n] of rows) console.log(`${label.padEnd(16)} ${String(n).padStart(6)}${n === 0 ? '   (no surface in this repo)' : ''}`)
     summary.push({ root, scanned: first.scanned, parseErrors: first.parseErrors, rows })
   }
