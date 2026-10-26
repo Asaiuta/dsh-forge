@@ -71,14 +71,26 @@ function text(value: string): Array<{ type: 'text'; text: string }> {
   return [{ type: 'text', text: value }]
 }
 
+/** Rules per root, reused while .gitignore is unchanged: the matcher caches
+ *  each path's verdict, which a fresh instance per scan would discard. */
+const IGNORE_RULES = new Map<string, { text: string; rules: ReturnType<typeof ignore> }>()
+
 /** Collect supported source, HTML, manifests and binaries, root-.gitignore-aware, capped. */
 function collectCandidates(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number } {
-  const rules = ignore()
   let walkErrors = 0
+  let text = ''
   const gitignore = path.join(root, '.gitignore')
   if (existsSync(gitignore)) {
-    try { rules.add(readFileSync(gitignore, 'utf8')) } catch { walkErrors++ }
+    try { text = readFileSync(gitignore, 'utf8') } catch { walkErrors++ }
   }
+  let cached = IGNORE_RULES.get(root)
+  if (!cached || cached.text !== text) {
+    cached = { text, rules: ignore().add(text) }
+    IGNORE_RULES.delete(root)
+    IGNORE_RULES.set(root, cached)
+    if (IGNORE_RULES.size > 8) IGNORE_RULES.delete(IGNORE_RULES.keys().next().value!)
+  }
+  const rules = cached.rules
   const files: Array<{ abs: string; rel: string }> = []
   const projectFiles: string[] = []
   const pythonFiles: string[] = []
@@ -266,6 +278,66 @@ const GRAPH_CACHE = new Map<string, { signature: string; decls: string; contexts
 interface PendingAssembly { controller: AbortController; users: number; promise: Promise<AssembledTrace> }
 const PENDING = new Map<string, Map<AstWorkerPool | undefined, PendingAssembly>>()
 
+/** The exact per-probe check: a file (links followed) with this real path. */
+function probeMatches(absolute: string, expected: GraphProbe): boolean {
+  try {
+    const exists = statSync(absolute, { throwIfNoEntry: false })?.isFile() ?? false
+    return exists === expected.exists && (!exists || realpathSync.native(absolute) === expected.identity)
+  } catch { return !expected.exists }
+}
+
+/**
+ * Whether every resolution probe still sees the same file. Most probes are
+ * missing extension/index candidates, so each parent directory is listed once
+ * instead of stat-ing every probe. A plain-file entry exists with identity
+ * realpath(dir)/name; links, case-only matches (case-insensitive volumes) and
+ * unreadable directories take the exact per-probe check.
+ */
+function probesUnchanged(root: string, probes: ReadonlyMap<string, GraphProbe>): boolean {
+  type Listing = { entries: Map<string, import('node:fs').Dirent>; folded: Set<string>; real: string | null }
+  const EMPTY: Listing = { entries: new Map(), folded: new Set(), real: null }
+  const listings = new Map<string, Listing | null>()
+  const listing = (dir: string): Listing | null => {
+    if (listings.has(dir)) return listings.get(dir)!
+    let value: Listing | null = null
+    // A directory the parent listing does not contain is missing: answering
+    // from the parent avoids an ENOENT throw per guessed package directory.
+    const parent = dir.startsWith(root + path.sep) ? listing(path.dirname(dir)) : undefined
+    const base = path.basename(dir)
+    const own = parent?.entries.get(base)
+    if (parent && !own && !parent.folded.has(base.toLowerCase())) value = EMPTY
+    else if (parent && own && !own.isDirectory() && !own.isSymbolicLink()) value = EMPTY
+    else {
+      try {
+        const entries = new Map(readdirSync(dir, { withFileTypes: true }).map(entry => [entry.name, entry]))
+        value = { entries, folded: new Set([...entries.keys()].map(name => name.toLowerCase())), real: null }
+      } catch (cause) {
+        // A missing directory holds no files; anything else is checked exactly.
+        const code = (cause as NodeJS.ErrnoException).code
+        value = code === 'ENOENT' || code === 'ENOTDIR' ? EMPTY : null
+      }
+    }
+    listings.set(dir, value)
+    return value
+  }
+  for (const [rel, expected] of probes) {
+    const absolute = path.join(root, ...rel.split('/'))
+    const dir = path.dirname(absolute), name = path.basename(absolute)
+    const list = listing(dir)
+    const entry = list?.entries.get(name)
+    if (!list || (entry ? !entry.isFile() && !entry.isDirectory() : list.folded.has(name.toLowerCase()))) {
+      if (!probeMatches(absolute, expected)) return false
+      continue
+    }
+    const exists = entry?.isFile() ?? false
+    if (exists !== expected.exists) return false
+    if (!exists) continue
+    try { list.real ??= realpathSync.native(dir) } catch { if (!probeMatches(absolute, expected)) return false; continue }
+    if (path.join(list.real, name) !== expected.identity) return false
+  }
+  return true
+}
+
 async function assemble(root: string, key: string, options: TraceAssemblyOptions): Promise<AssembledTrace> {
   const decls = await loadPreloadDecls(root, options.declarations, options.signal)
   const scan = await scanFacts(root, options.signal, options.workers)
@@ -295,14 +367,7 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
     && scan.walkErrors === 0 && !scan.truncated) {
     // Resolution may probe ignored/non-JS files or missing paths. Revalidate
     // those too, so adding an asset or an index file invalidates the graph.
-    const probesMatch = [...cached.probes].every(([rel, expected]) => {
-      const absolute = path.join(root, ...rel.split('/'))
-      try {
-        const exists = statSync(absolute, { throwIfNoEntry: false })?.isFile() ?? false
-        return exists === expected.exists && (!exists || realpathSync(absolute) === expected.identity)
-      } catch { return !expected.exists }
-    })
-    if (probesMatch) return cached.assembled
+    if (probesUnchanged(root, cached.probes)) return cached.assembled
   }
   const aliases = topLevelAliasNames([...scan.entries.values()].map((entry) => ({ facts: scriptFacts(entry) })))
   // Role globals recovered from `ROLE_GLOBALS.<role> = 'name'` const strings

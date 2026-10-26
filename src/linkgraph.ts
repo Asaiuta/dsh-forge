@@ -128,7 +128,9 @@ function makeIsFile(root: string, entries: Map<string, TraceFileFacts>, onProbe?
     const absolute = path.join(root, ...rel.split('/'))
     try { ok = statSync(absolute, { throwIfNoEntry: false })?.isFile() ?? false } catch { ok = false }
     let identity: string | null = null
-    if (ok && onProbe) { try { identity = realpathSync(absolute) } catch { ok = false } }
+    // Native realpath: one OS call, where the JS version lstat()s every path
+    // component — warm Trace revalidates every probe (tools-trace.ts).
+    if (ok && onProbe) { try { identity = realpathSync.native(absolute) } catch { ok = false } }
     statCache.set(rel, ok)
     onProbe?.(rel, ok, identity)
     return ok
