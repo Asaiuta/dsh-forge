@@ -97,6 +97,11 @@ type Resolution =
 - 定义文件不同于直接目标时，新增 `reexport` 边（candidate，evidence 写明 `via 中间文件链`，携带导入名）；不进入页面成员闭包；`edgeMode=certain` 排除。
 - 未做：CommonJS `module.exports` 转发；默认导入（`import x from`）与命名空间导入不追踪（现有 bindings 事实不区分二者）；符号级 `impact:文件#名称`。
 - 测试：`tests/run-trace-reexports.mjs`。
+
+**P3.5 状态（已完成）**：
+- Lua 提取器收集 `package.path = …` 右侧由字面量组成的 `;` 分段（支持 `..` 拼接与长括号字符串）；与非字面量相邻的分段丢弃，`package.path` 自身作为分段边界。
+- `require` 先试默认 `?.lua` / `?/init.lua`，再试工作区内收集到的模式，均相对扫描根；多个模式命中不同文件记 `ambiguous_target`（跨文件赋值顺序未知）。
+- 测试：`tests/run-trace-luapath.mjs`。
 - 每项：`tests/run-trace-<lang>-project.mjs`、`eval-trace-real` 回归、与 `js-project` 一致的预算（2000 文件 / 8 MiB）。
 
 ## P4 远期（仅设计）

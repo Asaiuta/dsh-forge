@@ -12,6 +12,8 @@ export interface ModuleInfo {
   javaTypes?: string[]
   javaModule?: string
   javaParents?: Array<{ name: string; types: string[] }>
+  /** Literal `package.path` search patterns assigned in this Lua file (e.g. `lib/?.lua`). */
+  luaPaths?: string[]
 }
 export const children = (node: Node): Node[] => node.namedChildren.filter((child): child is Node => child !== null)
 export const nodes = (node: Node, types: string | string[]): Node[] => node.descendantsOfType(types).filter((child): child is Node => child !== null)
@@ -65,6 +67,17 @@ export function extractModuleInfo(tree: Tree, lang: ModuleLanguage): ModuleInfo 
   if (lang === 'java') {
     return javaInfo(tree)
   }
+  if (lang === 'lua') {
+    const luaPaths: string[] = []
+    for (const node of nodes(root, 'assignment_statement')) {
+      const targets = children(children(node).find(child => child.type === 'variable_list') ?? node)
+      const values = children(children(node).find(child => child.type === 'expression_list') ?? node)
+      targets.forEach((target, index) => {
+        if (target.text.replace(/\s+/g, '') === 'package.path' && values[index]) luaPaths.push(...luaPathPatterns(values[index]))
+      })
+    }
+    return luaPaths.length ? { luaPaths } : undefined
+  }
   if (lang === 'rust') {
     const inlineModules = nodes(root, 'mod_item').filter(node => node.childForFieldName('body')).map(node => {
       const scope: string[] = []
@@ -77,6 +90,26 @@ export function extractModuleInfo(tree: Tree, lang: ModuleLanguage): ModuleInfo 
     return inlineModules.length ? { inlineModules } : undefined
   }
   return undefined
+}
+
+const SELF = Symbol('package.path'), DYNAMIC = Symbol('dynamic')
+
+/** `;`-separated segments built only from literals. A segment touching a
+ *  non-literal operand (`dir .. '/?.lua'`) is incomplete and dropped; the
+ *  `package.path` operand itself is a segment boundary. */
+function luaPathPatterns(expression: Node): string[] {
+  const operands: Array<string | typeof SELF | typeof DYNAMIC> = []
+  const flatten = (node: Node | null): void => {
+    if (!node) { operands.push(DYNAMIC); return }
+    if (node.type === 'binary_expression' && node.children[1]?.type === '..') {
+      flatten(node.childForFieldName('left')); flatten(node.childForFieldName('right')); return
+    }
+    const literal = node.type === 'string' ? staticString(node) : null
+    operands.push(literal ?? (node.text.replace(/\s+/g, '') === 'package.path' ? SELF : DYNAMIC))
+  }
+  flatten(expression)
+  const text = operands.map(item => item === SELF ? ';' : item === DYNAMIC ? '\u0000' : item).join('')
+  return text.split(';').filter(segment => segment && !segment.includes('\u0000') && segment.includes('?') && segment.endsWith('.lua'))
 }
 
 export function extractPythonDynamic(tree: Tree): ModuleFact[] {
