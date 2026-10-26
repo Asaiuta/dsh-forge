@@ -129,7 +129,7 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 
 ## 第三轮：图缓存探测下推（同日）
 
-图缓存复用前要复核 `buildGraph` 期间记录的每一条解析探测：`(相对路径, 是否解析到文件, 身份)`，身份是 `realpath(dir) + '\' + name`。VCPToolBox 一次重复查询有 15,291 条，靠父目录列举剪枝压到 280 次 `readdir`，仍在 JS 线程上花 158–190 ms。
+图缓存复用前要复核 `buildGraph` 期间记录的每一条解析探测：`(相对路径, 是否解析到文件, 身份)`，身份是 `realpath(dir) + '\' + name`。VCPToolBox 一次重复查询有 15,291 条，靠父目录列举剪枝压到 280 次 `readdir`，当时记的是在 JS 线程上花 158–190 ms（同刻插桩后来量到 89 ms，见《热查询的分段成本》，此处按当时的记录保留）。
 
 ### 做法
 
@@ -168,32 +168,72 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 | VCPToolBox | 630 / 1,175 ms | **370 / 557 ms** | 0.47–0.59 |
 | audio-engine-core | 40 / 77 ms | **22 / 41 ms** | 0.53–0.55 |
 
-两次采样的绝对值整体上移一倍，两列同向移动，所以只有比值可读。差值里含两项：本轮下推的 `probesUnchanged`（158–190 ms）和上一轮的 `statPaths`（40–49 ms）。
+两次采样的绝对值整体上移一倍，两列同向移动，所以只有比值可读。差值里含两项：本轮下推的 `probesUnchanged` 和上一轮的 `statPaths`。
+
+本节和下两节的绝对耗时来自不同时段，不要混着比。同一时刻插桩量出来的分量见《热查询的分段成本》：那里 `probesUnchanged` 的本地实现是 89 ms，不是本节早先记的 158–190 ms——后者是冷态或受干扰环境的数字。
 
 顺带修掉一处门控漏洞：重复查询的 `statPaths` 此前只检查 `DSH_FORGE_TRACE_NATIVE`，没有先问 sidecar 是否可用，于是 `DSH_FORGE_INDEXER=0` 仍会拉起子进程。现在两条下推都以「sidecar 就绪」为前提，关掉索引器就是完全不碰它——上表「本地实现」一列因此比上一轮记录的耗时更高，那是真正的无 sidecar 基线。
 
 ### 试过但没下推：`collectCandidates`
 
-第三项是扫描时的目录遍历。Rust 侧实现出来了，也逐条对齐过——四个仓库（1,726 / 2,862 / 169 / 142 个候选）的相对路径列表逐字相同，外加一个 60 项的 `.gitignore` fixture 全绿——但测量说明不值得：
+第三项是扫描时的目录遍历。Rust 侧实现过两次、也退回两次，每次的判据都是实测。
 
-| 语料 | 本地遍历 | sidecar |
+语义对齐没有问题：四个仓库（1,726 / 2,862 / 169 / 142 个候选）的相对路径列表逐字相同，外加一个 60 项 `.gitignore` fixture（目录专用模式、锚定、`**`、字符类、转义、大小写、CRLF、嵌套 `.gitignore` 不生效、`_dsh` 标记、junction）全绿。
+
+价格站不住，而且这个数的测法本身值得记一笔：
+
+| 量法（VCPToolBox） | 本地 | sidecar |
 |---|---:|---:|
-| VCPChat（1,726） | 30.0 ms | 23.2 ms |
-| VCPToolBox（2,862） | 80.1 ms | 71.9 ms |
-| audio-engine-core（169） | 6.5 ms | 5.9 ms |
-| dsh-forge（142） | 2.7 ms | 2.8 ms |
+| 紧循环微基准 | 80 ms | 72 ms |
+| 真实路径插桩 | 102 ms | 102 ms |
+| 拆开：sidecar 请求本身 | — | 91 ms |
+| 拆开：abs 拼接 / 排序 | 8.3 / 1.9 ms | 同 |
 
-同进程交替 7 轮取中位数。小树上 sidecar 反而更慢：一次请求的 JSON 往返比本地遍历本身贵。冷启动首调用更差，因为要 spawn 子进程：VCPChat 89 → 241 ms。
+同一个函数三次量出 80 / 102 / 194–233 ms：紧循环里没有别的活，V8 能在 `await` 间隙做增量 GC；连续 5 次背靠背遍历又把 GC 空档挤没了。**只信插桩在真实路径里的那组**：100 ms，换语言挪走 0–10 ms。
 
-所以上一节末尾记的「`collectCandidates` 233–250 ms」需要更正：那是**冷 matcher + 冷 JIT** 的一次性成本（VCPToolBox 冷启动首调用 292 ms，稳定复现），重复查询上只有 80 ms。为 8 ms 维护第二套 gitignore 语义不划算，代码已退回。
+原因是 readdir 的调用延迟，不是 JS 开销：877 个目录 × 约 95 µs ≈ 83 ms，和 2026-10-26 早先 `fsbench` 测到的 readdir 0.088 ms/次 对得上。
 
-两个当时踩到的语义偏差记在这里，将来若要重做可以直接抄：
+两个语义偏差记在这里，将来若要重做可以直接抄：
 
 - `ignore` crate 的 `GitignoreBuilder::add_line` 一次只吃一行。把整个文件当一行传进去，**之后所有模式全部失效**（症状：sidecar 一个文件都不排除，dsh-forge 从 142 涨到 12,742）。要按 `lines()` 逐行喂。
 - `matched()` 只比路径自身，`dist/` 这类目录专用模式匹配不到 `dist/a.js`，而 JS 的 `ignore` 包会。改成 `matched_path_or_any_parents(rel, false)`：父目录按目录参与匹配，路径自身仍按非目录，正好复刻 JS。另外 `projectMetadata` 还接受 `/^(?:ts|js)config(?:\.[^/]+)?\.json$/`（`tsconfig.app.json` 这类），只按等值判断会漏三个文件。
 
+## 热查询的分段成本（同日实测）
+
+临时给 `assemble` 与 `scanFacts` 插了 `performance.now()` 打点，取 6 次热调用的中位数（`DSH_FORGE_AST_WORKERS=0`、`DSH_FORGE_INDEXER=1`）：
+
+| 阶段 | VCPToolBox（2,862） | VCPChat（1,726） | audio-engine-core（169） |
+|---|---:|---:|---:|
+| 目录遍历 `walk` | 102 | 36 | 11 |
+| 逐文件 stat `statBatch` | 41 | 37 | 5 |
+| stamp 循环 `stamps` | 2 | 1 | 0 |
+| 事实提取 `facts`（全命中） | 2 | 0 | 0 |
+| **工程上下文 `contexts`** | **34** | **27** | 5 |
+| sidecar 就绪 `ready` | 54 | 25 | 6 |
+| 图缓存校验 `probes` | 0 | 0 | 0 |
+| 合计 | 238 | 128 | 27 |
+
+对照 `DSH_FORGE_INDEXER=0`（完全不碰 sidecar）：VCPToolBox 409 ms（`walk` 103 + `stamps` 165 + `probes` 89 + `contexts` 36）、VCPChat 197 ms（38 + 98 + 27 + 26）。差的 171 / 69 ms 就是前两轮下推兑现的部分。
+
+### 工程上下文加载：27–34 ms，不是 70–90 ms
+
+`contexts` 这一段是 `loadJsProject` / `loadPythonProject` / `loadRustProject` / `loadGoProject` / `loadCompilationDatabase`，热态只读几个元数据文件，不碰代码。此前记的 70–90 ms 应是冷态或受干扰的数字；热态占一次查询的 13–23%，冷 rebuild 上是 62–98 ms。
+
+### 图构建：热查询上是 0
+
+`buildGraph` 只在图缓存未命中时执行——热查询在 `probesUnchanged` 通过后直接返回缓存的 `assembled`。它只出现在 rebuild 上：
+
+| 阶段 | VCPToolBox | VCPChat |
+|---|---:|---:|
+| 目录遍历 | 406 | 251 |
+| 事实提取 | 6,615 | 2,787 |
+| 工程上下文 | 98 | 62 |
+| **buildGraph** | **931** | **302** |
+
+冷路径的第一大项是事实提取，第二大就是图构建。下推它的收益面最大，代价也最大：`buildGraph` 是纯内存图算法加解析器组合，输入是全部文件的 facts、声明表与五种工程上下文，输出是节点、边、注册表与 bridge 过滤结果；复刻它等于把 `linkgraph` 和五个 resolver 一起搬进 Rust，出错面比前三项加起来还大得多。不建议动。
+
 ### 下一步
 
-重复查询现在由三段构成：目录遍历 30–80 ms、`statPaths`、`probesUnchanged`。剩下的固定成本是工程上下文加载（此前测得 70–90 ms）、图构建与事实缓存查询，都不再是纯文件系统操作，下推 sidecar 的收益面要另外评估。
+热查询剩下的两块钱：目录遍历 100 ms、两次 IPC 往返（`statBatch` + `ready`）合计 95 ms。前者只能靠"少调 readdir"——按目录 mtime 缓存列举结果，也就是 `probesUnchanged` 已经在用的按需列举思路；后者可以考虑把 stat 与探针校验合成一次请求，省一次往返。两者都不是"搬到 Rust"。
 
-
+顺带一个留意点：`ready` 那 54 ms 全花在一次往返上，请求体是 15,291 条探针（约 1 MB JSON），返回体只有几个计数。如果改成"只传根与缓存代次、探针留在 sidecar 里"，这次往返能压到个位数毫秒——代价是 sidecar 要跨请求记住图缓存，多了一层失效面，值不值得另说。这一条没有拆开量过，序列化占多少、Rust 侧列举占多少还没分开。
