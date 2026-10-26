@@ -9,6 +9,8 @@ export type UnresolvedReason = 'non_literal' | 'missing_target' | 'external_pack
   | 'unsupported_config' | 'outside_root' | 'unsupported_resolution'
 export interface ResolutionFailure { reason: UnresolvedReason; detail?: string; config?: string }
 export interface UnresolvedModule extends ResolutionFailure { path: string; line: number; spec: string }
+/** Project metadata a graph was built from; a changed signature or invalid() forces reassembly. */
+export interface ProjectContext { signature: string; valid: () => boolean }
 export interface TraceDiagnostic { path: string; reason: string; message: string; line?: number }
 export type JsResolution = { status: 'resolved'; targets: Array<{ to: string; evidence: EdgeEvidence }> }
   | ({ status: 'unresolved' } & ResolutionFailure)

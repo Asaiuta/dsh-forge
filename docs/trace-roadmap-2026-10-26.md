@@ -38,6 +38,14 @@ type Resolution =
 
 验收：现有测试与 `eval-trace-real` 零差异；非 JS 诊断区分缺失 / 外部 / 歧义 / 动态。
 
+**状态（已完成）**：
+- `source-resolution.ts` 注册表 + `python/native/rust/go/lua/java-resolution.ts`，三态 `SourceResolution`；`module-resolution.ts` 删除，`module-facts.ts` 只保留提取。
+- JS/TS 已有三态 `JsResolution`，未并入同一接口（签名不同：spec/mode/syntax），维持 `JsProject`。
+- `assemble()` 缓存校验改为遍历 `ProjectContext[]`；P3 的新工程上下文追加一项即可。
+- 推迟：`go.mod` 仍作为 manifest 文件事实提供数据（Go 解析器负责解释）；迁移会改 `file:go.mod` 输出与缓存签名，收益小，等 P3 加 `go.work` 时一并处理。
+- 语义约定：源码本身的编译错误（rustc E0761 的 `x.rs` + `x/mod.rs`、Go 同目录多包名）记 `unsupported_resolution` 并在 detail 写明，不记 `ambiguous_target`，因为后者会把查询标为 incomplete（表示分析受限）。
+- 测试：`tests/run-trace-reasons.mjs`。
+
 ## P2 拆分 `buildGraph`（1-2 天，可与 P1 并行）
 
 - 拆为 `buildModuleGraph`、`buildPageGraph`、`buildBridgeIndex`、`buildIpcIndex`、`buildGlobalIndex`。

@@ -1,9 +1,9 @@
 /** File candidates from Java names; not javac type checking or module linking. */
 import path from 'node:path'
-import type { TraceFileFacts } from './facts.ts'
-import type { ModuleFact, ResolvedModule } from './module-facts.ts'
+import type { ModuleFact } from './module-facts.ts'
+import { NOT_APPLICABLE, resolvedTo, unresolvedAs, type SourceContext, type SourceResolution, type SourceResolver } from './source-resolution.ts'
 
-export function javaResolver(entries: Map<string, TraceFileFacts>, onLimit?: () => void): (from: string, ref: ModuleFact) => ResolvedModule[] | null {
+export function javaResolver({ entries, onLimit }: SourceContext): SourceResolver {
   const types = new Map<string, Set<string>>(), packages = new Map<string, string[]>(), descriptors = new Map<string, string[]>()
   const parents = new Map<string, { file: string; scope: string[]; names: string[] }>()
   const add = (map: Map<string, Set<string>>, name: string, file: string): void => { const set = map.get(name) ?? new Set(); set.add(file); map.set(name, set) }
@@ -14,10 +14,12 @@ export function javaResolver(entries: Map<string, TraceFileFacts>, onLimit?: () 
     for (const item of info.javaParents ?? []) parents.set(pkg ? pkg + '.' + item.name : item.name, { file, scope: item.name.split('.'), names: item.types })
     if (info.javaModule) { const files = descriptors.get(info.javaModule) ?? []; files.push(file); descriptors.set(info.javaModule, files) }
   }
-  const target = (name: string): ResolvedModule[] => {
+  const target = (name: string, absent: SourceResolution): SourceResolution => {
     const files = types.get(name)
-    return files?.size === 1 ? [{ to: files.values().next().value!, candidate: true }] : []
+    if (!files) return absent
+    return files.size === 1 ? resolvedTo([{ to: files.values().next().value!, candidate: true }]) : unresolvedAs('ambiguous_target', '多个文件声明同一全限定类型。')
   }
+  const external = unresolvedAs('external_package', '工作区内没有该类型（可能来自 JDK 或依赖）。')
   /** Names from syntax/import tables only. null means an unknown or ambiguous
    * binding which must block lower-priority fallbacks. [] means no local type. */
   const ordinary = (from: string, spec: string, scope: string[]): string[] | null => {
@@ -84,22 +86,30 @@ export function javaResolver(entries: Map<string, TraceFileFacts>, onLimit?: () 
   }).sort((a, b) => b.length - a.length)[0]
   return (from, ref) => {
     if (ref.kind === 'java_requires') {
-      const files = descriptors.get(ref.spec)
-      return files?.length === 1 ? [{ to: files[0], candidate: true }] : []
+      const files = descriptors.get(ref.spec) ?? []
+      if (files.length > 1) return unresolvedAs('ambiguous_target', '多个 module-info 声明同名模块。')
+      return files.length ? resolvedTo([{ to: files[0], candidate: true }]) : unresolvedAs('external_package', '工作区内没有该模块描述符。')
     }
-    if (ref.kind === 'java_package') return (packages.get(ref.spec) ?? []).filter(file => file !== from && owner(file) === from).map(to => ({ to, candidate: true }))
+    if (ref.kind === 'java_package') {
+      const files = (packages.get(ref.spec) ?? []).filter(file => file !== from && owner(file) === from)
+      return files.length ? resolvedTo(files.map(to => ({ to, candidate: true }))) : unresolvedAs('missing_target', '本模块内没有该包的源文件。')
+    }
     if (ref.kind === 'java_import') {
-      if (ref.wildcard && !ref.static) return (packages.get(ref.spec) ?? []).filter(file => file !== from).map(to => ({ to, candidate: true }))
+      if (ref.wildcard && !ref.static) {
+        const files = (packages.get(ref.spec) ?? []).filter(file => file !== from)
+        return files.length ? resolvedTo(files.map(to => ({ to, candidate: true }))) : unresolvedAs('external_package', '工作区内没有该包（可能来自 JDK 或依赖）。')
+      }
       const name = ref.static && !ref.wildcard ? ref.spec.slice(0, ref.spec.lastIndexOf('.')) : ref.spec
       const files = types.get(name)
       // Explicit imports preserve the existing confirmed syntax edge. Static
       // imports can name a member of a known outer type, not an arbitrary FQN.
-      return files?.size === 1 ? [{ to: files.values().next().value! }] : []
+      if (!files) return external
+      return files.size === 1 ? resolvedTo([{ to: files.values().next().value! }]) : unresolvedAs('ambiguous_target', '多个文件声明同一全限定类型。')
     }
-    if (ref.kind !== 'java_type') return null
+    if (ref.kind !== 'java_type') return NOT_APPLICABLE
     const facts = entries.get(from)
-    if (facts?.kind !== 'source') return []
-    if (limited) return []
+    if (facts?.kind !== 'source') return unresolvedAs('unsupported_resolution')
+    if (limited) return unresolvedAs('unsupported_resolution', '继承成员解析超出预算，已停止类型推断。')
     const pkg = facts.moduleInfo?.package ?? ''
     const qualify = (name: string): string => pkg ? pkg + '.' + name : name
     // Lexically enclosing/member types precede imports. An ambiguous identity
@@ -107,11 +117,12 @@ export function javaResolver(entries: Map<string, TraceFileFacts>, onLimit?: () 
     for (let n = ref.scope.length; n > 0; n--) {
       const name = qualify([...ref.scope.slice(0, n), ref.spec].join('.'))
       const prefix = qualify([...ref.scope.slice(0, n), ref.spec.split('.')[0]].join('.'))
-      if (types.has(prefix)) return target(name)
+      if (types.has(prefix)) return target(name, unresolvedAs('missing_target', '外层类型存在，但没有该成员类型。'))
       if (n === ref.scope.length && (ref.role === 'extends' || ref.role === 'implements')) continue
-      if (inheritanceBlocks(qualify(ref.scope.slice(0, n).join('.')), ref.spec)) return []
+      if (inheritanceBlocks(qualify(ref.scope.slice(0, n).join('.')), ref.spec)) return unresolvedAs('unsupported_resolution', '名称可能来自继承成员；访问控制与泛型需要编译器。')
     }
     const names = ordinary(from, ref.spec, ref.scope)
-    return names?.length === 1 ? target(names[0]) : []
+    if (names === null) return unresolvedAs('unsupported_resolution', '名称绑定未知或有歧义，已停止回退。')
+    return names.length === 1 ? target(names[0], external) : external
   }
 }

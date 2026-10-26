@@ -1,8 +1,6 @@
 /** Static module/file dependencies for the non-JavaScript Trace languages. */
-import path from 'node:path'
 import type { Node, Tree } from 'web-tree-sitter'
 import type { LangName } from './ast.ts'
-import type { IncludeResolver } from './compile-commands.ts'
 import { extractLanguageFacts, extractPythonDynamic, children } from './language-facts.ts'
 
 interface ModuleRef { spec: string; line: number }
@@ -182,92 +180,4 @@ export function extractModuleFacts(tree: Tree, lang: ModuleLanguage): ModuleFact
     }
   }
   return lang === 'python' ? [...out, ...extractPythonDynamic(tree)].sort((a, b) => a.line - b.line) : out
-}
-
-function withinRoot(rel: string): boolean {
-  return rel !== '..' && !rel.startsWith('../') && !path.posix.isAbsolute(rel) && !/^[a-z]:/i.test(rel)
-}
-
-function localPath(base: string, spec: string): string | null {
-  const clean = spec.replaceAll('\\', '/')
-  if (!clean || path.posix.isAbsolute(clean) || /^[a-z]:/i.test(clean) || clean.includes('\0')) return null
-  const rel = path.posix.normalize(path.posix.join(base, clean))
-  return withinRoot(rel) ? rel : null
-}
-
-function pythonBase(fromRel: string, spec: string): string | null {
-  const dots = /^\.+/.exec(spec)?.[0].length ?? 0
-  const dir = path.posix.dirname(fromRel)
-  // The workspace root is the import search root. Relative imports cannot
-  // climb beyond its top-level package (including namespace packages).
-  const packageDepth = dir === '.' ? 0 : dir.split('/').length
-  if (dots > packageDepth) return null
-  const tail = spec.slice(dots).replaceAll('.', '/')
-  const base = dots ? path.posix.join(dir, ...Array<string>(dots - 1).fill('..'), tail) : tail
-  return base && withinRoot(base) ? base : null
-}
-
-function pythonModule(base: string, isFile: (rel: string) => boolean): { to: string; package: boolean } | null {
-  const candidates = [
-    { to: path.posix.join(base, '__init__.py'), package: true },
-    ...(base === '.' ? [] : [{ to: `${base}.py`, package: false }]),
-    { to: path.posix.join(base, '__init__.pyi'), package: true },
-    ...(base === '.' ? [] : [{ to: `${base}.pyi`, package: false }]),
-  ]
-  return candidates.find(candidate => isFile(candidate.to)) ?? null
-}
-
-export interface ResolvedModule { to: string; candidate?: true }
-
-export function isRustRoot(file: string, isFile: (rel: string) => boolean): boolean {
-  const dir = path.posix.dirname(file)
-  return /(?:^|\/)src\/(?:lib|main)\.rs$/.test(file) || /^(?:lib|main)\.rs$/.test(file)
-    || /(?:^|\/)(?:src\/bin|tests|examples|benches)\/(?:[^/]+\.rs|[^/]+\/main\.rs)$/.test(file)
-    || path.posix.basename(file) === 'build.rs' && (dir === '.' || isFile(path.posix.join(dir, 'Cargo.toml')))
-}
-
-/** Resolve conventional local paths only; no Python execution, Cargo, -I search or macro expansion. */
-export function resolveModuleFact(fromRel: string, ref: ModuleFact, isFile: (rel: string) => boolean, includeResolver?: IncludeResolver): ResolvedModule[] {
-  const dir = path.posix.dirname(fromRel)
-  if (ref.kind === 'python_import' || ref.kind === 'python_from' || ref.kind === 'python_dynamic') {
-    if (ref.kind === 'python_dynamic' && ref.dynamic) return []
-    const base = ref.kind === 'python_dynamic' && ref.spec.startsWith('.') && ref.package
-      ? pythonBase(ref.package.replaceAll('.', '/') + '/__init__.py', ref.spec) : pythonBase(fromRel, ref.spec)
-    if (!base) return []
-    const module = pythonModule(base, isFile)
-    const targets: ResolvedModule[] = module ? [{ to: module.to }] : []
-    if (ref.kind === 'python_from' && (!module || module.package)) {
-      // A from-import can bind an attribute or a submodule; existence makes a
-      // submodule a candidate, not proof that Python will load it at runtime.
-      for (const name of ref.names) {
-        const child = pythonModule(path.posix.join(base, name.replaceAll('.', '/')), isFile)
-        if (child) targets.push({ to: child.to, candidate: true })
-      }
-    }
-    return targets
-  }
-  if (ref.kind === 'rust_use' || ref.kind === 'go_import' || ref.kind.startsWith('java_') || ref.kind === 'lua_require' || ref.kind === 'cpp_import' || ref.kind === 'cpp_implementation') return [] // workspace indexes resolve these
-  if (ref.kind === 'c_include' || ref.kind === 'rust_include' || ref.kind === 'cgo_include' || ref.kind === 'cpp_header') {
-    if ((ref.kind === 'c_include' || ref.kind === 'cpp_header') && includeResolver) {
-      const targets = includeResolver(fromRel, ref.spec, ref.mode, isFile)
-      if (targets !== null) return targets.map(to => ({ to, ...(ref.kind === 'cpp_header' ? { candidate: true as const } : {}) }))
-    }
-    if (ref.kind === 'rust_include' ? ref.dynamic : ref.mode !== 'quote') return []
-    const to = localPath(dir, ref.spec)
-    return to && isFile(to) ? [{ to, ...(ref.kind === 'cgo_include' || ref.kind === 'cpp_header' ? { candidate: true as const } : {}) }] : []
-  }
-  if (ref.kind !== 'rust_mod' || ref.dynamic) return []
-  // mod.rs and conventional crate roots own their containing directory;
-  // other module files own a subdirectory named after the file stem.
-  const rootFile = isRustRoot(fromRel, isFile)
-  const moduleDir = path.posix.basename(fromRel) === 'mod.rs' || rootFile ? dir : path.posix.join(dir, path.posix.basename(fromRel, '.rs'))
-  const base = path.posix.join(moduleDir, ...ref.scope)
-  if (ref.path !== undefined) {
-    const to = localPath(ref.scope.length ? base : dir, ref.path)
-    return to && isFile(to) ? [{ to }] : []
-  }
-  const target = localPath(base, ref.spec)
-  if (!target) return []
-  const candidates = [`${target}.rs`, path.posix.join(target, 'mod.rs')].filter(isFile)
-  return candidates.length === 1 ? [{ to: candidates[0] }] : []
 }

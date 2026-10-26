@@ -16,15 +16,15 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'n
 import ignore from 'ignore'
 import { bridgeGlobalsOf, loadPreloadDecls } from './decls.ts'
 import { buildGraph, deriveRoleGlobals, exposedGlobalsOf, normalizeTraceFile, parseDependencyPath, parseTarget, trace, type TraceGraph } from './linkgraph.ts'
-import { loadCompilationDatabase, resetCompilationCache, type CompilationDatabase, type CompilationInfo } from './compile-commands.ts'
+import { loadCompilationDatabase, resetCompilationCache, type CompilationInfo } from './compile-commands.ts'
 import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } from './facts.ts'
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
 import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from './ast-pool.ts'
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
-import { loadJsProject, projectMetadata, type JsProject } from './js-project.ts'
+import { loadJsProject, projectMetadata } from './js-project.ts'
 import { findDefinitions } from './tools-symbol.ts'
-import type { EdgeMode, TraceDiagnostic } from './trace-evidence.ts'
+import type { EdgeMode, ProjectContext, TraceDiagnostic } from './trace-evidence.ts'
 
 const SCAN_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.html', '.vue', '.svelte',
   '.py', '.pyi', '.rs', '.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx', '.cppm', '.ixx', '.go', '.java', '.lua'])
@@ -231,7 +231,7 @@ export interface AssembledTrace {
 
 export interface TraceAssemblyOptions { declarations?: string; compileCommands?: string; signal?: AbortSignal; workers?: AstWorkerPool }
 interface GraphProbe { exists: boolean; identity: string | null }
-const GRAPH_CACHE = new Map<string, { signature: string; decls: string; compilation?: CompilationDatabase; project?: JsProject; probes: Map<string, GraphProbe>; assembled: AssembledTrace }>()
+const GRAPH_CACHE = new Map<string, { signature: string; decls: string; contexts: Array<ProjectContext | undefined>; probes: Map<string, GraphProbe>; assembled: AssembledTrace }>()
 interface PendingAssembly { controller: AbortController; users: number; promise: Promise<AssembledTrace> }
 const PENDING = new Map<string, Map<AstWorkerPool | undefined, PendingAssembly>>()
 
@@ -251,9 +251,11 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   const project = hasJs ? loadJsProject(root, scan.projectFiles, options.signal, new Set(scan.entries.keys()), jsRefs) : undefined
   const cached = GRAPH_CACHE.get(key)
   const declsKey = JSON.stringify(decls)
+  // Fixed slot order: a context that disappears (undefined) must not match one that existed.
+  const contexts: Array<ProjectContext | undefined> = [compilation, project]
   if (cached && cached.signature === scan.signature && cached.decls === declsKey
-    && cached.compilation?.signature === compilation?.signature && cached.compilation?.valid() !== false
-    && cached.project?.signature === project?.signature && cached.project?.valid() !== false && scan.walkErrors === 0 && !scan.truncated) {
+    && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
+    && scan.walkErrors === 0 && !scan.truncated) {
     // Resolution may probe ignored/non-JS files or missing paths. Revalidate
     // those too, so adding an asset or an index file invalidates the graph.
     const probesMatch = [...cached.probes].every(([rel, expected]) => {
@@ -281,7 +283,7 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
     ...(compilation?.info ? { compilation: compilation.info } : {}) }
   if (!scan.truncated && scan.walkErrors === 0) {
     GRAPH_CACHE.delete(key)
-    GRAPH_CACHE.set(key, { signature: scan.signature, decls: declsKey, compilation, project, probes, assembled })
+    GRAPH_CACHE.set(key, { signature: scan.signature, decls: declsKey, contexts, probes, assembled })
     if (GRAPH_CACHE.size > 4) GRAPH_CACHE.delete(GRAPH_CACHE.keys().next().value!)
   }
   return assembled

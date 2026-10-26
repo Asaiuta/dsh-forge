@@ -16,8 +16,7 @@ import { realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import type { TraceFileFacts, IpcFact, BridgeFact, GlobalDefFact, GlobalUseFact, WrapperFact, NamedEntryFact, ExposeFact } from './facts.ts'
 import { jsReferences, scriptFacts } from './facts.ts'
-import { resolveModuleFact } from './module-facts.ts'
-import { moduleResolver } from './module-resolution.ts'
+import { sourceResolver } from './source-resolution.ts'
 import { indexFfi, traceFfi, type FfiMatch } from './trace-native.ts'
 import type { IncludeResolver } from './compile-commands.ts'
 import { traceImpact, tracePath, type AnalysisResult } from './trace-analysis.ts'
@@ -238,7 +237,7 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
   const unresolvedModules: UnresolvedModule[] = []
   const edgeSeen = new Set<string>()
   let resolutionLimited = false
-  const extraResolver = moduleResolver(entries, isFile, () => { resolutionLimited = true })
+  const resolveSource = sourceResolver({ entries, isFile, includeResolver, onLimit: () => { resolutionLimited = true } })
   const virtual = new Map<string, string[]>()
   for (const [file, entry] of entries) for (const module of scriptFacts(entry)?.ambientModules ?? []) {
     const files = virtual.get(module.name) ?? []
@@ -248,11 +247,12 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
   for (const [rel, f] of entries) {
     if (f.kind === 'source') {
       for (const ref of f.modules) {
-        const targets = extraResolver(rel, ref) ?? resolveModuleFact(rel, ref, isFile, includeResolver)
-        if (!targets.length) unresolvedModules.push({ path: rel, line: ref.line, spec: ref.spec,
-          reason: 'dynamic' in ref && ref.dynamic || 'mode' in ref && ref.mode === 'dynamic' ? 'non_literal' : 'unsupported_resolution',
-          detail: '当前模块规则未找到唯一可用目标；可能涉及缺失文件、工程配置、遮蔽或歧义。' })
-        for (const target of targets) {
+        const result = resolveSource(rel, ref)
+        if (result.status !== 'resolved') {
+          if (result.status === 'unresolved') unresolvedModules.push({ path: rel, line: ref.line, spec: ref.spec, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) })
+          continue
+        }
+        for (const target of result.targets) {
           const normalizedTarget = normalizeTarget(target.to)
           if (ref.kind === 'java_type' && normalizedTarget === rel) continue
           const kind = ref.kind + ('role' in ref ? ':' + ref.role : '') + (target.candidate ? ref.kind === 'python_from' ? ' (submodule candidate)' : ' (module candidate)' : '')
