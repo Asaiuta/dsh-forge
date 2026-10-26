@@ -165,6 +165,25 @@ export interface ExposeFact {
   partial?: boolean
 }
 
+/** `export … from` (or an exported import binding): names this module forwards from another. */
+export interface ForwardFact {
+  spec: string
+  line: number
+  /** `export * from` — every named export except default. */
+  star?: true
+  /** `export * as ns from` — the namespace object of the target module. */
+  namespace?: string
+  names?: Array<{ exported: string; imported: string }>
+}
+
+/** ES module export table: declared names plus forwards. Absent for CommonJS-only files. */
+export interface ModuleExportsFact {
+  names: string[]
+  forwards: ForwardFact[]
+  /** Exported default/namespace import bindings: exported, but the definition is not traced. */
+  opaque?: string[]
+}
+
 export interface FileFacts {
   /** Present only for the non-JavaScript module collectors. */
   modules?: ModuleFact[]
@@ -186,6 +205,7 @@ export interface FileFacts {
   bindings: ModuleBindingFact[]
   deferredCalls: DeferredCallFact[]
   namedEntries: NamedEntryFact[]
+  moduleExports?: ModuleExportsFact
 }
 
 export interface HtmlScriptFact {
@@ -469,6 +489,8 @@ class FactsCollector {
   private readonly constShapes = new Map<string, { keys: string[]; complete: boolean }>()
   private readonly wrappers = new Map<string, WrapperDef>()
   private readonly bindings = new Map<string, ModuleBindingFact>()
+  /** `export { a as b }` without a source: a may be a declaration or an import binding (hoisted). */
+  private readonly localExports: Array<{ local: string; exported: string; line: number }> = []
   private readonly paramCalls: Array<{ fact: IpcFact; wrapper: string }> = []
   private readonly wrapperCallSites = new Map<string, number>()
   private readonly usedSeen = new Set<string>()
@@ -498,6 +520,14 @@ class FactsCollector {
     for (const record of this.paramCalls) {
       if (!this.wrapperCallSites.get(record.wrapper)) record.fact.via = 'dynamic'
     }
+    // Exported import bindings become forwards; imports are hoisted, so this
+    // runs after the whole top level has been scanned.
+    for (const item of this.localExports) {
+      const exports = this.exportsFact(), binding = this.bindings.get(item.local)
+      if (!binding) { if (!exports.names.includes(item.exported)) exports.names.push(item.exported) }
+      else if (binding.imported !== null) exports.forwards.push({ spec: binding.spec, line: item.line, names: [{ exported: item.exported, imported: binding.imported }] })
+      else (exports.opaque ??= []).push(item.exported)
+    }
     // Wrapper table for cross-file callers. Only top-level declarations are
     // importable; a wrapper nested inside another function never is.
     const topLevel = new Set(this.out.globalsDefined.map((d) => d.name))
@@ -524,6 +554,7 @@ class FactsCollector {
 
   private scanTopLevel(stmt: TsNode): void {
     if (stmt.type === 'export_statement') {
+      this.scanExport(stmt)
       const inner = stmt.childForFieldName('declaration')
       if (inner) this.scanTopLevel(inner)
       return
@@ -552,6 +583,57 @@ class FactsCollector {
       const name = stmt.childForFieldName('name')
       if (name) this.out.globalsDefined.push({ name: name.text, how: 'function', line: stmt.startPosition.row + 1 })
     }
+  }
+
+  private exportsFact(): ModuleExportsFact {
+    return this.out.moduleExports ??= { names: [], forwards: [] }
+  }
+
+  /** Top-level export statement → declared names or forwards. Unknown shapes add nothing. */
+  private scanExport(stmt: TsNode): void {
+    const line = stmt.startPosition.row + 1
+    const source = stmt.childForFieldName('source')
+    const spec = source ? literalString(source) : null
+    if (source && spec === null) return
+    const nameOf = (node: TsNode | null | undefined): string | null => !node ? null : node.type === 'string' ? literalString(node) : node.text
+    const clause = stmt.children.find(child => child.type === 'export_clause')
+    const specifiers = (clause?.children ?? []).filter(child => child.type === 'export_specifier').flatMap(child => {
+      const imported = nameOf(child.childForFieldName('name'))
+      const exported = nameOf(child.childForFieldName('alias')) ?? imported
+      return imported && exported ? [{ imported, exported }] : []
+    })
+    const exports = this.exportsFact()
+    if (spec !== null) {
+      const namespace = stmt.children.find(child => child.type === 'namespace_export')
+      if (namespace) {
+        const name = nameOf(namespace.children.find(child => child.type === 'identifier' || child.type === 'string'))
+        if (name) exports.forwards.push({ spec, line, namespace: name })
+      } else if (clause) exports.forwards.push({ spec, line, names: specifiers })
+      else if (/^export\s+\*\s*from\b/.test(stmt.text)) exports.forwards.push({ spec, line, star: true })
+      return
+    }
+    if (clause) {
+      for (const item of specifiers) this.localExports.push({ local: item.imported, exported: item.exported, line })
+      return
+    }
+    if (/^export\s+default\b/.test(stmt.text)) { exports.names.push('default'); return }
+    const declared = (node: TsNode | null): string[] => {
+      if (!node) return []
+      if (node.type === 'ambient_declaration') return node.children.flatMap(child => declared(child))
+      if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+        return node.children.filter(child => child.type === 'variable_declarator').flatMap(declarator => {
+          const name = declarator.childForFieldName('name')
+          if (!name) return []
+          if (name.type === 'identifier') return [name.text]
+          // Destructuring: every bound identifier is exported.
+          return [...name.descendantsOfType('identifier'), ...name.descendantsOfType('shorthand_property_identifier_pattern')]
+            .filter(id => id.parent?.type !== 'pair_pattern' || id.parent.childForFieldName('value') === id).map(id => id.text)
+        })
+      }
+      const name = node.childForFieldName('name')
+      return name && (name.type === 'identifier' || name.type === 'type_identifier') ? [name.text] : []
+    }
+    for (const name of declared(stmt.childForFieldName('declaration'))) if (!exports.names.includes(name)) exports.names.push(name)
   }
 
   /** `const { invoke, send: s } = require('spec')` / `const bridge = require('spec')`. */

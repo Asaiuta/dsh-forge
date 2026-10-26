@@ -23,6 +23,7 @@ import type { PythonRoots } from './python-project.ts'
 import type { RustCrates } from './rust-project.ts'
 import type { GoModules } from './go-project.ts'
 import { jsFile, relativeJs } from './js-resolution.ts'
+import { reexportEdges, type NamedImport } from './js-reexports.ts'
 import type { EdgeEvidence, JsResolver, UnresolvedModule } from './trace-evidence.ts'
 export { traceImpact, tracePath, normalizeTraceFile, parseDependencyPath } from './trace-analysis.ts'
 import { COMPAT_GLOBAL, DEFAULT_ROLE_GLOBALS, type PreloadApi, type PreloadDecls } from './decls.ts'
@@ -237,6 +238,9 @@ interface ModuleBuild {
 /** Module graph (edge-deduplicated): JS/HTML/component references, preload wiring and source-language modules. */
 function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: BuildContext, includeResolver?: IncludeResolver, projects: SourceProjects = {}): ModuleBuild {
   const constIndex = constStringsOf(entries)
+  /** ES import specifier → its single resolved file (null: unresolved or several targets). */
+  const esTargets = new Map<string, Map<string, string | null>>()
+  const namedImports: NamedImport[] = []
   const deps = new Map<string, DepEdge[]>()
   const resolvedDeps = new Map<string, DepEdge[]>()
   const inlineDeps = new Map<string, Map<number, DepEdge[]>>()
@@ -286,6 +290,7 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
     }
     for (const { mode, ref, syntax } of jsReferences(f)) {
       const edgeKind = ref.dynamic ? 'dynamic_import' : mode
+      const esImport = mode === 'import' && !ref.dynamic && !ref.unresolved
       const imports = ref.unresolved ? undefined : importedNames(ref.spec)
       // An expression such as `import(/regex/.source)` is retained as an
       // unresolved fact for diagnostics, but its source text must never be
@@ -295,6 +300,13 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
         : declared ? declared.length === 1 ? { status: 'resolved' as const, targets: [{ to: declared[0], evidence: { confidence: 'candidate' as const, basis: 'ambient_module' } }] }
           : { status: 'unresolved' as const, reason: 'ambiguous_target' as const, detail: '多个文件声明同名 ambient module。' }
         : jsResolver(rel, ref.spec, ref.dynamic ? 'dynamic_import' : mode, isFile, syntax)
+      if (esImport) {
+        let specs = esTargets.get(rel)
+        if (!specs) esTargets.set(rel, specs = new Map())
+        const single = resolution.status === 'resolved' && resolution.targets.length === 1 ? normalizeTarget(resolution.targets[0].to) : null
+        if (!specs.has(ref.spec)) specs.set(ref.spec, single)
+        if (single && imports) namedImports.push({ from: rel, line: ref.line, to: single, names: imports })
+      }
       if (resolution.status === 'resolved') for (const target of resolution.targets) {
         const normalizedTarget = normalizeTarget(target.to)
         const edge = { to: normalizedTarget, line: ref.line, kind: edgeKind, evidence: target.evidence, ...(imports ? { imports } : {}) }
@@ -344,6 +356,17 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
     }
   }
 
+  // Named imports through barrels: an extra candidate edge to the defining
+  // file. Page membership is unaffected (the barrel already reaches it).
+  for (const edge of reexportEdges(entries, (file, spec) => esTargets.get(file)?.get(spec), namedImports)) {
+    const kind = 'reexport'
+    const evidence: EdgeEvidence = { confidence: 'candidate', basis: 'reexport', config: `via ${edge.via.join(' → ')}` }
+    const key = JSON.stringify([edge.from, edge.to, edge.line, kind, edge.via])
+    if (edgeSeen.has(key)) continue
+    edgeSeen.add(key)
+    push(deps, edge.from, { to: edge.to, line: edge.line, kind, evidence, imports: edge.names })
+    push(rdeps, edge.to, { path: edge.from, line: edge.line, kind, evidence, imports: edge.names })
+  }
   return { graph: { deps, rdeps, unresolvedModules }, resolvedDeps, inlineDeps, resolutionLimited }
 }
 

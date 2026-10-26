@@ -90,6 +90,13 @@ type Resolution =
 - 无 go.work / replace 时行为与之前一致。`go.mod` 的 manifest 文件事实保留，仅供 `file:go.mod` 展示；解析数据来自工程上下文。
 - 未做：`vendor/` 目录。
 - 测试：`tests/run-trace-gowork.mjs`。
+
+**P3.4 状态（已完成）**：
+- 提取器新增 `moduleExports` 事实：本模块声明的导出名（含解构、TS 类型/枚举、`export default`）、转发（`export {a as b} from`、`export * from`、`export * as ns from`、导出的 import 绑定），默认/命名空间 import 绑定被再导出时记为 opaque。
+- `js-reexports.ts`：从具名导入沿转发链找定义文件，≤8 跳、遇环停、带记忆化。按 ES 语义保守处理：`export *` 不转发 default；多个 star 目标同名则排除；链上任一模块导出表未知（CommonJS、外部包、非 JS）即停止。
+- 定义文件不同于直接目标时，新增 `reexport` 边（candidate，evidence 写明 `via 中间文件链`，携带导入名）；不进入页面成员闭包；`edgeMode=certain` 排除。
+- 未做：CommonJS `module.exports` 转发；默认导入（`import x from`）与命名空间导入不追踪（现有 bindings 事实不区分二者）；符号级 `impact:文件#名称`。
+- 测试：`tests/run-trace-reexports.mjs`。
 - 每项：`tests/run-trace-<lang>-project.mjs`、`eval-trace-real` 回归、与 `js-project` 一致的预算（2000 文件 / 8 MiB）。
 
 ## P4 远期（仅设计）
