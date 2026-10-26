@@ -172,8 +172,28 @@ PF 在 VCPToolBox 只解析 966 个文件，本插件解析 2,859 个，两者�
 
 顺带修掉一处门控漏洞：重复查询的 `statPaths` 此前只检查 `DSH_FORGE_TRACE_NATIVE`，没有先问 sidecar 是否可用，于是 `DSH_FORGE_INDEXER=0` 仍会拉起子进程。现在两条下推都以「sidecar 就绪」为前提，关掉索引器就是完全不碰它——上表「本地实现」一列因此比上一轮记录的耗时更高，那是真正的无 sidecar 基线。
 
-### 还没做的
+### 试过但没下推：`collectCandidates`
 
-- `collectCandidates` 的目录遍历（VCPToolBox 233–250 ms）。语义包含根 `.gitignore`、`FILE_CAP`/`WALK_VISIT_CAP` 截断、元数据文件分类，出错面比 stat 和探测都大。
+第三项是扫描时的目录遍历。Rust 侧实现出来了，也逐条对齐过——四个仓库（1,726 / 2,862 / 169 / 142 个候选）的相对路径列表逐字相同，外加一个 60 项的 `.gitignore` fixture 全绿——但测量说明不值得：
+
+| 语料 | 本地遍历 | sidecar |
+|---|---:|---:|
+| VCPChat（1,726） | 30.0 ms | 23.2 ms |
+| VCPToolBox（2,862） | 80.1 ms | 71.9 ms |
+| audio-engine-core（169） | 6.5 ms | 5.9 ms |
+| dsh-forge（142） | 2.7 ms | 2.8 ms |
+
+同进程交替 7 轮取中位数。小树上 sidecar 反而更慢：一次请求的 JSON 往返比本地遍历本身贵。冷启动首调用更差，因为要 spawn 子进程：VCPChat 89 → 241 ms。
+
+所以上一节末尾记的「`collectCandidates` 233–250 ms」需要更正：那是**冷 matcher + 冷 JIT** 的一次性成本（VCPToolBox 冷启动首调用 292 ms，稳定复现），重复查询上只有 80 ms。为 8 ms 维护第二套 gitignore 语义不划算，代码已退回。
+
+两个当时踩到的语义偏差记在这里，将来若要重做可以直接抄：
+
+- `ignore` crate 的 `GitignoreBuilder::add_line` 一次只吃一行。把整个文件当一行传进去，**之后所有模式全部失效**（症状：sidecar 一个文件都不排除，dsh-forge 从 142 涨到 12,742）。要按 `lines()` 逐行喂。
+- `matched()` 只比路径自身，`dist/` 这类目录专用模式匹配不到 `dist/a.js`，而 JS 的 `ignore` 包会。改成 `matched_path_or_any_parents(rel, false)`：父目录按目录参与匹配，路径自身仍按非目录，正好复刻 JS。另外 `projectMetadata` 还接受 `/^(?:ts|js)config(?:\.[^/]+)?\.json$/`（`tsconfig.app.json` 这类），只按等值判断会漏三个文件。
+
+### 下一步
+
+重复查询现在由三段构成：目录遍历 30–80 ms、`statPaths`、`probesUnchanged`。剩下的固定成本是工程上下文加载（此前测得 70–90 ms）、图构建与事实缓存查询，都不再是纯文件系统操作，下推 sidecar 的收益面要另外评估。
 
 
