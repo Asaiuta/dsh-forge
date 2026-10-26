@@ -52,6 +52,12 @@ type Resolution =
 - `TraceGraph` 分组为 `{ modules, pages, electron: { ipc, bridge, globals }, ffi }`，保留过渡兼容层。
 - 渲染抽到 `trace-render.ts`，只挪位置不改文案。
 
+**状态（已完成）**：
+- `buildGraph` 变为编排函数：`buildModuleGraph` / `buildPageGraph` / `buildElectronIndex` 共享 `BuildContext`；调用顺序固定（`normalizeTarget` 保留首个拼写）。
+- `TraceGraph` 保持扁平（测试约 100 处直接访问字段），改为 `ModuleGraph & PageGraph & ElectronIndex & {...}` 组合类型，无需兼容层。
+- 查询与渲染移到 `trace-queries.ts`（未拆分计算与渲染，文案零改动）；`linkgraph.ts` 重新导出以保持 `lib/linkgraph.js` 公开接口。
+- 验证：全量测试通过；本仓库 9 个查询的输出与重构前逐字节一致。
+
 ## P3 语言能力（每项一个 `LanguageProject` 实现）
 
 | 序 | 项目 | 做法 | 置信度 | 估时 |
