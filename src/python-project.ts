@@ -2,11 +2,9 @@
  * Python package roots from local packaging metadata. Reads pyproject.toml and
  * setup.cfg as data; never runs setup.py, a build backend or an interpreter.
  */
-import { createHash } from 'node:crypto'
-import { realpathSync } from 'node:fs'
 import path from 'node:path'
 import { parse as parseToml } from 'smol-toml'
-import { canonicalTarget, readBoundedFile, within } from './fs-paths.ts'
+import { at, metadataReader, record, strings, tomlError } from './metadata-reader.ts'
 import { localPath } from './source-resolution.ts'
 import type { ProjectContext, TraceDiagnostic } from './trace-evidence.ts'
 
@@ -23,20 +21,6 @@ export interface PythonRoots { roots: PythonRoot[]; packageDirs: PythonPackageDi
 export interface PythonProject extends ProjectContext, PythonRoots { issues: TraceDiagnostic[] }
 
 export const pythonMetadata = (name: string): boolean => name === 'pyproject.toml' || name === 'setup.cfg'
-
-const FILE_BYTES = 256 * 1024
-const TOTAL_BYTES = 8 * 1024 * 1024
-const FILE_COUNT = 2000
-
-const record = (value: unknown): Record<string, unknown> | null =>
-  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
-const at = (value: unknown, ...keys: string[]): unknown => {
-  let current = value
-  for (const key of keys) current = record(current)?.[key]
-  return current
-}
-const strings = (value: unknown): string[] | null =>
-  typeof value === 'string' ? [value] : Array.isArray(value) && value.every(item => typeof item === 'string') ? value as string[] : null
 
 /** Minimal INI reader for setup.cfg: sections, `key = value` and indented continuation lines. */
 function parseSetupCfg(text: string): Map<string, Map<string, string>> {
@@ -57,26 +41,8 @@ function parseSetupCfg(text: string): Map<string, Map<string, string>> {
 }
 
 export function loadPythonProject(root: string, files: readonly string[], pythonFiles: Iterable<string>, signal?: AbortSignal): PythonProject {
-  const issues: TraceDiagnostic[] = [], stamps: unknown[] = [], roots: PythonRoot[] = [], packageDirs: PythonPackageDir[] = []
-  let canonicalRoot: string | null = null
-  try { canonicalRoot = realpathSync(root) } catch { /* scanFacts reports inaccessible roots */ }
-  let bytes = 0, count = 0
-  const read = (file: string): string | null => {
-    signal?.throwIfAborted()
-    try {
-      if (++count > FILE_COUNT || bytes >= TOTAL_BYTES) throw new Error('超过 Python 工程元数据预算（2,000 个文件 / 8 MiB）。')
-      const target = canonicalTarget(path.resolve(root, file))
-      if (!canonicalRoot || !within(canonicalRoot, target)) throw new Error('工程元数据路径超出扫描根或无法确认身份。')
-      const data = readBoundedFile(target, Math.min(FILE_BYTES, TOTAL_BYTES - bytes))
-      bytes += data.length
-      stamps.push([file, createHash('sha256').update(data).digest('hex')])
-      return data.toString('utf8').replace(/^\uFEFF/, '')
-    } catch (cause) {
-      stamps.push([file, 'failed'])
-      issues.push({ path: file, reason: 'metadata_read', message: cause instanceof Error ? cause.message : String(cause) })
-      return null
-    }
-  }
+  const { read, issues, signature } = metadataReader(root, 'Python', signal)
+  const roots: PythonRoot[] = [], packageDirs: PythonPackageDir[] = []
   const explicit = new Set<string>()
   const addRoot = (file: string, base: string, value: string, declared: boolean, key: string): void => {
     const dir = localPath(base, value)
@@ -99,7 +65,7 @@ export function loadPythonProject(root: string, files: readonly string[], python
     if (path.posix.basename(file) === 'pyproject.toml') {
       let data: unknown
       try { data = parseToml(text) } catch (cause) {
-        issues.push({ path: file, reason: 'metadata_parse', message: cause instanceof Error ? cause.message.split('\n')[0].slice(0, 240) : '无效 TOML。' })
+        issues.push({ path: file, reason: 'metadata_parse', message: tomlError(cause) })
         continue
       }
       const packageDir = record(at(data, 'tool', 'setuptools', 'package-dir'))
@@ -149,5 +115,5 @@ export function loadPythonProject(root: string, files: readonly string[], python
     if (!roots.some(item => item.dir === dir)) roots.push({ dir, declared: false, source: `${file} · src/ layout 约定` })
   }
   roots.sort((a, b) => Number(b.declared) - Number(a.declared) || a.dir.localeCompare(b.dir))
-  return { roots, packageDirs, issues, signature: JSON.stringify([canonicalRoot, stamps, roots, packageDirs]), valid: () => true }
+  return { roots, packageDirs, issues, signature: signature([roots, packageDirs]), valid: () => true }
 }

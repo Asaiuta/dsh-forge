@@ -9,6 +9,7 @@ import type { ModuleFact } from './module-facts.ts'
 import type { IncludeResolver } from './compile-commands.ts'
 import type { UnresolvedReason } from './trace-evidence.ts'
 import type { PythonRoots } from './python-project.ts'
+import type { RustCrates } from './rust-project.ts'
 import { javaResolver } from './java-resolution.ts'
 import { goResolver } from './go-resolution.ts'
 import { rustResolver } from './rust-resolution.ts'
@@ -31,6 +32,8 @@ export interface SourceContext {
   onLimit?: () => void
   /** Package roots from pyproject.toml / setup.cfg and layout conventions. */
   python?: PythonRoots
+  /** Crate names, declared target roots and path dependencies from Cargo.toml. */
+  rust?: RustCrates
 }
 
 export const NOT_APPLICABLE: SourceResolution = { status: 'not_applicable' }

@@ -1,6 +1,7 @@
-/** Rust mod trees from crate roots, `use` paths and include! macros. No Cargo or macro expansion. */
+/** Rust mod trees from crate roots, `use` paths (incl. Cargo path dependencies) and include! macros. No cargo run or macro expansion. */
 import path from 'node:path'
 import type { ModuleFact } from './module-facts.ts'
+import type { RustCrate } from './rust-project.ts'
 import { localPath, NOT_APPLICABLE, resolvedTo, unresolvedAs, type SourceContext, type SourceResolution, type SourceResolver } from './source-resolution.ts'
 
 type RustMod = Extract<ModuleFact, { kind: 'rust_mod' }>
@@ -14,10 +15,10 @@ export function isRustRoot(file: string, isFile: (rel: string) => boolean): bool
 
 /** mod.rs and conventional crate roots own their containing directory;
  *  other module files own a subdirectory named after the file stem. */
-function resolveMod(fromRel: string, ref: RustMod, isFile: (rel: string) => boolean): SourceResolution {
+function resolveMod(fromRel: string, ref: RustMod, isFile: (rel: string) => boolean, isRoot: (file: string) => boolean): SourceResolution {
   if (ref.dynamic) return unresolvedAs('unsupported_resolution', 'cfg_attr 或外层 #[path] 下的模块路径不做推断。')
   const dir = path.posix.dirname(fromRel)
-  const moduleDir = path.posix.basename(fromRel) === 'mod.rs' || isRustRoot(fromRel, isFile) ? dir : path.posix.join(dir, path.posix.basename(fromRel, '.rs'))
+  const moduleDir = path.posix.basename(fromRel) === 'mod.rs' || isRoot(fromRel) ? dir : path.posix.join(dir, path.posix.basename(fromRel, '.rs'))
   const base = path.posix.join(moduleDir, ...ref.scope)
   if (ref.path !== undefined) {
     const to = localPath(ref.scope.length ? base : dir, ref.path)
@@ -35,7 +36,14 @@ function resolveMod(fromRel: string, ref: RustMod, isFile: (rel: string) => bool
 
 const one = (values: string[] | undefined): string | null => values?.length === 1 ? values[0] : null
 
-export function rustResolver({ entries, isFile, onLimit }: SourceContext): SourceResolver {
+export function rustResolver({ entries, isFile, onLimit, rust }: SourceContext): SourceResolver {
+  const declaredRoots = new Set(rust?.roots ?? [])
+  const isRoot = (file: string): boolean => isRustRoot(file, isFile) || declaredRoots.has(file)
+  const crates = rust?.crates ?? []
+  const crateByDir = new Map(crates.map(crate => [crate.dir, crate]))
+  const crateOf = (file: string): RustCrate | undefined => crates
+    .filter(crate => crate.dir === '.' || file.startsWith(crate.dir + '/'))
+    .sort((a, b) => b.dir.length - a.dir.length)[0]
   // Follow actual mod declarations, including #[path], instead of searching
   // arbitrary Rust filenames. Ownership can be shared by lib/main crates.
   const rustModules = new Map<string, Map<string, string[]>>()
@@ -47,7 +55,7 @@ export function rustResolver({ entries, isFile, onLimit }: SourceContext): Sourc
   }
   let work = 0, limited = false
   for (const [root, facts] of entries) {
-    if (facts.kind !== 'source' || facts.lang !== 'rust' || !isRustRoot(root, isFile)) continue
+    if (facts.kind !== 'source' || facts.lang !== 'rust' || !isRoot(root)) continue
     const modules = new Map<string, string[]>(), queue = [{ file: root, scope: [] as string[] }], seen = new Set<string>()
     rustModules.set(root, modules)
     for (let n = 0; n < queue.length; n++) {
@@ -61,7 +69,7 @@ export function rustResolver({ entries, isFile, onLimit }: SourceContext): Sourc
       if (entry?.kind !== 'source') continue
       for (const inline of entry.moduleInfo?.inlineModules ?? []) add(modules, [...scope, ...inline].join('::'), file)
       for (const ref of entry.modules) if (ref.kind === 'rust_mod' && !ref.dynamic) {
-        const result = resolveMod(file, ref, isFile)
+        const result = resolveMod(file, ref, isFile, isRoot)
         if (result.status === 'resolved') for (const target of result.targets) {
           if (queue.length >= 20_000) { limited = true; break }
           queue.push({ file: target.to, scope: [...scope, ...ref.scope, ref.spec] })
@@ -73,7 +81,7 @@ export function rustResolver({ entries, isFile, onLimit }: SourceContext): Sourc
   if (limited) onLimit?.()
 
   return (from, ref) => {
-    if (ref.kind === 'rust_mod') return resolveMod(from, ref, isFile)
+    if (ref.kind === 'rust_mod') return resolveMod(from, ref, isFile, isRoot)
     if (ref.kind === 'rust_include') {
       if (ref.dynamic) return unresolvedAs('non_literal')
       const to = localPath(path.posix.dirname(from), ref.spec)
@@ -89,8 +97,8 @@ export function rustResolver({ entries, isFile, onLimit }: SourceContext): Sourc
     if (!own.length) return unresolvedAs('unsupported_resolution', '文件不在任何已识别 crate 根的 mod 树中。')
     const parts0 = ref.spec.replace(/^::/, '').split('::').map(part => part.replace(/^r#/, ''))
     const explicit = ['crate', 'self', 'super'].includes(parts0[0])
-    if (!explicit && ref.spec.startsWith('::')) return unresolvedAs('external_package', '绝对路径指向外部 crate。')
-    const targets = own.map(owner => {
+    const absolute = !explicit && ref.spec.startsWith('::')
+    const localTarget = (owner: { root: string; scope: string[] }): string | null => {
       const parts = [...parts0]
       const scope = [...owner.scope, ...ref.scope]
       if (parts[0] === 'crate') { parts.shift(); scope.length = 0 }
@@ -105,11 +113,38 @@ export function rustResolver({ entries, isFile, onLimit }: SourceContext): Sourc
       if (!explicit && parts.length < 2) return null
       if (parts.length) parts.pop()
       return one(modules.get([...scope, ...parts].join('::')))
+    }
+    /** `dep::path` inside a Cargo path dependency's lib tree. undefined: the
+     *  first segment names no local crate; null: it does, but the path is not found. */
+    const dependencyTarget = (owner: { root: string }): string | null | undefined => {
+      const crate = crateOf(owner.root)
+      if (!crate) return undefined
+      // Binaries, tests, examples and benches see their own package's lib implicitly.
+      const depDir = crate.deps[parts0[0]] ?? (parts0[0] === crate.libName && owner.root !== crate.libRoot ? crate.dir : undefined)
+      if (depDir === undefined) return undefined
+      const dep = crateByDir.get(depDir)
+      const modules = dep ? rustModules.get(dep.libRoot) : undefined
+      if (!modules) return null
+      const rest = parts0.slice(1)
+      if (rest.at(-1) === 'self' || rest.at(-1) === '*') rest.pop()
+      const exact = one(modules.get(rest.join('::')))
+      if (exact) return exact
+      if (rest.length) rest.pop()
+      return one(modules.get(rest.join('::')))
+    }
+    const results = own.map(owner => {
+      const local = absolute ? null : localTarget(owner)
+      if (local || explicit) return { to: local, dependency: false }
+      const via = dependencyTarget(owner)
+      return via === undefined ? { to: null, dependency: false } : { to: via, dependency: true }
     })
-    if (targets[0] && targets.every(to => to === targets[0])) return resolvedTo([{ to: targets[0], candidate: true }])
-    if (targets.some(Boolean)) return unresolvedAs('ambiguous_target', '共享该文件的多个 crate 对此路径给出不同结果。')
-    return explicit
-      ? unresolvedAs('missing_target', 'crate 模块树中没有该路径。')
-      : unresolvedAs('external_package', '首段不是本 crate 的模块，视为外部 crate 或标准库（Cargo workspace 尚未读取）。')
+    const first = results[0].to
+    if (first && results.every(result => result.to === first)) return resolvedTo([{ to: first, candidate: true }])
+    if (results.some(result => result.to)) return unresolvedAs('ambiguous_target', '共享该文件的多个 crate 对此路径给出不同结果。')
+    if (explicit) return unresolvedAs('missing_target', 'crate 模块树中没有该路径。')
+    if (results.some(result => result.dependency)) return unresolvedAs('missing_target', '本地 path 依赖 crate 的模块树中没有该路径（或其 lib 根未扫描）。')
+    return absolute
+      ? unresolvedAs('external_package', '绝对路径指向外部 crate。')
+      : unresolvedAs('external_package', '首段既不是本 crate 模块也不是本地 path 依赖，视为外部 crate 或标准库。')
   }
 }

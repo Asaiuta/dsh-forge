@@ -20,6 +20,7 @@ import { sourceResolver } from './source-resolution.ts'
 import { indexFfi, type FfiMatch } from './trace-native.ts'
 import type { IncludeResolver } from './compile-commands.ts'
 import type { PythonRoots } from './python-project.ts'
+import type { RustCrates } from './rust-project.ts'
 import { jsFile, relativeJs } from './js-resolution.ts'
 import type { EdgeEvidence, JsResolver, UnresolvedModule } from './trace-evidence.ts'
 export { traceImpact, tracePath, normalizeTraceFile, parseDependencyPath } from './trace-analysis.ts'
@@ -212,6 +213,9 @@ function preloadTarget(from: string, spec: string, isFile: (file: string) => boo
   return null
 }
 
+/** Project metadata for non-JavaScript resolution (absent when the workspace has none). */
+export interface SourceProjects { python?: PythonRoots; rust?: RustCrates }
+
 interface BuildContext {
   entries: Map<string, TraceFileFacts>
   isFile: (rel: string) => boolean
@@ -230,7 +234,7 @@ interface ModuleBuild {
 }
 
 /** Module graph (edge-deduplicated): JS/HTML/component references, preload wiring and source-language modules. */
-function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: BuildContext, includeResolver?: IncludeResolver, python?: PythonRoots): ModuleBuild {
+function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: BuildContext, includeResolver?: IncludeResolver, projects: SourceProjects = {}): ModuleBuild {
   const constIndex = constStringsOf(entries)
   const deps = new Map<string, DepEdge[]>()
   const resolvedDeps = new Map<string, DepEdge[]>()
@@ -239,7 +243,7 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
   const unresolvedModules: UnresolvedModule[] = []
   const edgeSeen = new Set<string>()
   let resolutionLimited = false
-  const resolveSource = sourceResolver({ entries, isFile, includeResolver, python, onLimit: () => { resolutionLimited = true } })
+  const resolveSource = sourceResolver({ entries, isFile, includeResolver, ...projects, onLimit: () => { resolutionLimited = true } })
   const virtual = new Map<string, string[]>()
   for (const [file, entry] of entries) for (const module of scriptFacts(entry)?.ambientModules ?? []) {
     const files = virtual.get(module.name) ?? []
@@ -535,7 +539,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
   }
 }
 
-export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, decls: PreloadDecls, onProbe?: (rel: string, exists: boolean, identity?: string | null) => void, includeResolver?: IncludeResolver, jsResolver: JsResolver = relativeJs, python?: PythonRoots): TraceGraph {
+export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, decls: PreloadDecls, onProbe?: (rel: string, exists: boolean, identity?: string | null) => void, includeResolver?: IncludeResolver, jsResolver: JsResolver = relativeJs, projects: SourceProjects = {}): TraceGraph {
   const isFile = makeIsFile(root, entries, onProbe)
   const entryKeys = new Map<string, string>()
   const graphKey = (value: string): string => {
@@ -556,7 +560,7 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
   }
   const context: BuildContext = { entries, isFile, normalizeTarget, jsResolver }
   // Order matters: normalizeTarget keeps the first spelling it sees.
-  const modules = buildModuleGraph(context, includeResolver, python)
+  const modules = buildModuleGraph(context, includeResolver, projects)
   const pageGraph = buildPageGraph(context, modules)
   const electron = buildElectronIndex(context, decls, pageGraph)
   const ffi = indexFfi(entries)

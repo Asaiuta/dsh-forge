@@ -75,6 +75,14 @@ type Resolution =
 - 搜索顺序：扫描根 → 具名映射 → 声明根（certain）→ 约定根（candidate：`src/<pkg>/__init__.py`、无显式配置的嵌套工程目录）；同层多根命中记 `ambiguous_target`。
 - 作为 `ProjectContext` 接入缓存；内容哈希进签名，改 pyproject 即失效。
 - 测试：`tests/run-trace-python-project.mjs`。
+
+**P3.2 状态（已完成）**：
+- `rust-project.ts`：读取各 `Cargo.toml` 的 `[package] name`、`[lib] name/path`、`[[bin|test|example|bench]] path`，以及 `dependencies` / `dev-` / `build-` / `target.*` 中的 path 依赖（含 `workspace = true` 经 `[workspace.dependencies]`）。
+- 代码中的依赖名取依赖 crate 的 lib 名；用 `package = "…"` 重命名时取表键。
+- `use dep::…`：本地模块优先，其后进入依赖 crate 的 mod 树（candidate）；bin/tests/examples/benches 隐式可见本包 lib；注册表依赖保持 external；依赖中找不到路径记 `missing_target`。
+- 声明的 target path 成为 crate 根（此前只认约定文件名）。
+- `metadata-reader.ts`：Python 与 Cargo 共用的有界元数据读取 + 签名；`buildGraph` 末参数改为 `SourceProjects` 对象。
+- 测试：`tests/run-trace-cargo.mjs`。
 - 每项：`tests/run-trace-<lang>-project.mjs`、`eval-trace-real` 回归、与 `js-project` 一致的预算（2000 文件 / 8 MiB）。
 
 ## P4 远期（仅设计）
