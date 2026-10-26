@@ -83,6 +83,13 @@ type Resolution =
 - 声明的 target path 成为 crate 根（此前只认约定文件名）。
 - `metadata-reader.ts`：Python 与 Cargo 共用的有界元数据读取 + 签名；`buildGraph` 末参数改为 `SourceProjects` 对象。
 - 测试：`tests/run-trace-cargo.mjs`。
+
+**P3.3 状态（已完成）**：
+- `go-project.ts`：解析 `go.mod`（`module`、`replace`）与 `go.work`（`use`、`replace`），支持块语法、引号与注释；只采纳本地路径的 replace，版本替换仍为外部。
+- 解析规则：可见模块（本模块；工作区模式下为 go.work 的全部 use 模块）中模块路径最长前缀者提供包；replace 覆盖同名模块，go.work 的 replace 优先；不在 go.work 中的模块只用自己的 replace。
+- 无 go.work / replace 时行为与之前一致。`go.mod` 的 manifest 文件事实保留，仅供 `file:go.mod` 展示；解析数据来自工程上下文。
+- 未做：`vendor/` 目录。
+- 测试：`tests/run-trace-gowork.mjs`。
 - 每项：`tests/run-trace-<lang>-project.mjs`、`eval-trace-real` 回归、与 `js-project` 一致的预算（2000 文件 / 8 MiB）。
 
 ## P4 远期（仅设计）

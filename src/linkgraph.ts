@@ -21,6 +21,7 @@ import { indexFfi, type FfiMatch } from './trace-native.ts'
 import type { IncludeResolver } from './compile-commands.ts'
 import type { PythonRoots } from './python-project.ts'
 import type { RustCrates } from './rust-project.ts'
+import type { GoModules } from './go-project.ts'
 import { jsFile, relativeJs } from './js-resolution.ts'
 import type { EdgeEvidence, JsResolver, UnresolvedModule } from './trace-evidence.ts'
 export { traceImpact, tracePath, normalizeTraceFile, parseDependencyPath } from './trace-analysis.ts'
@@ -214,7 +215,7 @@ function preloadTarget(from: string, spec: string, isFile: (file: string) => boo
 }
 
 /** Project metadata for non-JavaScript resolution (absent when the workspace has none). */
-export interface SourceProjects { python?: PythonRoots; rust?: RustCrates }
+export interface SourceProjects { python?: PythonRoots; rust?: RustCrates; go?: GoModules }
 
 interface BuildContext {
   entries: Map<string, TraceFileFacts>
