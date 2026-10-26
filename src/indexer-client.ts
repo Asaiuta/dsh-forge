@@ -259,6 +259,9 @@ export async function indexerParseBatch(
 /** Languages whose Trace facts the sidecar extracts (rust_indexer/src/facts). */
 const TRACE_LANGS = new Set(['javascript', 'typescript', 'tsx', 'python', 'rust', 'c', 'cpp', 'go', 'java', 'lua'])
 const TRACE_CHUNK = 2000
+/** Directory listings are cached per request, so a chunk boundary re-lists the
+ *  directories it shares with the previous one: keep probe batches large. */
+const PROBE_CHUNK = 50_000
 
 /** Gate: `DSH_FORGE_TRACE_NATIVE=0|false|off` keeps Trace facts on the WASM path. */
 export function indexerTraceWanted(): boolean {
@@ -298,6 +301,83 @@ export async function indexerTraceFacts(paths: string[], signal?: AbortSignal): 
     })
   }
   return out
+}
+
+/** One identity stamp per path, the same three fields `fs.statSync` reports.
+ *
+ *  The warm path only needs `(mtimeMs, size, ctimeMs)` per file to decide
+ *  whether cached facts are still valid, and that is the dominant cost of a
+ *  repeat Trace query: thousands of serial `statSync` calls. The sidecar
+ *  answers them over the rayon pool in one round trip, and it reads the NTFS
+ *  *change* time (what Node calls `ctimeMs`) from `FILE_BASIC_INFO`, so values
+ *  are bit-identical to `statSync` rather than merely close.
+ *
+ *  A `null` entry means that path could not be stamped; the caller then runs
+ *  its own `statSync` for that file and keeps its original error message. A
+ *  `null` result means the sidecar is unavailable (no binary, older protocol),
+ *  so the caller takes the per-file path for the whole scan. */
+export async function indexerStatPaths(
+  paths: string[],
+  signal?: AbortSignal,
+): Promise<Array<{ mtimeMs: number; size: number; ctimeMs: number } | null> | null> {
+  if (paths.length === 0) return []
+  const out: Array<{ mtimeMs: number; size: number; ctimeMs: number } | null> = []
+  for (let start = 0; start < paths.length; start += TRACE_CHUNK) {
+    signal?.throwIfAborted()
+    const files = paths.slice(start, start + TRACE_CHUNK)
+    let reply: { stamps?: unknown }
+    try {
+      reply = (await request('statPaths', { files }, { signal })) as typeof reply
+    } catch {
+      signal?.throwIfAborted()
+      return null
+    }
+    const stamps = reply.stamps
+    if (!Array.isArray(stamps) || stamps.length !== files.length) return null
+    for (const item of stamps) {
+      const stamp = Array.isArray(item) && item.length === 3
+        && typeof item[0] === 'number' && typeof item[1] === 'number' && typeof item[2] === 'number'
+        ? { mtimeMs: item[0], size: item[1], ctimeMs: item[2] }
+        : null
+      out.push(stamp)
+    }
+  }
+  return out
+}
+
+/** Whether a cached graph is still valid, decided by the sidecar.
+ *
+ *  The warm path replays every resolution probe it recorded (`rel`, whether a
+ *  file was found, its identity) and checks it still sees the same file. That
+ *  is thousands of `readdir`/`stat`/`realpath` calls, and the ~800 directory
+ *  listings behind them are pure filesystem work with no JS state involved.
+ *
+ *  `null` means the sidecar is unavailable or answered an older protocol, so
+ *  the caller runs its own check. A `true`/`false` is final. */
+export async function indexerProbesUnchanged(
+  root: string,
+  probes: ReadonlyMap<string, { exists: boolean; identity: string | null }>,
+  signal?: AbortSignal,
+): Promise<boolean | null> {
+  const entries = [...probes]
+  if (entries.length === 0) return true
+  for (let start = 0; start < entries.length; start += PROBE_CHUNK) {
+    signal?.throwIfAborted()
+    const chunk = entries.slice(start, start + PROBE_CHUNK)
+    let reply: { unchanged?: unknown }
+    try {
+      reply = (await request('probesUnchanged', {
+        root,
+        probes: chunk.map(([rel, probe]) => [rel, probe.exists, probe.identity]),
+      }, { signal })) as typeof reply
+    } catch {
+      signal?.throwIfAborted()
+      return null
+    }
+    if (typeof reply.unchanged !== 'boolean') return null
+    if (!reply.unchanged) return false
+  }
+  return true
 }
 
 /** Inline script facts through the sidecar (partial parses included, as for

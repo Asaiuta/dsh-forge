@@ -22,7 +22,7 @@ import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } fr
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
 import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from './ast-pool.ts'
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
-import { indexerReady, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
+import { indexerProbesUnchanged, indexerReady, indexerStatPaths, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
 import { loadJsProject, projectMetadata } from './js-project.ts'
 import { loadPythonProject, pythonMetadata } from './python-project.ts'
@@ -186,11 +186,18 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
   let parseErrors = 0
   let partialFiles = 0
   const diagnostics: TraceDiagnostic[] = []
+  // One batched round trip replaces the per-file statSync loop, which dominates
+  // a repeat query. A stamp the sidecar cannot produce (missing path, unreadable
+  // directory) falls back to the local call so the `stat_failed` diagnostic
+  // keeps the same message as before. `indexerReady` is what makes
+  // `DSH_FORGE_INDEXER=0` mean "no sidecar at all", statistics included.
+  const sidecar = files.length > 0 && indexerTraceWanted() && await indexerReady({ signal })
+  const remote = sidecar ? await indexerStatPaths(files.map(file => file.abs), signal) : null
   for (let index = 0; index < files.length; index++) {
     const { abs, rel } = files[index]
     signal?.throwIfAborted()
     try {
-      const stat = statSync(abs)
+      const stat = remote?.[index] ?? statSync(abs)
       stamps.push([rel, stat.mtimeMs, stat.size, stat.ctimeMs])
       const cacheKey = JSON.stringify([rootIdentity, abs])
       const cached = FACTS_CACHE.get(cacheKey)
@@ -207,7 +214,7 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
   // Source files go to the native sidecar first. What it declines (size cap,
   // over-deep trees, an older binary) keeps the WASM path below.
   const parsed: Array<TraceFileOutcome | null> = missing.map(() => null)
-  const native = indexerTraceWanted() && missing.length > 0 && await indexerReady({ signal })
+  const native = sidecar && missing.length > 0
   if (native) {
     const indexes = missing.flatMap((item, index) => indexerTraceLang(item.file) ? [index] : [])
     const outcomes = await indexerTraceFacts(indexes.map(index => missing[index].file), signal)
@@ -367,7 +374,11 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
     && scan.walkErrors === 0 && !scan.truncated) {
     // Resolution may probe ignored/non-JS files or missing paths. Revalidate
     // those too, so adding an asset or an index file invalidates the graph.
-    if (probesUnchanged(root, cached.probes)) return cached.assembled
+    // The sidecar decides when it can: the listings behind it are its kind of
+    // work, and it reports "unavailable" (null) rather than guessing.
+    const native = indexerTraceWanted() && await indexerReady({ signal: options.signal })
+    const remote = native ? await indexerProbesUnchanged(root, cached.probes, options.signal) : null
+    if (remote ?? probesUnchanged(root, cached.probes)) return cached.assembled
   }
   const aliases = topLevelAliasNames([...scan.entries.values()].map((entry) => ({ facts: scriptFacts(entry) })))
   // Role globals recovered from `ROLE_GLOBALS.<role> = 'name'` const strings

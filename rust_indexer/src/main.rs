@@ -326,6 +326,325 @@ fn files_arg(req: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Per-file identity stamp the caller uses to decide whether cached facts are
+/// still valid: (mtime ms, size, change time ms), matching `fs.statSync`.
+///
+/// The change time is the point of doing this here. On Windows Node reports
+/// NTFS *change* time as `ctimeMs`, and no std API exposes it — a same-size
+/// edit with a restored mtime leaves mtime and size identical, so without it a
+/// stale entry would be reused. Reading it costs one extra handle query per
+/// file, which is still far cheaper than the serial `statSync` loop it
+/// replaces: the work is spread over the rayon pool.
+mod stamp {
+    #[cfg(windows)]
+    mod imp {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        type Handle = *mut c_void;
+        const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const SHARE_ALL: u32 = 0x0000_0007;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_BASIC_INFO: u32 = 0;
+        const FILE_STANDARD_INFO: u32 = 1;
+        /// 1601-01-01 -> 1970-01-01 in 100 ns ticks.
+        const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct BasicInfo { creation: i64, access: i64, write: i64, change: i64, attributes: u32 }
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct StandardInfo { allocation: i64, eof: i64, links: u32, delete_pending: u8, directory: u8 }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *mut c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
+            fn GetFileInformationByHandleEx(handle: Handle, class: u32, info: *mut c_void, len: u32) -> i32;
+            fn CloseHandle(handle: Handle) -> i32;
+        }
+
+        /// Same value Node reports as `mtimeMs`/`ctimeMs`: the millisecond
+        /// fraction is computed as `sec * 1000 + nsec / 1e6` on the integer
+        /// nanosecond split, not as `ticks / 10_000`. The two differ in the
+        /// last bit for ~40% of files, which would make every cache entry look
+        /// stale.
+        fn ticks_to_ms(ticks: i64) -> f64 {
+            let ns = (ticks as i128 - EPOCH_DIFF_100NS as i128) * 100;
+            (ns / 1_000_000_000) as f64 * 1000.0 + (ns % 1_000_000_000) as f64 / 1e6
+        }
+
+        pub fn of(path: &str) -> Result<(f64, u64, f64), String> {
+            // Node's `statSync` opens the extended-length form itself, so a
+            // path over MAX_PATH still stats there. Without the `\\?\` prefix
+            // CreateFileW fails and this stamp would silently fall back to the
+            // slow per-file path for every deep file.
+            let name: std::borrow::Cow<'_, str> = if path.len() > 240 && !path.starts_with(r"\\") {
+                std::borrow::Cow::Owned(format!(r"\\?\{path}"))
+            } else {
+                std::borrow::Cow::Borrowed(path)
+            };
+            let mut wide: Vec<u16> = std::ffi::OsStr::new(name.as_ref()).encode_wide().collect();
+            wide.push(0);
+            unsafe {
+                let handle = CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES, SHARE_ALL, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut());
+                if handle == INVALID_HANDLE_VALUE {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                let mut basic = BasicInfo::default();
+                let mut standard = StandardInfo::default();
+                let basic_ok = GetFileInformationByHandleEx(handle, FILE_BASIC_INFO, &mut basic as *mut _ as *mut c_void, std::mem::size_of::<BasicInfo>() as u32);
+                let size_ok = GetFileInformationByHandleEx(handle, FILE_STANDARD_INFO, &mut standard as *mut _ as *mut c_void, std::mem::size_of::<StandardInfo>() as u32);
+                let error = std::io::Error::last_os_error();
+                CloseHandle(handle);
+                if basic_ok == 0 || size_ok == 0 {
+                    return Err(error.to_string());
+                }
+                Ok((ticks_to_ms(basic.write), standard.eof.max(0) as u64, ticks_to_ms(basic.change)))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod imp {
+        use std::os::unix::fs::MetadataExt;
+
+        pub fn of(path: &str) -> Result<(f64, u64, f64), String> {
+            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+            let mtime = meta.mtime() as f64 * 1000.0 + meta.mtime_nsec() as f64 / 1e6;
+            let ctime = meta.ctime() as f64 * 1000.0 + meta.ctime_nsec() as f64 / 1e6;
+            Ok((mtime, meta.len(), ctime))
+        }
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    mod imp {
+        pub fn of(path: &str) -> Result<(f64, u64, f64), String> {
+            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+            let millis = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            Ok((millis, meta.len(), millis))
+        }
+    }
+
+    pub fn of(path: &str) -> Result<(f64, u64, f64), String> {
+        imp::of(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph-cache validation (warm Trace path)
+// ---------------------------------------------------------------------------
+
+const P_FILE: u8 = 1;
+const P_DIR: u8 = 2;
+const P_SYMLINK: u8 = 3;
+const P_OTHER: u8 = 4;
+
+#[derive(Default)]
+struct ProbeListing {
+    entries: HashMap<String, u8>,
+    folded: std::collections::HashSet<String>,
+    /// `None` = never asked; `Some(None)` = the real path could not be read.
+    real: Option<Option<String>>,
+    /// The directory exists but could not be listed: take the exact check.
+    unreadable: bool,
+    /// Known to hold nothing (`ENOENT`), or known not to be a directory.
+    empty: bool,
+}
+
+#[derive(Default)]
+struct ProbeStats {
+    probes: usize,
+    reads: usize,
+    reals: usize,
+    exact: usize,
+    mismatches: usize,
+}
+
+/// `\\?\D:\x` -> `D:\x`, `\\?\UNC\s\v` -> `\\s\v`: the form Node reports from
+/// `fs.realpathSync.native`, so identity strings compare byte for byte.
+fn strip_verbatim(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    path.to_string()
+}
+
+fn probe_parent(dir: &str) -> Option<&str> {
+    let index = dir.rfind('\\')?;
+    if index < 3 {
+        return None;
+    }
+    Some(&dir[..index])
+}
+
+fn probe_split(path: &str) -> Option<(&str, &str)> {
+    let index = path.rfind('\\')?;
+    Some((&path[..index], &path[index + 1..]))
+}
+
+fn probe_join(root: &str, rel: &str) -> String {
+    let mut out = String::with_capacity(root.len() + rel.len() + 1);
+    out.push_str(root);
+    for part in rel.split('/') {
+        out.push('\\');
+        out.push_str(part);
+    }
+    out
+}
+
+/// The exact per-probe check: a file (links followed) with this real path.
+fn probe_matches(absolute: &str, expected_exists: bool, identity: &Option<String>) -> bool {
+    match std::fs::metadata(absolute) {
+        Ok(meta) => {
+            let exists = meta.is_file();
+            if exists != expected_exists {
+                return false;
+            }
+            if !exists {
+                return true;
+            }
+            match std::fs::canonicalize(absolute) {
+                Ok(real) => Some(strip_verbatim(&real.to_string_lossy())) == *identity,
+                Err(_) => false,
+            }
+        }
+        Err(_) => !expected_exists,
+    }
+}
+
+fn ensure_listing(cache: &mut HashMap<String, ProbeListing>, dir: &str, root_prefix: &str, reads: &mut usize) {
+    if cache.contains_key(dir) {
+        return;
+    }
+    let mut value = ProbeListing::default();
+    let parent = if dir.starts_with(root_prefix) { probe_parent(dir) } else { None };
+    if let Some(parent) = parent {
+        ensure_listing(cache, parent, root_prefix, reads);
+        let listed = &cache[parent];
+        if !listed.unreadable {
+            let base = dir.rsplit('\\').next().unwrap_or("");
+            match listed.entries.get(base).copied() {
+                // Not present at all, case-insensitively either: the directory
+                // cannot exist, so its probes are answered without a readdir.
+                None => {
+                    if !listed.folded.contains(&base.to_lowercase()) {
+                        value.empty = true;
+                    }
+                }
+                // A plain file or a link that is not a directory cannot hold
+                // entries; a link may still resolve to one.
+                Some(kind) => {
+                    if kind == P_FILE || kind == P_OTHER {
+                        value.empty = true;
+                    }
+                }
+            }
+        }
+    }
+    if !value.empty {
+        *reads += 1;
+        match std::fs::read_dir(dir) {
+            Ok(iter) => {
+                for entry in iter.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let kind = match entry.file_type() {
+                        Ok(file_type) if file_type.is_symlink() => P_SYMLINK,
+                        Ok(file_type) if file_type.is_dir() => P_DIR,
+                        Ok(file_type) if file_type.is_file() => P_FILE,
+                        _ => P_OTHER,
+                    };
+                    value.folded.insert(name.to_lowercase());
+                    value.entries.insert(name, kind);
+                }
+            }
+            Err(error) => {
+                // A missing directory holds no files; anything else (permission
+                // denied, a device) has to be checked probe by probe.
+                let not_a_dir = error.raw_os_error() == Some(267) || error.raw_os_error() == Some(20);
+                if error.kind() == std::io::ErrorKind::NotFound || not_a_dir {
+                    value.empty = true;
+                } else {
+                    value.unreadable = true;
+                }
+            }
+        }
+    }
+    cache.insert(dir.to_string(), value);
+}
+
+/// Whether every resolution probe still sees the same file. Mirrors
+/// `probesUnchanged` in src/tools-trace.ts, including its two-step strategy:
+/// most probes are guessed `extension`/`index` candidates that do not exist, so
+/// each parent directory is listed once and a directory the parent listing does
+/// not contain is answered from the parent. Links, case-only matches and
+/// unreadable directories fall back to the exact per-probe check.
+fn probes_unchanged(root: &str, probes: &[(String, bool, Option<String>)]) -> (bool, ProbeStats) {
+    let mut stats = ProbeStats { probes: probes.len(), ..ProbeStats::default() };
+    let root_prefix = if root.ends_with('\\') { root.to_string() } else { format!("{root}\\") };
+    let mut cache: HashMap<String, ProbeListing> = HashMap::new();
+    for (rel, expected_exists, identity) in probes {
+        let absolute = probe_join(root, rel);
+        let Some((dir, name)) = probe_split(&absolute) else { return (false, stats) };
+        ensure_listing(&mut cache, dir, &root_prefix, &mut stats.reads);
+        let listed = cache.get_mut(dir).expect("listing inserted above");
+        let kind = listed.entries.get(name).copied();
+        let exact = if listed.unreadable {
+            true
+        } else {
+            match kind {
+                Some(kind) => kind != P_FILE && kind != P_DIR,
+                // Absent, but the directory has this name in another case: on a
+                // case-insensitive volume it may still be the same file.
+                None => listed.folded.contains(&name.to_lowercase()),
+            }
+        };
+        if exact {
+            stats.exact += 1;
+            if !probe_matches(&absolute, *expected_exists, identity) {
+                return (false, stats);
+            }
+            continue;
+        }
+        let exists = kind == Some(P_FILE);
+        if exists != *expected_exists {
+            return (false, stats);
+        }
+        if !exists {
+            continue;
+        }
+        if listed.real.is_none() {
+            stats.reals += 1;
+            listed.real = Some(std::fs::canonicalize(dir).ok().map(|p| strip_verbatim(&p.to_string_lossy())));
+        }
+        let Some(real) = listed.real.as_ref().and_then(|v| v.as_ref()) else {
+            stats.exact += 1;
+            if !probe_matches(&absolute, *expected_exists, identity) {
+                return (false, stats);
+            }
+            continue;
+        };
+        // `path.join(dir, name)` never doubles a separator, and a drive root
+        // canonicalizes to `D:\`.
+        let joined = if real.ends_with('\\') { format!("{real}{name}") } else { format!("{real}\\{name}") };
+        if Some(&joined) != identity.as_ref() {
+            stats.mismatches += 1;
+            return (false, stats);
+        }
+    }
+    (true, stats)
+}
+
 /// Mirrors `IGNORE_DIRS` + gitignore handling in src/tools-symbol.ts: hidden
 /// entries are NOT skipped (readdirSync includes them), only `.gitignore` files
 /// (not `.ignore`/global/exclude/parent) are honoured, and the fixed ignore
@@ -444,6 +763,56 @@ fn main() {
                     Some((facts, partial)) => serde_json::json!({ "id": id, "ok": true, "facts": facts, "partial": partial }),
                     None => serde_json::json!({ "id": id, "ok": false, "error": "native extraction declined" }),
                 }
+            }
+            // Batched identity stamps for the caller's warm-path cache check.
+            // Null marks a file this process could not stamp; `errors` carries
+            // the reason per index so the caller keeps its `stat_failed`
+            // diagnostic instead of a generic message.
+            "statPaths" => {
+                let files = files_arg(&req);
+                let results: Vec<Result<(f64, u64, f64), String>> =
+                    files.par_iter().map(|file| stamp::of(file)).collect();
+                let mut errors = serde_json::Map::new();
+                let stamps: Vec<serde_json::Value> = results
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, result)| match result {
+                        Ok((mtime, size, ctime)) => serde_json::json!([mtime, size, ctime]),
+                        Err(error) => {
+                            errors.insert(index.to_string(), serde_json::Value::String(error));
+                            serde_json::Value::Null
+                        }
+                    })
+                    .collect();
+                serde_json::json!({ "id": id, "ok": true, "stamps": stamps, "errors": errors })
+            }
+            // Whether the cached graph is still valid: same protocol as
+            // `probesUnchanged` in the caller, but the ~800 directory listings
+            // it needs are answered here instead of in the JS thread.
+            "probesUnchanged" => {
+                let root = req.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let probes: Vec<(String, bool, Option<String>)> = req
+                    .get("probes")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                let fields = item.as_array()?;
+                                let rel = fields.first()?.as_str()?.to_string();
+                                let exists = fields.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+                                let identity = fields.get(2).and_then(|v| v.as_str()).map(String::from);
+                                Some((rel, exists, identity))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (unchanged, stats) = probes_unchanged(root, &probes);
+                serde_json::json!({
+                    "id": id, "ok": true, "unchanged": unchanged,
+                    "probes": stats.probes, "reads": stats.reads,
+                    "reals": stats.reals, "exact": stats.exact, "mismatches": stats.mismatches
+                })
             }
             "ping" => serde_json::json!({ "id": id, "ok": true }),
             "resetCache" => {
