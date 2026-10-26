@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `packageManager` in package.json pins the exact pnpm version; corepack
+      # ships with Node and downloads it, so no third-party setup action.
+      - run: corepack enable
+
+      # `prepare` runs build.mjs, so this also proves the bundle builds from a
+      # clean checkout with no rust toolchain and no machine-local .env.
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run typecheck
+
+      # The integration suites are intentionally not wired in yet. 49 of their
+      # assertions branch on win32/posix paths, and none of them has been run on
+      # Linux, so a red matrix here would say nothing about the code. Probe with
+      # `pnpm test` on a Linux box first, then add the suites group by group.

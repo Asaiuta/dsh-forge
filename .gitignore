@@ -40,3 +40,7 @@ Thumbs.db
 .pnpm-store/
 tests/.host-fixture-*/
 tests/.findroot-fixture/
+
+# Agent workspace: session notes, machine-local paths and per-task scratch kept
+# by the assistant alongside the checkout. Never part of the project.
+/.workbuddy/

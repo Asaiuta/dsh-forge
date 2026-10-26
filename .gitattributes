@@ -1,0 +1,26 @@
+# Normalize text to LF in the repository, regardless of the contributor's
+# core.autocrlf. Without this, the same .ts file committed from Windows and from
+# Linux differs by every byte of every line ending.
+* text=auto eol=lf
+
+*.ts text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.wasm binary
+
+# The lockfile is generated; keep it out of review diffs and GitHub's language
+# stats.
+pnpm-lock.yaml -diff linguist-generated
+Cargo.lock -diff linguist-generated

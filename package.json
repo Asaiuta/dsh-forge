@@ -68,5 +68,26 @@
     "esbuild": "^0.25.0",
     "typescript": "^5.9.0"
   },
-  "author": "Asaiuta <asaiuta@users.noreply.github.com>"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asaiuta/dsh-forge.git"
+  },
+  "homepage": "https://github.com/Asaiuta/dsh-forge#readme",
+  "bugs": {
+    "url": "https://github.com/Asaiuta/dsh-forge/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "code-search",
+    "fuzzy-find",
+    "grep",
+    "tree-sitter",
+    "ast",
+    "code-editing",
+    "ai-agent"
+  ],
+  "packageManager": "pnpm@11.21.0",
+  "author": "Asaiuta <36721683+Asaiuta@users.noreply.github.com>"
 }
