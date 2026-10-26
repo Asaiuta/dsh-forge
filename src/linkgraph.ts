@@ -89,6 +89,8 @@ export interface TraceGraph {
   bridgeRefs: Map<string, BridgeItem[]>
   /** Bridge references grouped by resolved window object — no decls table needed. */
   bridgeByObject: Map<string, BridgeItem[]>
+  /** Alias-resolved bridge references per file (HTML entries carry inline scripts). */
+  bridgeByFile: Map<string, BridgeItem[]>
   unknownBridge: BridgeItem[]
   gdefs: Map<string, DefItem[]>
   guses: Map<string, UseItem[]>
@@ -395,6 +397,7 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
   for (const api of apis) if (api.channel) push(apisByChannel, api.channel, api)
   const bridgeRefs = new Map<string, BridgeItem[]>()
   const bridgeByObject = new Map<string, BridgeItem[]>()
+  const bridgeByFile = new Map<string, BridgeItem[]>()
   const unknownBridge: BridgeItem[] = []
   const gdefs = new Map<string, DefItem[]>()
   const guses = new Map<string, UseItem[]>()
@@ -500,6 +503,7 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
       const resolved = resolveAliasRef(rel, raw)
       if (!resolved) continue
       push(bridgeByObject, resolved.object, resolved)
+      push(bridgeByFile, rel, resolved)
       if (apisByName.has(resolved.name)) push(bridgeRefs, resolved.name, resolved)
       else if (decls.status === 'ok') unknownBridge.push(resolved)
     }
@@ -516,7 +520,7 @@ export function buildGraph(root: string, entries: Map<string, TraceFileFacts>, d
   return {
     root, files: entries, deps, rdeps, unresolvedModules, pages, membership, classic,
     registers, pushes, directCalls, dynamic, apisByName, apisByChannel, namedEntries, roleGlobals, roleByGlobal,
-    bridgeRefs, bridgeByObject, unknownBridge, gdefs, guses, decls, ...(ffi.size ? { ffi } : {}), ...(resolutionLimited ? { resolutionLimited: true } : {}),
+    bridgeRefs, bridgeByObject, bridgeByFile, unknownBridge, gdefs, guses, decls, ...(ffi.size ? { ffi } : {}), ...(resolutionLimited ? { resolutionLimited: true } : {}),
     stats: { withFacts: entries.size, pages: pages.size },
   }
 }
@@ -742,13 +746,11 @@ export function tracePage(g: TraceGraph, q: string): { found: boolean; text: str
   injected.sort((a, b) => (a.pos ?? 0) - (b.pos ?? 0) || a.name.localeCompare(b.name))
   const bridgeUsed = new Map<string, string[]>()
   const unknown: BridgeItem[] = []
+  // Same alias-resolved references as ipc:/exposes:, including inline scripts.
   for (const rel of memberSet) {
-    const f = g.files.get(rel)
-    if (f?.kind !== 'js') continue
-    for (const b of f.bridge) {
-      const api = g.apisByName.get(b.name)
-      if (!api) {
-        if (g.decls.status === 'ok') unknown.push({ ...b, path: rel })
+    for (const b of g.bridgeByFile.get(rel) ?? []) {
+      if (!g.apisByName.has(b.name) && g.decls.status === 'ok') {
+        unknown.push(b)
         continue
       }
       push(bridgeUsed, b.object, b.name)
@@ -914,7 +916,7 @@ function traceExposes(g: TraceGraph, value: string): AnalysisResult {
   for (const item of selected) push(groups, item.path, item)
   const lines = [
     `## Trace exposes:${filter}`,
-    `- 共 ${selected.length} 处 · ${groups.size} 个文件 · 键用法按成员聚合；路径:行 可回填 ffread / ffedit。`,
+    `- 共 ${selected.length} 处 · ${groups.size} 个文件 · 键用法按成员聚合；键和引用点仅反映静态可见结果，动态属性名或运行时构造可能未覆盖。路径:行 可回填 ffread / ffedit。`,
   ]
   for (const [file, items] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
     lines.push(`### \`${file}\``)
