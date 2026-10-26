@@ -263,7 +263,7 @@ modify file content / create file in subdirectory                               
 
 ### 工程上下文加载：27–34 ms，不是 70–90 ms
 
-`contexts` 这一段是 `loadJsProject` / `loadPythonProject` / `loadRustProject` / `loadGoProject` / `loadCompilationDatabase`，热态只读几个元数据文件，不碰代码。此前记的 70–90 ms 应是冷态或受干扰的数字；热态占一次查询的 13–23%，冷 rebuild 上是 62–98 ms。
+`contexts` 这一段是 `loadJsProject` / `loadPythonProject` / `loadRustProject` / `loadGoProject` / `loadCompilationDatabase`，热态只读几个元数据文件，不碰代码。此前记的 70–90 ms 应是冷态或受干扰的数字；热态占一次查询的 13–23%，冷 rebuild 上是 62–98 ms。本节这一行是按功能块量的；拆细之后 `jsProj` 与 `rustProj` 分开看合计 54 ms，见《第四轮》。
 
 ### 图构建：热查询上是 0
 
@@ -278,14 +278,78 @@ modify file content / create file in subdirectory                               
 
 冷路径的第一大项是事实提取，第二大就是图构建。下推它的收益面最大，代价也最大：`buildGraph` 是纯内存图算法加解析器组合，输入是全部文件的 facts、声明表与五种工程上下文，输出是节点、边、注册表与 bridge 过滤结果；复刻它等于把 `linkgraph` 和五个 resolver 一起搬进 Rust，出错面比前三项加起来还大得多。不建议动。
 
-### 下一步
+## 第四轮：热查询剩下的那些钱（同日实测）
 
-热查询剩下的两块，都不再是「搬到 Rust」：
+第二轮的分段表是按功能块分的（walk / statBatch / contexts / ready）。这一轮把它拆细，并且先拆清楚再去动，结论是原来的两笔账都不对。
 
-1. **两次 IPC 往返**（`statBatch` + `ready`）合计 95 ms。第一刀是把 stat 与探针校验合成一次请求，省一次往返；第二刀是「只传根与缓存代次、探针留在 sidecar 里」，能把 `ready` 那 54 ms 压到个位数——代价是 sidecar 要跨请求记住图缓存，多一层失效面。
-2. **遍历之后剩下的 50 ms 里，12 ms 是纯 JS**：`abs` 拼接 8.4 ms、`localeCompare` 排序 2.0 ms。排序有理由留着（`localeCompare` 在 Rust 里没有字节序等价物，而顺序是扫描签名的一部分）；`path.join` 那 8.4 ms 是纯粹的实现选择，按分隔符做字符串拼接能省掉它的大部分，且不影响语义。
+### 拆细之后（VCPToolBox 2,862 个候选，6 次热调用中位数）
 
-顺带一句关于 `ready` 那 54 ms 的形态：请求体是 15,291 条探针（约 1 MB JSON），返回体只有几个计数。这一项没有拆开量过——序列化占多少、Rust 侧列举占多少还没分开，动手前要先拆。
+| 阶段 | 拆细前 | 拆细后 | 说明 |
+|---|---:|---:|---|
+| 目录遍历 sidecar 请求 | 102（含下面两行） | 44 | 并行 readdir |
+| `abs` 拼接 | — | 10 | 原来被算进 walk |
+| `localeCompare` 排序 | — | 2.6 | 顺序是签名的一部分，不动 |
+| 逐文件 stat | 41 | 39 | 已在 Rust 侧并行 |
+| 工程上下文 | 34 | 54 | 原来漏了 `jsProj` 与 `rustProj` 分开算 |
+| 图缓存探针检查 | 54 | 80 | 这是最大的一块 |
+| 其余（facts / 遍历判定 / 编译库） | 7 | 10 | |
+| 合计 | 238 | 240 | 总数没变，权重变了 |
+
+### 探针检查：不是「一趟 1 MB 的往返」
+
+原来的假设是「15,291 条探针约 1 MB JSON，往返本身贵」。逐项量下来不成立：
+
+| 量法 | 结果 |
+|---|---:|
+| JS 侧展开 Map + 转数组 + `JSON.stringify` | 6.1 ms（0.83 + 1.19 + 4.08） |
+| 一次空往返（`statPaths` 传空数组） | **约 0.05 ms** |
+| 8 条探针整趟 | 2.1 ms |
+| 15,291 条探针整趟 | 69.0 ms |
+
+**一趟 IPC 几乎不花钱。** 所以「把 stat 和探针校验合成一次请求」这件事从计划里划掉了——省下的是一次 0.05 ms 的往返。真正的大头是探针数量本身。
+
+再往下拆一层，用合成探针（同样 15,291 次迭代，全都不存在，所以循环一定跑完）：
+
+| 形态 | 耗时 |
+|---|---:|
+| 一条目录、短名字 | 15.4 ms |
+| 10 条目录、短名字 | 16.0 ms |
+| 300 条目录、短名字 | 17.8 ms |
+| **真实路径、真实目录** | **69.0 ms** |
+
+同样是 15,291 次循环，短路径 15 ms、真路径 69 ms。差别不在循环次数，也不在 readdir 次数（实测只有 280 次），而在**为这 280 个真实目录建列举表**：每个条目要往两个哈希表各插一次，其中一个是 `name.to_lowercase()` 新分配的字符串。
+
+### 改了什么，各值多少
+
+| 改动 | 位置 | 隔离实测 |
+|---|---|---:|
+| 探针的折叠索引从 `HashSet<String>` 改成 `HashSet<u64>`（`fold_hash`） | `rust_indexer/src/main.rs` | 69.0 → 35.4 ms |
+| 每个候选文件的 `abs` 不再走 `path.join` | `src/tools-trace.ts` | 10 → 0.95 ms |
+| 五个 `scan.entries` 遍历合并成一次 | `src/tools-trace.ts` | 3.8 → 2.5 ms |
+
+`fold_hash` 之所以安全：命中不了只会让探针走下面那条精确检查（`metadata` + `canonicalize`），那是保守答案，不可能把「变了」误判成「没变」。ASCII 就地折叠，非 ASCII 退回真正的 `to_lowercase()`，所以和 JS 的 `name.toLowerCase()` 在边缘情况上也一致（`str::to_lowercase` 与 `char::to_lowercase` 在词尾 sigma 上不同）。
+
+端到端（两个独立进程各 5 次中位数）：
+
+| 语料 | `DSH_FORGE_INDEXER=0` | sidecar | 上一轮同法测得 |
+|---|---:|---:|---:|
+| VCPToolBox | 528 ms | **169 ms** | 202 ms |
+| VCPChat | 201 ms | **113 ms** | 126 ms |
+| audio-engine-core | 28 ms | **19 ms** | 30 ms |
+| dsh-forge（142） | 27 ms | **22 ms** | 33 ms |
+
+「本地实现」一列在两次测量之间从 414 漂到 528 ms，测试机噪声太大，不能跨行比；sidecar 一列稳定。小仓库那一行这次也不再是负收益。
+
+顺带一个副产品：这轮补了一条常驻回归 `run-trace-cache` 的「依赖换个大小写回来也要失效」——它正好压在 `fold_hash` 上，把 `folded` 判定改成恒 false 后立刻变红。
+
+### 还剩什么
+
+现在 VCPToolBox 一次热查询 169 ms 的分法是：探针检查 35（隔离实测 35.4）、遍历 47、stat 40、工程上下文 28、其余 19。
+
+两块可以考虑，都不便宜：
+
+1. **工程上下文每次查询都重算，只为了比一次签名。** `scan.signature` 已经相同（所有候选的 `(mtime, size, ctime)` 与根身份都没变）时，py/rust/go 三个 context 的 `valid()` 都是 `() => true`，也就是说它们自己认为「签名就是全部检查」，而签名是从候选文件内容算出来的——那些文件的戳已经在 `scan.signature` 里了。把它们整块跳过能省约 15 ms。**缺口**：`loadPythonProject` 会列举目录来发现 namespace package，新建一个只含非候选文件的目录不会改任何戳，跳过就看不到了。要动必须先把「哪些输入不是候选文件」这件事列干净，`compile_commands.json` 与 preload 声明表就属于这一类（前者本来就在每次重算，1 ms）。
+2. **探针列举表（约 35 ms 里的 20 ms）。** 280 个目录每次都重新 readdir 再建两张表。按目录时间戳缓存列举结果能省掉，代价是跨请求状态和 15.6 ms 时钟窗口——和第三轮否掉目录缓存是同一个理由，只是这次赌注更小、收益也更小。
 
 ## 关于测量的两条（这一轮换来的）
 

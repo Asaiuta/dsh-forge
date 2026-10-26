@@ -151,9 +151,16 @@ export function collectCandidatesLocal(root: string, signal?: AbortSignal): { fi
 async function collectCandidates(root: string, signal?: AbortSignal): Promise<ReturnType<typeof collectCandidatesLocal>> {
   const remote = indexerTraceWanted() && await indexerReady({ signal }) ? await indexerCollectCandidates(root, signal) : null
   if (!remote) return collectCandidatesLocal(root, signal)
-  const files = remote.files
-    .map(rel => ({ abs: path.join(root, ...rel.split('/')), rel }))
-    .sort((a, b) => a.rel.localeCompare(b.rel))
+  // `path.join` per file costs 8-10 ms at this size: it splits both arguments,
+  // filters empty segments and re-joins. One `path.join(root, '.')` normalises
+  // the root exactly as the per-file call would have, and the walk only returns
+  // relative paths that use `/` and contain no `.` or `..` segment, so a
+  // separator swap reaches the same string.
+  const base = path.join(root, '.') + path.sep
+  const files = remote.files.map(rel => ({
+    abs: base + (path.sep === '/' ? rel : rel.replaceAll('/', path.sep)),
+    rel,
+  })).sort((a, b) => a.rel.localeCompare(b.rel))
   return {
     files,
     projectFiles: remote.projectFiles.sort(),
@@ -373,26 +380,34 @@ function probesUnchanged(root: string, probes: ReadonlyMap<string, GraphProbe>):
 async function assemble(root: string, key: string, options: TraceAssemblyOptions): Promise<AssembledTrace> {
   const decls = await loadPreloadDecls(root, options.declarations, options.signal)
   const scan = await scanFacts(root, options.signal, options.workers)
-  const hasNative = [...scan.entries.values()].some(entry => entry.kind === 'source' && (entry.lang === 'c' || entry.lang === 'cpp'))
-  const compilation = hasNative || options.compileCommands ? loadCompilationDatabase(root, options.compileCommands, options.signal) : undefined
-  const hasJs = [...scan.entries.values()].some(entry => entry.kind === 'js' || entry.kind === 'html' || entry.kind === 'component')
-  // Program membership expands through TS/JS file references only; HTML and
-  // component scripts never join a tsc program.
+  // One pass over the facts answers everything the five loaders need to be
+  // called or skipped. The JS file-reference map needed a pass of its own
+  // anyway, and the other four only ever asked one question each.
+  let hasNative = false, hasJs = false, hasRust = false, hasGo = false
+  const pythonSources: string[] = []
   const jsRefs = new Map<string, ReturnType<typeof jsReferences>>()
-  for (const [rel, entry] of scan.entries) if (entry.kind === 'js') {
-    const refs = jsReferences(entry)
-    if (refs.length) jsRefs.set(rel, refs)
+  for (const [rel, entry] of scan.entries) {
+    if (entry.kind === 'source') {
+      if (entry.lang === 'c' || entry.lang === 'cpp') hasNative = true
+      else if (entry.lang === 'python') pythonSources.push(rel)
+      else if (entry.lang === 'rust') hasRust = true
+      else if (entry.lang === 'go') hasGo = true
+    } else if (entry.kind === 'js') {
+      hasJs = true
+      // Program membership expands through TS/JS file references only; HTML and
+      // component scripts never join a tsc program.
+      const refs = jsReferences(entry)
+      if (refs.length) jsRefs.set(rel, refs)
+    } else if (entry.kind === 'html' || entry.kind === 'component') hasJs = true
   }
+  const compilation = hasNative || options.compileCommands ? loadCompilationDatabase(root, options.compileCommands, options.signal) : undefined
   const project = hasJs ? loadJsProject(root, scan.projectFiles, options.signal, new Set(scan.entries.keys()), jsRefs) : undefined
   const cached = GRAPH_CACHE.get(key)
   const declsKey = JSON.stringify(decls)
-  // Fixed slot order: a context that disappears (undefined) must not match one that existed.
-  const pythonSources = [...scan.entries].filter(([, entry]) => entry.kind === 'source' && entry.lang === 'python').map(([rel]) => rel)
   const python = pythonSources.length ? loadPythonProject(root, scan.pythonFiles, pythonSources, options.signal) : undefined
-  const hasRust = [...scan.entries.values()].some(entry => entry.kind === 'source' && entry.lang === 'rust')
   const rust = hasRust && scan.cargoFiles.length ? loadRustProject(root, scan.cargoFiles, options.signal) : undefined
-  const hasGo = [...scan.entries.values()].some(entry => entry.kind === 'source' && entry.lang === 'go')
   const go = hasGo && scan.goFiles.length ? loadGoProject(root, scan.goFiles, options.signal) : undefined
+  // Fixed slot order: a context that disappears (undefined) must not match one that existed.
   const contexts: Array<ProjectContext | undefined> = [compilation, project, python, rust, go]
   if (cached && cached.signature === scan.signature && cached.decls === declsKey
     && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
@@ -403,7 +418,9 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
     // work, and it reports "unavailable" (null) rather than guessing.
     const native = indexerTraceWanted() && await indexerReady({ signal: options.signal })
     const remote = native ? await indexerProbesUnchanged(root, cached.probes, options.signal) : null
-    if (remote ?? probesUnchanged(root, cached.probes)) return cached.assembled
+    if (remote ?? probesUnchanged(root, cached.probes)) {
+      return cached.assembled
+    }
   }
   const aliases = topLevelAliasNames([...scan.entries.values()].map((entry) => ({ facts: scriptFacts(entry) })))
   // Role globals recovered from `ROLE_GLOBALS.<role> = 'name'` const strings

@@ -451,7 +451,11 @@ const P_OTHER: u8 = 4;
 #[derive(Default)]
 struct ProbeListing {
     entries: HashMap<String, u8>,
-    folded: std::collections::HashSet<String>,
+    /// Hash of each name's lowercased form, not the string itself. A collision
+    /// only sends the probe down the exact check below, which is the
+    /// conservative answer, so this can never report "unchanged" wrongly. It
+    /// also removes the only per-entry allocation left in the listing.
+    folded: std::collections::HashSet<u64>,
     /// `None` = never asked; `Some(None)` = the real path could not be read.
     real: Option<Option<String>>,
     /// The directory exists but could not be listed: take the exact check.
@@ -524,6 +528,29 @@ fn probe_matches(absolute: &str, expected_exists: bool, identity: &Option<String
     }
 }
 
+/// Case-folded hash of a file name. Byte-identical in meaning to the
+/// `name.toLowerCase()` the JS side stores: ASCII is folded in place, anything
+/// else falls back to the allocating lowercase so the two agree on the edge
+/// cases (`str::to_lowercase` and `char::to_lowercase` differ on final sigma).
+fn fold_hash(name: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let bytes: Vec<u8>;
+    let source: &[u8] = if name.is_ascii() {
+        name.as_bytes()
+    } else {
+        bytes = name.to_lowercase().into_bytes();
+        &bytes
+    };
+    let mut hash = OFFSET;
+    for byte in source {
+        let value = if name.is_ascii() { byte.to_ascii_lowercase() } else { *byte };
+        hash ^= u64::from(value);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn ensure_listing(cache: &mut HashMap<String, ProbeListing>, dir: &str, root_prefix: &str, reads: &mut usize) {
     if cache.contains_key(dir) {
         return;
@@ -539,7 +566,7 @@ fn ensure_listing(cache: &mut HashMap<String, ProbeListing>, dir: &str, root_pre
                 // Not present at all, case-insensitively either: the directory
                 // cannot exist, so its probes are answered without a readdir.
                 None => {
-                    if !listed.folded.contains(&base.to_lowercase()) {
+                    if !listed.folded.contains(&fold_hash(base)) {
                         value.empty = true;
                     }
                 }
@@ -565,7 +592,7 @@ fn ensure_listing(cache: &mut HashMap<String, ProbeListing>, dir: &str, root_pre
                         Ok(file_type) if file_type.is_file() => P_FILE,
                         _ => P_OTHER,
                     };
-                    value.folded.insert(name.to_lowercase());
+                    value.folded.insert(fold_hash(&name));
                     value.entries.insert(name, kind);
                 }
             }
@@ -607,7 +634,7 @@ fn probes_unchanged(root: &str, probes: &[(String, bool, Option<String>)]) -> (b
                 Some(kind) => kind != P_FILE && kind != P_DIR,
                 // Absent, but the directory has this name in another case: on a
                 // case-insensitive volume it may still be the same file.
-                None => listed.folded.contains(&name.to_lowercase()),
+                None => listed.folded.contains(&fold_hash(name)),
             }
         };
         if exact {

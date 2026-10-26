@@ -30,6 +30,18 @@ try {
   assert.ok(!removedAsset.graph.deps.get('main.js').some(edge => edge.to === 'asset.json'))
   ok('warm graph reuse revalidates missing and non-source dependency probes')
 
+  // The same dependency coming back under a different case. `scan.signature`
+  // cannot see it (a `.json` is not a candidate, so no stamp changed), and an
+  // exact-name listing lookup misses because the directory holds `Asset.json`
+  // while the probe remembers `asset.json`. Only the case-folded index can
+  // notice, and it may only answer "check exactly" — never "still absent".
+  write('Asset.json', '{}')
+  const recased = await assembleTraceGraph(root)
+  assert.notEqual(recased.graph, removedAsset.graph, 'a case-only dependency must not be reused')
+  assert.ok(recased.graph.deps.get('main.js').some(edge => edge.to.toLowerCase() === 'asset.json'))
+  fs.unlinkSync(path.join(root, 'Asset.json'))
+  ok('a dependency that returns under another case invalidates the graph')
+
   const stat = fs.statSync(path.join(root, 'main.js'))
   write('main.js', "ipcMain.handle('cache:two', () => {}); require('./asset.json')\n")
   fs.utimesSync(path.join(root, 'main.js'), stat.atime, stat.mtime)
