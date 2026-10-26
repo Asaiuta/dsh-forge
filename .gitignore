@@ -44,3 +44,7 @@ tests/.findroot-fixture/
 # Agent workspace: session notes, machine-local paths and per-task scratch kept
 # by the assistant alongside the checkout. Never part of the project.
 /.workbuddy/
+
+# Adoption experiments: prompt sets, per-session tool-call attribution and sample
+# counts. Internal measurement notes, not project documentation.
+/docs/p0-adoption-*
