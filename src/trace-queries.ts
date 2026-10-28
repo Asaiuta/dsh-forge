@@ -163,18 +163,26 @@ export function traceGlobal(g: TraceGraph, name: string): { found: boolean; text
       text: `## Trace global:${clean}\n- 未找到 \`window.${clean}\` 的定义或使用。${near.length ? `\n- 相近的：${near.map((n) => `\`${n}\``).join('、')}` : ''}`,
     }
   }
-  const warnings: string[] = []
+  // The per-page table already says which script defines the global on each
+  // page ("定义于第 — 个脚本"), so a second ⚠️ line repeating "this page used it
+  // but loaded no definer" would restate the same rows for a real repo: on
+  // VCPChat, 25 pages appeared in both sections, 54% of the whole reply. The
+  // miss is marked inline instead. Only the ordering hazard stays a separate
+  // row — that fact exists nowhere else.
+  const ordering: string[] = []
   const pageSet = new Set([...defs, ...uses].flatMap((x) => pagesOf(g, x.path)))
   const perPage: string[] = []
   for (const page of [...pageSet].sort()) {
     const defPos = defs.map((d) => positionIn(g, page, d)).filter((v): v is number => v !== null)
     const usePos = uses.map((u) => ({ u, pos: positionIn(g, page, u) })).filter((x): x is { u: UseItem; pos: number } => x.pos !== null)
     const first = defPos.length ? Math.min(...defPos) : null
-    perPage.push(`- \`${page}\`：定义于第 ${first ?? '—'} 个脚本 · 本页使用 ${usePos.length} 处`)
-    if (usePos.length && first === null && defs.length) warnings.push(`⚠️ \`${page}\` 使用了 \`${clean}\`，但本页未加载任何定义它的脚本`)
+    // A page that uses the global but loads no definer is a real defect, so it
+    // is marked in place rather than dropped.
+    const miss = usePos.length > 0 && first === null && defs.length > 0
+    perPage.push(`- \`${page}\`：定义于第 ${first ?? '—'} 个脚本 · 本页使用 ${usePos.length} 处${miss ? ' · ⚠️ 本页未加载定义脚本' : ''}`)
     for (const { u, pos } of usePos) {
       if (first !== null && pos < first) {
-        warnings.push(`⚠️ \`${page}\`：${loc(u)} 所在脚本（第 ${pos} 个）早于定义脚本（第 ${first} 个）加载；若在顶层同步执行会取到 undefined`)
+        ordering.push(`- \`${page}\`：${loc(u)} 所在脚本（第 ${pos} 个）早于定义脚本（第 ${first} 个）加载；顶层同步执行会取到 undefined`)
       }
     }
   }
@@ -185,7 +193,7 @@ export function traceGlobal(g: TraceGraph, name: string): { found: boolean; text
     `### 使用 \`window.${clean}\`（${uses.length}，只统计显式 window./globalThis. 访问）`,
     capped(uses.map((u) => `- ${loc(u)}${pageSuffix(g, u.path)}`)),
     perPage.length ? `### 按页面\n${perPage.join('\n')}` : '',
-    warnings.length ? `### 检查\n${capped(warnings)}` : '',
+    ordering.length ? `### ⚠️ 加载顺序风险（${ordering.length}）\n${capped(ordering)}` : '',
     !defs.length ? '- ⚠️ 未找到定义（可能由第三方库、非 window.X 写法或 module 脚本定义）' : '',
   ].filter(Boolean).join('\n')
   return { found: true, text }
@@ -240,6 +248,23 @@ export function tracePage(g: TraceGraph, q: string): { found: boolean; text: str
     if (def) injected.push({ name, path: def.path, line: def.line, pos: positionIn(g, page, def) })
   }
   injected.sort((a, b) => (a.pos ?? 0) - (b.pos ?? 0) || a.name.localeCompare(b.name))
+  // Group by the script that injects them, and name that script once. Printing
+  // "第 N 个脚本 · <path>:<line>" per global repeats one path as many times as
+  // there are globals: an inline script with 18 globals spent 810 of its view's
+  // 1467 chars restating a single file.
+  const injectedGroups = new Map<string, typeof injected>()
+  for (const item of injected) {
+    const key = `${item.pos ?? '?'}|${item.path}`
+    const bucket = injectedGroups.get(key)
+    if (bucket) bucket.push(item)
+    else injectedGroups.set(key, [item])
+  }
+  const injectedRows = [...injectedGroups].flatMap(([key, items]) => {
+    const [pos] = key.split('|')
+    // One script on the page: "第 1 个脚本" says nothing the heading does not.
+    const where = injectedGroups.size === 1 ? '' : ` · 第 ${pos === '?' ? '?' : pos} 个脚本`
+    return [`- \`${items[0].path}\`${where}（${items.length}）`, ...items.map((x) => `  - \`${x.name}\` L${x.line}`)]
+  })
   const bridgeUsed = new Map<string, string[]>()
   const unknown: BridgeItem[] = []
   // Same alias-resolved references as ipc:/exposes:, including inline scripts.
@@ -258,7 +283,7 @@ export function tracePage(g: TraceGraph, q: string): { found: boolean; text: str
     rows.join('\n') || '- 无',
     `- 页面共加载 ${members.length} 个本地文件（含 require/import 闭包）。`,
     `### 页面内注入的全局（${injected.length}，按加载位置）`,
-    capped(injected.map((x) => `- \`${x.name}\` · 第 ${x.pos ?? '?'} 个脚本 · ${loc(x)}`), 60),
+    capped(injectedRows, 60),
     `### preload 桥接使用`,
     [...bridgeUsed].map(([obj, names]) => `- \`${obj}\`：${new Set(names).size} 个 API（${names.length} 处调用）`).join('\n') || '- 无',
     unknown.length ? `### ⚠️ 调用了声明表中不存在的 API（${unknown.length}）\n${capped(unknown.map((u) => `- ${loc(u)} · \`${u.object}.${u.name}\``))}` : '',
@@ -322,32 +347,93 @@ export function traceFile(g: TraceGraph, rel: string, edgeMode: EdgeMode = 'all'
   const globals = f.kind === 'js'
     ? f.globalsDefined.filter((d) => d.how === 'window' || g.classic.has(rel))
     : []
+  /** The `<header>（n）` + body pair, or nothing when the section is empty.
+   *
+   *  A section that is empty by construction — a TypeScript file cannot register
+   *  an ipcMain handler, a main-process file is not loaded by a page — prints a
+   *  header and "- 无" that say only "this cannot be here". On a preload view
+   *  that was four such pairs of pure noise. The count is folded into the
+   *  section list line instead, so a reader still sees the zero.
+   */
+  const section = (heading: string, count: number, body: string): string => count > 0 ? `### ${heading}（${count}）\n${body}` : ''
+  const zeroBits: string[] = []
+  const zeroCount = (label: string, count: number): void => { if (count === 0) zeroBits.push(label) }
+  zeroCount('被页面加载', members.length)
+  zeroCount('依赖', rawDeps.length)
+  zeroCount('被依赖', rawRdeps.length)
+  zeroCount('未解析导入', unresolved.length)
+  zeroCount('IPC 注册', ipc.filter((i) => i.side === 'register').length)
+  zeroCount('IPC 调用', ipc.filter((i) => i.side !== 'register').length)
+  zeroCount('桥接调用', bridge.length)
+  zeroCount('全局定义', globals.length)
+  zeroCount('全局使用', f.kind === 'js' ? f.globalsUsed.length : 0)
   const text = [
     `## Trace file:${rel}`,
-    `### 被页面加载（${members.length}）`,
-    members.join('\n') || '- 无（主进程文件、preload 或未被任何页面引用）',
-    `### 依赖（${rawDeps.length}） / 被依赖（${rawRdeps.length}）`,
-    capped(rawDeps.map((d) => `- → \`${d.to}\` · L${d.line} · ${d.kind} · ${label(d)}${importNames(d.imports)}`), 20),
-    capped(rawRdeps.map((d) => `- ← \`${d.path}:${d.line}\` · ${d.kind} · ${label(d)}${importNames(d.imports)}`), 20),
-    `### 未解析的导入 / 路径（${unresolved.length}）`,
-    capped(unresolved.map(ref => `- \`${ref.spec}\` · L${ref.line} · ${ref.reason}${ref.detail ? ' · ' + ref.detail : ''}`), 20),
-    `### IPC 注册（${ipc.filter((i) => i.side === 'register').length}）`,
-    capped(ipc.filter((i) => i.side === 'register').map((i) => `- ${ipcChannelLabel(i)} · ipcMain.${i.method} · L${i.line}${i.symbol ? ` · in ${i.symbol}` : ''}（${i.via}）`), 60),
-    `### IPC 推送 / 直接调用（${ipc.filter((i) => i.side !== 'register').length}）`,
-    capped(ipc.filter((i) => i.side !== 'register').map((i) => `- ${ipcChannelLabel(i)} · ${i.side === 'push' ? i.method : `ipcRenderer.${i.method}`} · L${i.line}${i.symbol ? ` · in ${i.symbol}` : ''}（${i.via}）`)),
+    f ? `- ${f.kind === 'js' ? `JS · ${g.classic.has(rel) ? 'classic 脚本' : '模块'}` : f.kind === 'html' ? 'HTML' : f.kind === 'component' ? '组件' : '源码'}` : '- 内容未解析',
+    ...(zeroBits.length ? [`- 无：${zeroBits.join('、')}`] : []),
+    section('被页面加载', members.length, members.join('\n')),
+    section('依赖 / 被依赖', rawDeps.length + rawRdeps.length, [
+      ...(rawDeps.length ? [capped(rawDeps.map((d) => `- → \`${d.to}\` · L${d.line} · ${d.kind} · ${label(d)}${importNames(d.imports)}`), 20)] : []),
+      ...(rawRdeps.length ? [capped(rawRdeps.map((d) => `- ← \`${d.path}:${d.line}\` · ${d.kind} · ${label(d)}${importNames(d.imports)}`), 20)] : []),
+    ].join('\n')),
+    section('未解析的导入 / 路径', unresolved.length, capped(unresolved.map(ref => `- \`${ref.spec}\` · L${ref.line} · ${ref.reason}${ref.detail ? ' · ' + ref.detail : ''}`), 20)),
+    section('IPC 注册', ipc.filter((i) => i.side === 'register').length, capped(ipc.filter((i) => i.side === 'register').map((i) => `- ${ipcChannelLabel(i)} · ipcMain.${i.method} · L${i.line}${i.symbol ? ` · in ${i.symbol}` : ''}（${i.via}）`), 60)),
+    section('IPC 推送 / 直接调用', ipc.filter((i) => i.side !== 'register').length, capped(ipc.filter((i) => i.side !== 'register').map((i) => `- ${ipcChannelLabel(i)} · ${i.side === 'push' ? i.method : `ipcRenderer.${i.method}`} · L${i.line}${i.symbol ? ` · in ${i.symbol}` : ''}（${i.via}）`))),
     // Calls into a wrapper owned by another module. The channel is a literal
     // argument; whether it reaches ipcMain is decided by that module.
     deferred.length
       ? `### 外部包装调用（${deferred.length}）\n${capped(deferred.map((c) => `- ${c.local}('${c.channel}') · L${c.line}${c.symbol ? ` · in ${c.symbol}` : ''} · 是否 IPC 取决于 ${c.spec}`), 20)}`
       : '',
-    `### preload 桥接调用（${bridge.length}）`,
-    capped(bridge),
-    `### 全局 定义 ${globals.length} / 使用 ${f.kind === 'js' ? f.globalsUsed.length : 0}`,
-    capped(globals.map((d) => `- 定义 \`${d.name}\` · ${d.how} · L${d.line}`), 20),
-    capped(f.kind === 'js' ? f.globalsUsed.map((u) => `- 使用 \`window.${u.name}\` · L${u.line}`) : [], 20),
-    f.kind === 'js' && f.exposes.length ? `### exposeInMainWorld\n${f.exposes.map((e) => exposeRow(g, e)).join('\n')}` : '',
+    section('preload 桥接调用', bridge.length, capped(bridge)),
+    section('全局', globals.length + (f.kind === 'js' ? f.globalsUsed.length : 0), [
+      ...(globals.length ? [capped(globals.map((d) => `- 定义 \`${d.name}\` · ${d.how} · L${d.line}`), 20)] : []),
+      ...(f.kind === 'js' && f.globalsUsed.length ? [capped(f.globalsUsed.map((u) => `- 使用 \`window.${u.name}\` · L${u.line}`), 20)] : []),
+    ].join('\n')),
+    // Same summary row the exposes: view starts from. A preload with a wide
+    // bridge printed one near-identical line per key here; the key surface is
+    // still summarised, and the per-key coordinates are one
+    // `exposes:<file>`/`format=detail` query away.
+    f.kind === 'js' && f.exposes.length
+      ? `### exposeInMainWorld\n${f.exposes.map((e) => exposeSummaryRow(g, e, true)).join('\n')}${f.exposes.some((e) => e.keys.length)
+        ? `\n- 逐键消费者：\`exposes:${rel}\`（或 \`format=detail\`）`
+        : ''}`
+      : '',
   ].filter(Boolean).join('\n')
   return { found: true, text }
+}
+
+/** The consumer surface of one exposed global: alias-resolved member
+ *  references plus bare `window.<global>` uses, deduped and grouped by file.
+ *  Both views render from this one computation, so the collapsed and the
+ *  expanded row can never disagree about a count. */
+interface ExposeSites {
+  memberRefs: BridgeItem[]
+  sites: string[]
+  /** Consumer files, most sites first. */
+  files: Array<[string, number]>
+  usedKeys: string[]
+  unusedKeys: string[]
+}
+
+function exposeSites(g: TraceGraph, e: ExposeFact): ExposeSites {
+  const memberRefs = g.bridgeByObject.get(e.name) ?? []
+  const seen = new Set<string>()
+  const sites = [
+    ...memberRefs.map(ref => `${ref.path}:${ref.line}`),
+    ...(g.guses.get(e.name) ?? []).map(ref => `${ref.path}:${ref.line}`),
+  ].filter(site => seen.has(site) ? false : (seen.add(site), true)).sort()
+  const byFile = new Map<string, number>()
+  for (const site of sites) {
+    const file = site.slice(0, site.lastIndexOf(':'))
+    byFile.set(file, (byFile.get(file) ?? 0) + 1)
+  }
+  return {
+    memberRefs,
+    sites,
+    files: [...byFile].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+    usedKeys: e.keys.filter(key => memberRefs.some(ref => ref.name === key)),
+    unusedKeys: e.keys.filter(key => !memberRefs.some(ref => ref.name === key)),
+  }
 }
 
 /**
@@ -357,12 +443,7 @@ export function traceFile(g: TraceGraph, rel: string, edgeMode: EdgeMode = 'all'
  * key" (real-repo A10: dozens of follow-up greps hunting one global).
  */
 function exposeRow(g: TraceGraph, e: ExposeFact): string {
-  const memberRefs = g.bridgeByObject.get(e.name) ?? []
-  const seen = new Set<string>()
-  const sites = [
-    ...memberRefs.map(ref => `${ref.path}:${ref.line}`),
-    ...(g.guses.get(e.name) ?? []).map(ref => `${ref.path}:${ref.line}`),
-  ].filter(site => seen.has(site) ? false : (seen.add(site), true)).sort()
+  const { memberRefs, sites } = exposeSites(g, e)
   const label = e.dynamic ? `\`${e.name}\`（动态名）` : `\`${e.name}\``
   const keyText = e.keys.length
     ? `${e.keys.slice(0, 12).join('、')}${e.keys.length > 12 ? ` 等 ${e.keys.length} 个` : ''}${e.partial ? '（含展开，键可能不全）' : ''}`
@@ -391,7 +472,85 @@ function exposeRow(g: TraceGraph, e: ExposeFact): string {
   return [head, ...rows].join('\n')
 }
 
-function traceExposes(g: TraceGraph, value: string): AnalysisResult {
+/** Collapsed row: "who consumes this bridge, from where" in one line.
+ *
+ *  Per-key rows only carry information when a bridge has few keys spread over
+ *  several consumer files. A 33-key bridge called from one file prints 33
+ *  near-identical rows and repeats the key names already in the header — on
+ *  VCPChat, 6 of 15 preloads accounted for most of an 18 469-character reply
+ *  whose whole answer was "they call it from one file". Counts stay: only the
+ *  per-key coordinates move behind `format=detail`. */
+function exposeSummaryRow(g: TraceGraph, e: ExposeFact, compact = false): string {
+  const { sites, files, usedKeys, unusedKeys } = exposeSites(g, e)
+  const label = e.dynamic ? `\`${e.name}\`（动态名）` : `\`${e.name}\``
+  const possible = e.dynamic && Object.keys(g.roleGlobals).length
+    ? ` · 可能为：${Object.values(g.roleGlobals).join('、')}`
+    : ''
+  const parts = [
+    `- ${label} · L${e.line}`,
+    e.keys.length ? `键 ${e.keys.length}${e.partial ? '（含展开）' : ''} · 已用 ${usedKeys.length}` : '键运行时构造',
+    sites.length
+      ? `站点 ${sites.length} · 消费者 ${files.length} 文件：${files.slice(0, SUMMARY_FILES).map(([file, count]) => `\`${file}\` ×${count}`).join('、')}${files.length > SUMMARY_FILES ? ` 等 ${files.length} 个` : ''}`
+      : '无消费者',
+  ]
+  if (unusedKeys.length) {
+    parts.push(compact
+      ? `未用 ${unusedKeys.length}`
+      : `未用 ${unusedKeys.length}：${unusedKeys.slice(0, SUMMARY_KEYS).join('、')}${unusedKeys.length > SUMMARY_KEYS ? ' 等' : ''}`)
+  }
+  return parts.join(' · ') + possible
+}
+
+/** Within this budget every view is detail-or-summary; above it, the widest
+ *  replies collapse. Output is re-read by every later call in the session, so
+ *  an oversized reply is charged repeatedly, not once. */
+const EXPOSES_BUDGET = 4_000
+/** Per-key rows are worth their lines only while the bridge is this small. */
+const SUMMARY_KEY_ROWS = 12
+const SUMMARY_FILES = 3
+const SUMMARY_KEYS = 8
+
+export type ExposesFormat = 'auto' | 'summary' | 'detail'
+
+/** `survey` lists every bridge on one line (per-key rows would restate each
+ *  header); `filtered` expands the small bridges where per-key rows still
+ *  answer something; `compact` is `survey` under budget pressure. */
+type ExposesView = 'survey' | 'filtered' | 'compact' | 'detail'
+
+const VIEW_LABEL: Record<ExposesView, string> = {
+  survey: '视图：summary（每个 expose 一行；逐键站点加 format=detail 展开）',
+  filtered: '视图：auto（小桥接保留逐键站点；其余每个 expose 一行，format=detail 全展开）',
+  compact: '视图：compact（已压缩到预算内；未用键名单与逐键站点加 format=detail 展开）',
+  detail: '视图：detail（每个 expose 的全部逐键站点）',
+}
+
+function renderExposes(g: TraceGraph, selected: readonly ExposeItem[], groups: ReadonlyMap<string, ExposeItem[]>, filter: string, view: ExposesView): string {
+  const lines = [
+    `## Trace exposes:${filter}`,
+    `- 共 ${selected.length} 处 · ${groups.size} 个文件 · 键用法按成员聚合；键和引用点仅反映静态可见结果，动态属性名或运行时构造可能未覆盖。路径:行 可回填 ffread / ffedit。`,
+  ]
+  // A collapsed reply has to say it is collapsed, or the agent reads a missing
+  // per-key row as "no consumer". detail stays byte-identical to the pre-change
+  // render so the escape hatch — and the digest test pinning it — stay honest.
+  if (view !== 'detail') lines.push(`- ${VIEW_LABEL[view]}`)
+  for (const [file, items] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(`### \`${file}\``)
+    for (const item of items) {
+      if (view === 'detail') { lines.push(exposeRow(g, item)); continue }
+      if (view === 'filtered' && isSmallBridge(g, item)) { lines.push(exposeRow(g, item)); continue }
+      lines.push(exposeSummaryRow(g, item, view === 'compact'))
+    }
+  }
+  return lines.join('\n')
+}
+
+/** Whether a bridge's per-key rows still say something the counts do not. */
+function isSmallBridge(g: TraceGraph, e: ExposeFact): boolean {
+  const { files, usedKeys } = exposeSites(g, e)
+  return usedKeys.length > 0 && usedKeys.length <= SUMMARY_KEY_ROWS && files.length <= SUMMARY_FILES
+}
+
+function traceExposes(g: TraceGraph, value: string, format: ExposesFormat = 'auto'): AnalysisResult {
   const filter = value.trim()
   const lower = filter.toLowerCase()
   const all: ExposeItem[] = []
@@ -410,15 +569,17 @@ function traceExposes(g: TraceGraph, value: string): AnalysisResult {
   }
   const groups = new Map<string, ExposeItem[]>()
   for (const item of selected) push(groups, item.path, item)
-  const lines = [
-    `## Trace exposes:${filter}`,
-    `- 共 ${selected.length} 处 · ${groups.size} 个文件 · 键用法按成员聚合；键和引用点仅反映静态可见结果，动态属性名或运行时构造可能未覆盖。路径:行 可回填 ffread / ffedit。`,
-  ]
-  for (const [file, items] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
-    lines.push(`### \`${file}\``)
-    for (const item of items) lines.push(exposeRow(g, item))
-  }
-  return { found: true, text: lines.join('\n') }
+  // A survey names no key to inspect, so per-key rows would print every
+  // bridge's whole key table: collapse it. A filtered query usually narrows to
+  // one bridge, and there the per-key rows answer "did I miss a consumer".
+  const survey = lower === '' || lower === 'all' || lower === '*'
+  const chosen: ExposesView = format === 'detail' ? 'detail' : format === 'summary' || survey ? 'survey' : 'filtered'
+  let text = renderExposes(g, selected, groups, filter, chosen)
+  // A loose filter (`exposes:preload` matching every preload file) lands between
+  // the two shapes, and a survey over a large repo can still run long: the
+  // budget decides, not the query's spelling.
+  if (chosen !== 'detail' && text.length > EXPOSES_BUDGET) text = renderExposes(g, selected, groups, filter, 'compact')
+  return { found: true, text }
 }
 
 export function parseTarget(raw: string): { kind: TraceKind; value: string } | null {
@@ -431,13 +592,13 @@ export function parseTarget(raw: string): { kind: TraceKind; value: string } | n
   return { kind, value: m[2] === '' ? 'all' : m[2] }
 }
 
-export function trace(g: TraceGraph, kind: TraceKind, value: string, edgeMode: EdgeMode = 'all'): AnalysisResult {
+export function trace(g: TraceGraph, kind: TraceKind, value: string, edgeMode: EdgeMode = 'all', format: ExposesFormat = 'auto'): AnalysisResult {
   if (kind === 'ipc' || kind === 'api') return traceIpc(g, value)
   if (kind === 'global') return traceGlobal(g, value)
   if (kind === 'page') return tracePage(g, value)
   if (kind === 'impact') return traceImpact(g, value, edgeMode)
   if (kind === 'path') return tracePath(g, value, edgeMode)
   if (kind === 'ffi') return traceFfi(g.ffi, value)
-  if (kind === 'exposes') return traceExposes(g, value)
+  if (kind === 'exposes') return traceExposes(g, value, format)
   return traceFile(g, value.replace(/\\/g, '/').replace(/^\.\//, ''), edgeMode)
 }

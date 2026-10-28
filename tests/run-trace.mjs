@@ -301,7 +301,11 @@ resetFactsCache()
   assert.ok(r.text.includes('内联'), r.text)
   assert.ok(!r.text.includes('commented.js'), r.text)
   assert.ok(r.text.includes('页面共加载'), r.text)
-  assert.ok(r.text.includes('`VCPUI` · 第 2 个脚本'), r.text)
+  // Injected globals are grouped under the script that defines them, so the
+  // path and the load position are named once per script instead of once per
+  // global. What must stay true: VCPUI is reported against the 2nd script.
+  assert.ok(/^- `renderer\/globals\.js` · 第 2 个脚本（\d+）$/m.test(r.text), r.text)
+  assert.ok(/^  - `VCPUI` L\d+$/m.test(r.text), r.text)
   assert.ok(!r.text.includes('`moduleScoped`'), r.text)
   assert.ok(r.text.includes('`chatAPI`：'), r.text)
   assert.ok(r.text.includes('调用了声明表中不存在的 API'), r.text)
@@ -343,16 +347,21 @@ resetFactsCache()
   assert.ok(r.text.includes('exposeInMainWorld'), r.text)
   assert.ok(r.text.includes('`electronAPI` · '), r.text)
   assert.ok(r.text.includes('direct'), r.text)
-  assert.ok(/electronAPI` · L2 · 键：direct、compatInvoke · 使用 1 处：`renderer\/app\.js:\d+`/.test(r.text), r.text)
-  ok('file: exposeInMainWorld keys rendered')
+  // The file view reports the bridge's key surface as counts plus the consumer
+  // that exercises it, and defers per-key coordinates to exposes:/detail.
+  assert.ok(/electronAPI` · L2 · 键 2 · 已用 \d+ · 站点 1 · 消费者 1 文件：`renderer\/app\.js` ×1/.test(r.text), r.text)
+  assert.ok(r.text.includes('逐键消费者：`exposes:preloads/compat.js`'), r.text)
+  ok('file: exposeInMainWorld key surface + consumer, per-key detail deferred to exposes:')
 }
 {
-  const r = await run('file:preloads/chart.js')
+  // Per-key coordinates live in the exposes: view now; the file view reports the
+  // key surface and points here. Same facts, one view, asserted where they are.
+  const r = await run('exposes:preloads/chart.js')
   assert.ok(/`chartAPI` · L\d+ · 键：listCharts、togglePin、onChartChanged/.test(r.text), r.text)
   assert.ok(/`listCharts` ×2：`renderer\/chart-users\.js:\d+`、`renderer\/chart-users\.js:\d+`/.test(r.text), r.text)
   assert.ok(/`onChartChanged` ×1：/.test(r.text), r.text)
   assert.ok(/未被使用（1）：togglePin/.test(r.text), r.text)
-  ok('file: non-literal exposed object keys resolved + per-key usage grouped')
+  ok('exposes:: non-literal exposed object keys resolved + per-key usage grouped')
 }
 {
   const all = await run('exposes:')
@@ -504,8 +513,11 @@ const exec3 = { agent: { session: { header: { cwd: root3, id: 'trace3' } } }, to
   assert.deepEqual(await deps('file:cmp/external.vue'), ['cmp/logic.ts'])
   assert.deepEqual(await deps('file:cmp/anchor.svelte'), ['cmp/helper.js', 'cmp/dep.ts'])
   const view = await tool.execute({ target: 'file:cmp/panel.vue' }, exec4)
-  assert.ok(view.text.includes('### 依赖（2）'), view.text)
-  assert.ok(view.text.includes('### IPC 注册（0）'), view.text)
+  assert.ok(view.text.includes('### 依赖 / 被依赖（2）'), view.text)
+  // A section that is empty by construction is folded into the "无：" line
+  // rather than printed as a header plus "- 无".
+  assert.ok(/^- 无：.*IPC 注册/m.test(view.text), view.text)
+  assert.doesNotMatch(view.text, /### IPC 注册（0）/, view.text)
   const impact = await tool.execute({ target: 'impact:cmp/dep.ts' }, exec4)
   assert.ok(impact.text.includes('cmp/panel.vue'), impact.text)
   assert.ok(impact.text.includes('cmp/anchor.svelte'), impact.text)

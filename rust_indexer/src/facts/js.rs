@@ -133,8 +133,12 @@ struct Expose {
 #[derive(Serialize)]
 struct Wrapper { name: String, side: &'static str, method: String }
 
+/// One imported binding, tagged with the 1-based line of the statement that
+/// created it. The line is what lets a link edge report only its own
+/// statement's names: a file may import from one module several times, and a
+/// per-module name set would make each edge claim the other's names.
 #[derive(Serialize, Clone)]
-struct Binding { local: String, spec: String, imported: Option<String> }
+struct Binding { local: String, spec: String, imported: Option<String>, line: u64 }
 
 #[derive(Serialize)]
 struct Deferred {
@@ -519,21 +523,24 @@ impl<'a> Collector<'a> {
         let callee = field(value, "function");
         if !callee.is_some_and(|c| c.kind() == "identifier" && self.t(c) == "require") { return; }
         let Some(spec) = self.literal(args_of(value).first().copied()) else { return };
+        // The call node's own line, matching the require reference the link
+        // stage records for the same call.
+        let line = value.start_position().row as u64 + 1;
         if name.kind() == "identifier" {
-            self.add_binding(Binding { local: self.t(name).to_string(), spec, imported: None });
+            self.add_binding(Binding { local: self.t(name).to_string(), spec, imported: None, line });
             return;
         }
         if name.kind() != "object_pattern" { return; }
         for child in kids(name) {
             if child.kind() == "shorthand_property_identifier_pattern" {
                 let t = self.t(child).to_string();
-                self.add_binding(Binding { local: t.clone(), spec: spec.clone(), imported: Some(t) });
+                self.add_binding(Binding { local: t.clone(), spec: spec.clone(), imported: Some(t), line });
             } else if child.kind() == "pair_pattern" {
                 let key = field(child, "key");
                 let target = field(child, "value");
                 let imported = key.and_then(|k| if k.kind() == "string" { self.literal(Some(k)) } else { Some(self.t(k).to_string()) });
                 if let (Some(imported), Some(target)) = (imported.filter(|i| !i.is_empty()), target.filter(|t| t.kind() == "identifier")) {
-                    self.add_binding(Binding { local: self.t(target).to_string(), spec: spec.clone(), imported: Some(imported) });
+                    self.add_binding(Binding { local: self.t(target).to_string(), spec: spec.clone(), imported: Some(imported), line });
                 }
             }
         }
@@ -543,6 +550,8 @@ impl<'a> Collector<'a> {
     fn scan_import_bindings(&mut self, stmt: Node) {
         let Some(spec) = self.literal(field(stmt, "source")) else { return };
         let Some(clause) = kids(stmt).into_iter().find(|c| c.kind() == "import_clause") else { return };
+        // The statement line the import reference is recorded against.
+        let line = stmt.start_position().row as u64 + 1;
         let mut stack = vec![clause];
         let mut found = Vec::new();
         // Depth-first in document order, like the recursive TS visitor.
@@ -553,13 +562,13 @@ impl<'a> Collector<'a> {
                     let alias = field(node, "alias");
                     let imported = name.and_then(|n| if n.kind() == "string" { self.literal(Some(n)) } else { Some(self.t(n).to_string()) });
                     let local = alias.map(|a| self.t(a).to_string()).or_else(|| imported.clone());
-                    if let (Some(i), Some(l)) = (imported.filter(|s| !s.is_empty()), local.filter(|s| !s.is_empty())) { found.push(Binding { local: l, spec: spec.clone(), imported: Some(i) }); }
+                    if let (Some(i), Some(l)) = (imported.filter(|s| !s.is_empty()), local.filter(|s| !s.is_empty())) { found.push(Binding { local: l, spec: spec.clone(), imported: Some(i), line }); }
                 }
                 "namespace_import" => {
-                    if let Some(id) = kids(node).into_iter().find(|c| c.kind() == "identifier") { found.push(Binding { local: self.t(id).to_string(), spec: spec.clone(), imported: None }); }
+                    if let Some(id) = kids(node).into_iter().find(|c| c.kind() == "identifier") { found.push(Binding { local: self.t(id).to_string(), spec: spec.clone(), imported: None, line }); }
                 }
                 "identifier" if node.parent().is_some_and(|p| p.kind() == "import_clause") => {
-                    found.push(Binding { local: self.t(node).to_string(), spec: spec.clone(), imported: None });
+                    found.push(Binding { local: self.t(node).to_string(), spec: spec.clone(), imported: None, line });
                 }
                 _ => { let mut k = kids(node); k.reverse(); stack.extend(k); }
             }

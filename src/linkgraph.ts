@@ -282,18 +282,27 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
       continue
     }
     if (f.kind !== 'js' && f.kind !== 'html' && f.kind !== 'component') continue
-    // Imported names per specifier: the question "who uses which of my exports"
-    // is answerable without re-reading every dependent.
+    // Imported names per statement, not per module: a file may import from one
+    // module more than once (`import type {A} from './m'` on line 9, `import {b}
+    // from './m'` on line 10), and an edge that reported the module's whole name
+    // set would claim each statement imported the other's names.
+    //
+    // The native sidecar is an optional prebuilt binary, so bindings may arrive
+    // without a line (an older build). Match by line when the data supports it
+    // and fall back to the module-wide set otherwise: showing names at module
+    // granularity is the old behaviour, showing none would be a regression.
     const bindings = scriptFacts(f)?.bindings ?? []
-    const importedNames = (spec: string): string[] | undefined => {
-      const names = bindings.filter(binding => binding.spec === spec)
+    const importedNames = (spec: string, line: number): string[] | undefined => {
+      const sameSpec = bindings.filter(binding => binding.spec === spec)
+      const onLine = sameSpec.filter(binding => binding.line === line)
+      const names = (onLine.length ? onLine : sameSpec.some(binding => binding.line !== undefined) ? [] : sameSpec)
         .map(binding => binding.imported ?? '*' + binding.local)
       return names.length ? [...new Set(names)] : undefined
     }
     for (const { mode, ref, syntax } of jsReferences(f)) {
       const edgeKind = ref.dynamic ? 'dynamic_import' : mode
       const esImport = mode === 'import' && !ref.dynamic && !ref.unresolved
-      const imports = ref.unresolved ? undefined : importedNames(ref.spec)
+      const imports = ref.unresolved ? undefined : importedNames(ref.spec, ref.line)
       // An expression such as `import(/regex/.source)` is retained as an
       // unresolved fact for diagnostics, but its source text must never be
       // interpreted as a file path merely because a matching file exists.

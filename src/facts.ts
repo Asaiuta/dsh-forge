@@ -121,6 +121,12 @@ export interface ModuleBindingFact {
   local: string
   spec: string
   imported: string | null
+  /** 1-based line of the statement (or `require` call) that created this
+   *  binding. Attached to the binding, not just the module, because a file can
+   *  import from one module several times: `import type {A} from './m'` on one
+   *  line and `import {b} from './m'` on the next are different statements, and
+   *  an edge must not claim both names. */
+  line: number
 }
 
 /**
@@ -275,7 +281,9 @@ export function mergeFacts(target: FileFacts, source: FileFacts, offset: number)
   target.globalsUsed.push(...source.globalsUsed.map(u => ({ ...u, line: u.line + offset })))
   target.exposes.push(...source.exposes.map(e => ({ ...e, line: e.line + offset })))
   target.wrappers.push(...source.wrappers.map(w => ({ ...w })))
-  target.bindings.push(...source.bindings.map(b => ({ ...b })))
+  // Bindings shift too: their line is matched against a reference line, and an
+  // inline <script> block is offset from the document start.
+  target.bindings.push(...source.bindings.map(b => ({ ...b, line: b.line + offset })))
   target.deferredCalls.push(...source.deferredCalls.map(c => ({ ...c, line: c.line + offset })))
   target.namedEntries.push(...source.namedEntries.map(n => ({ ...n, line: n.line + offset })))
 }
@@ -643,19 +651,22 @@ class FactsCollector {
     if (callee?.type !== 'identifier' || callee.text !== 'require') return
     const spec = literalString(argsOf(value)[0])
     if (spec === null) return
+    // Same node the require reference is recorded against, so binding lines and
+    // reference lines agree.
+    const line = value.startPosition.row + 1
     if (name.type === 'identifier') {
-      this.addBinding({ local: name.text, spec, imported: null })
+      this.addBinding({ local: name.text, spec, imported: null, line })
       return
     }
     if (name.type !== 'object_pattern') return
     for (const child of name.children) {
       if (child.type === 'shorthand_property_identifier_pattern') {
-        this.addBinding({ local: child.text, spec, imported: child.text })
+        this.addBinding({ local: child.text, spec, imported: child.text, line })
       } else if (child.type === 'pair_pattern') {
         const key = child.childForFieldName('key')
         const target = child.childForFieldName('value')
         const imported = key === null ? null : key.type === 'string' ? literalString(key) : key.text
-        if (imported && target?.type === 'identifier') this.addBinding({ local: target.text, spec, imported })
+        if (imported && target?.type === 'identifier') this.addBinding({ local: target.text, spec, imported, line })
       }
     }
   }
@@ -666,22 +677,24 @@ class FactsCollector {
     if (spec === null) return
     const clause = stmt.children.find((c) => c.type === 'import_clause')
     if (!clause) return
+    // The statement line the import reference is recorded against.
+    const line = stmt.startPosition.row + 1
     const visit = (node: TsNode): void => {
       if (node.type === 'import_specifier') {
         const name = node.childForFieldName('name')
         const alias = node.childForFieldName('alias')
         const imported = name?.type === 'string' ? literalString(name) : name?.text ?? null
         const local = alias?.text ?? imported
-        if (imported && local) this.addBinding({ local, spec, imported })
+        if (imported && local) this.addBinding({ local, spec, imported, line })
         return
       }
       if (node.type === 'namespace_import') {
         const id = node.children.find((c) => c.type === 'identifier')
-        if (id) this.addBinding({ local: id.text, spec, imported: null })
+        if (id) this.addBinding({ local: id.text, spec, imported: null, line })
         return
       }
       if (node.type === 'identifier' && node.parent?.type === 'import_clause') {
-        this.addBinding({ local: node.text, spec, imported: null })
+        this.addBinding({ local: node.text, spec, imported: null, line })
         return
       }
       for (const child of node.children) visit(child)
