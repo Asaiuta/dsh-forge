@@ -4,6 +4,7 @@ import path from 'node:path'
 import { canonicalTarget, canonicalWorkspace, within } from './fs-paths.ts'
 import { observedRead, parseLineRange, type ForgeExec, workdirOf, withFileLock, withFileLocks, withNativeWrite } from './core.ts'
 import { commitFiles, detectEncoding, encodeText, prepareWorkspace, putBlob, readKnownState, recordExternalState, storeFor, type FileChange, type LedgerNode } from './ledger.ts'
+import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { findSymbol, parseFile, normalizeText, symbolSpan, syntaxValid, detectLanguage } from './ast.ts'
 import { applyEditSteps } from './edit-engine.ts'
 import { isSymbolicLink } from './fs-paths.ts'
@@ -71,8 +72,25 @@ export function createFileTool() {
     output: { schema: { type: 'object', additionalProperties: false, properties: {
       batch: { type: 'integer', required: true }, files: { type: 'array', items: { type: 'string' }, required: true },
       note: { type: 'string' },
-    } }, render: (_args: unknown, value: { batch: number; files: string[]; note?: string }) => [{ type: 'text' as const,
-      text: `batch #${value.batch}\n${value.files.join('\n')}${value.note ? `\n[${value.note}]` : ''}` }] },
+      audit: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          status: { type: 'string', required: true, enum: ['partial', 'not_run', 'stale'] },
+          reason: { type: 'string', required: true, enum: ['legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale'] },
+          detail: { type: 'string' },
+          verdict: { type: 'string' },
+          coverage: { type: 'object', additionalProperties: true },
+          baseline: { type: 'object', additionalProperties: true },
+          globals: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        },
+      },
+    } }, render: (_args: unknown, value: { batch: number; files: string[]; note?: string; audit?: EditAudit }) => {
+      const lines = [`batch #${value.batch}\n${value.files.join('\n')}${value.note ? `\n[${value.note}]` : ''}`]
+      if (value.audit) lines.push(...renderAudit(value.audit))
+      return [{ type: 'text' as const, text: lines.join('\n') }]
+    } },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {
@@ -89,7 +107,7 @@ export function createFileTool() {
           if (!within(workspace, file)) throw new Error('file operations must stay inside the workspace')
           if (!existsSync(path.dirname(file)) || !statSync(path.dirname(file)).isDirectory()) throw new Error('destination parent must be an existing directory')
         }
-        return await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
+        const committed = await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
           await prepareWorkspace(store, exec)
           exec?.signal?.throwIfAborted()
           const original = await observedRead(exec, source, read)
@@ -276,6 +294,17 @@ export function createFileTool() {
             return { batch: batch.id, files: nodes.map(node => node.file), ...(transferNote ? { note: transferNote } : {}) }
           })
         }))
+        // File identity changed, not bridge membership: the audit says so
+        // explicitly instead of leaving this entry point silent. Without this,
+        // a move that strands consumers would look identical to a clean run.
+        const audit = auditCommit({
+          workspace,
+          batchId: committed.batch,
+          kind: 'file',
+          changed: committed.files.map(rel => ({ rel, abs: path.join(workspace, ...rel.split('/')) })),
+          operation: action,
+        })
+        return { ...committed, audit }
       } catch (cause) { return { error: cause instanceof Error ? cause.message : String(cause) } }
     },
   } as const

@@ -27,6 +27,10 @@ import type { FileFacts } from './facts.ts'
  * `lang::supported` table and the WASM path's language set exactly: every
  * language dsh-forge knows is served by the Rust sidecar, and anything else
  * stays on the WASM path.
+ *
+ * NOT the Trace support list: a language can be parseable (C#) and still
+ * contribute no dependency edges. Trace capability rows live in
+ * `trace-capabilities.ts`; render status/docs from there, never from this set.
  */
 const SUPPORTED = new Set([
   'javascript', 'typescript', 'tsx',
@@ -37,6 +41,10 @@ let child: ChildProcess | null = null
 let seq = 1
 let disabled = false
 let readyPromise: Promise<boolean> | null = null
+/** Observed only when a ping actually answered / failed. Never inferred from
+ *  the presence of a binary or a spawned process (M0.5). */
+let readyVersion: string | null = null
+let failedPing: string | null = null
 const pending = new Map<number, { resolve(value: unknown): void; reject(cause: Error): void }>()
 
 function binaryPath(): string | null {
@@ -181,6 +189,62 @@ export function setIndexerTransportForTest(
   disabled = false
 }
 
+/**
+ * What the status command may report about the sidecar without running it.
+ *
+ * M0.5's rule: the status path answers questions, it does not start engines. So
+ * this function reads process state and the filesystem only — it never spawns
+ * the sidecar, never pings it and never waits on a readiness promise. The
+ * distinction matters because `/forge-status` is the one command a user runs
+ * *specifically* when something looks wrong, and a status command that spawns a
+ * Rust process, loads cargo metadata or reaches the network to describe health
+ * can fail for exactly the reason the user is investigating.
+ *
+ * `not_probed` is the honest answer for "we have not asked yet": it is not a
+ * failure and must never be rendered as "available".
+ */
+export interface IndexerStatus {
+  /** `disabled` (env off / compiled out), `configured` (binary present, not
+   *  started), `ready` (a ping succeeded earlier in this process), `failed`
+   *  (starting was attempted and failed), or `not_probed` (auto, binary
+   *  missing — we never asked, so we do not know). */
+  state: 'disabled' | 'configured' | 'ready' | 'failed' | 'not_probed'
+  /** Binary path when one was found; null otherwise. */
+  binary: string | null
+  /** Resolved from the ping reply, never assumed. */
+  version: string | null
+  /** Languages the protocol can parse. Static capability, not a probe. */
+  languages: string[]
+  /** Why `state` is what it is, in one short phrase for the status line. */
+  detail: string
+}
+
+/** Read the sidecar's state passively. Zero spawns, zero executes, no network. */
+export function peekIndexerStatus(): IndexerStatus {
+  const languages = [...SUPPORTED].sort()
+  const configuredPath = binaryPath()
+  // An explicit DSH_FORGE_INDEXER_BIN override is a *request*, not proof the
+  // file is there: `binaryPath()` returns it unchecked so a real spawn can
+  // report the OS error. Status must not repeat that optimism, or a typo in the
+  // env var would read as "configured" forever.
+  const binary = configuredPath !== null && existsSync(configuredPath) ? configuredPath : null
+  const base = { binary, languages }
+  if (!wanted()) {
+    return { ...base, state: 'disabled', version: null, detail: '环境变量已关闭' }
+  }
+  // Observation beats inference: a ping that answered or failed is a fact about
+  // this process, whether or not a child process is currently visible (a test
+  // transport, or a sidecar that crashed and was reaped, both land here).
+  if (failedPing !== null) return { ...base, state: 'failed', version: null, detail: `sidecar 未应答：${failedPing}` }
+  if (readyVersion !== null) return { ...base, state: 'ready', version: readyVersion, detail: '本次进程内 ping 成功' }
+  if (binary === null) {
+    const why = configuredPath === null ? '未找到 sidecar 二进制' : `指定的 sidecar 不存在（${configuredPath}）`
+    return { ...base, state: 'not_probed', version: null, detail: `${why}，未尝试启动` }
+  }
+  if (child && !disabled) return { ...base, state: 'configured', version: null, detail: '进程已启动但尚未应答' }
+  return { ...base, state: 'configured', version: null, detail: '二进制存在，本次进程尚未启动' }
+}
+
 /** Spawn + ping once; cached. Caller budgets/cancellation bound only their
  *  own wait, leaving the shared ping available to other callers. */
 export function indexerReady(options: RequestOptions = {}): Promise<boolean> {
@@ -189,9 +253,15 @@ export function indexerReady(options: RequestOptions = {}): Promise<boolean> {
   if (!wanted()) return Promise.resolve(false)
   readyPromise ??= (async () => {
     try {
-      const reply = (await request('ping', {}, { deadline: Date.now() + 2_000 })) as { ok?: boolean }
-      return reply.ok === true
-    } catch {
+      const reply = (await request('ping', {}, { deadline: Date.now() + 2_000 })) as { ok?: boolean; version?: unknown }
+      if (reply.ok === true) {
+        readyVersion = typeof reply.version === 'string' && reply.version ? reply.version : 'unversioned'
+        return true
+      }
+      failedPing = 'ping 返回非 ok'
+      return false
+    } catch (cause) {
+      failedPing = cause instanceof Error ? cause.message : String(cause)
       return false
     }
   })()
@@ -504,5 +574,7 @@ export async function resetIndexer(): Promise<void> {
   pending.clear()
   previous?.kill()
   readyPromise = null
+  readyVersion = null
+  failedPing = null
   disabled = false
 }

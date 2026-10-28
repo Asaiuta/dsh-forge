@@ -22,6 +22,9 @@ import { allStores, hasPendingTransaction, pruneOrphanedStores, gcStoreBlobs, pu
 import { cardsStatusFor, CARD_NAMES } from './cards.ts'
 import { canonicalWorkspace } from './fs-paths.ts'
 import { countTickets } from './tickets.ts'
+import { peekIndexerStatus } from './indexer-client.ts'
+import { TRACE_CAPABILITY_MATRIX, TRACE_BINARY_EVIDENCE } from './trace-capabilities.ts'
+import { traceSnapshotStatus } from './tools-trace.ts'
 import {
   CONTEXT_MAX,
   FILTER_MAX_EXTRA_PAGES,
@@ -1195,6 +1198,13 @@ export function createStatusCommand(
         }
       }
       ledgerLines.push(`歧义票据：${countTickets()} 张存活（24h 过期）`)
+      // Trace capability + snapshot section. Passive on purpose: no scan, no
+      // sidecar spawn, no cargo, no network. Everything below is either a
+      // static table, process state, or a directory listing (M0.5).
+      {
+        const traceCwd = invocation.agent?.session?.header?.cwd
+        ledgerLines.push(...describeTraceStatus(traceCwd))
+      }
       // Knowledge cards (sedimentation): read-only on purpose — this command
       // runs on the status path, so a stale anchor is reported, never repaired
       // here (no rebuild, no AST parse; ff_cards owns the repair).
@@ -1289,6 +1299,44 @@ export function createStatusCommand(
 function safeVersion(finder: FileFinderApi): string {
   const health = finder.healthCheck()
   return health.ok ? health.value.version : 'unknown'
+}
+
+/**
+ * Passive Trace section for `/forge-status` (M0.5).
+ *
+ * Every line here is either a compile-time table, process state, or a registry
+ * count. Nothing spawns the sidecar, runs cargo, executes project code or
+ * touches the network — the status path must stay usable precisely when the
+ * engine is what is broken. A capability that is merely unproven reads as
+ * `not_probed`/`unavailable`, never as "available by default".
+ */
+function describeTraceStatus(workspace: string | undefined): string[] {
+  const lines: string[] = []
+  const indexer = peekIndexerStatus()
+  const dependencyLanguages = TRACE_CAPABILITY_MATRIX.filter(row => row.fileDependency !== false).map(row => row.language)
+  // Languages parsed but contributing no dependency edges are named, not just
+  // counted: "13 of 14" leaves the reader to guess which one has no edges.
+  const parseOnly = TRACE_CAPABILITY_MATRIX.filter(row => row.fileDependency === false).map(row => row.language)
+  lines.push(
+    `Trace 覆盖：${TRACE_CAPABILITY_MATRIX.length} 种语言，文件依赖 ${dependencyLanguages.length} 种（${dependencyLanguages.join('、')}）` +
+    `${parseOnly.length ? `；仅解析不计依赖：${parseOnly.join('、')}` : ''}` +
+    `；二进制证据 ${TRACE_BINARY_EVIDENCE.extensions.length} 类扩展名（仅元数据）`,
+  )
+  lines.push(
+    `Trace 原生解析：${indexer.state}${indexer.binary ? `（${indexer.binary}）` : ''} · ${indexer.detail}` +
+    `${indexer.version ? ` · 版本 ${indexer.version}` : ''}；未探测不等于可用`,
+  )
+  const snapshots = traceSnapshotStatus(workspace)
+  lines.push(
+    snapshots.snapshots === 0
+      ? 'Trace 快照：本次进程内尚无（fftrace 首次查询后建立；仅内存，不落盘）'
+      : `Trace 快照：${snapshots.snapshots} 个 · ${snapshots.configurations} 种配置 · 分页游标 ${snapshots.liveCursors} 个 · 最新 ${snapshots.newest}`,
+  )
+  // Stages the roadmap has not delivered yet say so explicitly. Leaving them
+  // out would make "no line" and "supported" indistinguishable.
+  lines.push('Trace 语义引用：unavailable（M2 计划，当前未实现；symbol: 只找定义，不是引用计数）')
+  lines.push('Trace 运行时证据：unavailable（不做动态加载、不执行工程代码）')
+  return lines
 }
 
 /** Tiny helper mirroring dsh-ssh's text() output wrapper. */

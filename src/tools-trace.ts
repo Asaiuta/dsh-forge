@@ -12,11 +12,12 @@
  */
 
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import ignore from 'ignore'
 import { bridgeGlobalsOf, loadPreloadDecls } from './decls.ts'
 import { buildGraph, deriveRoleGlobals, exposedGlobalsOf, normalizeTraceFile, parseDependencyPath, type TraceGraph } from './linkgraph.ts'
-import { parseTarget, trace } from './trace-queries.ts'
+import { parseTarget, trace, type ExposesFormat } from './trace-queries.ts'
 import { loadCompilationDatabase, resetCompilationCache, type CompilationInfo } from './compile-commands.ts'
 import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } from './facts.ts'
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
@@ -29,10 +30,12 @@ import { loadPythonProject, pythonMetadata } from './python-project.ts'
 import { cargoMetadata, loadRustProject } from './rust-project.ts'
 import { goMetadata, loadGoProject } from './go-project.ts'
 import { findDefinitions } from './tools-symbol.ts'
+import { TRACE_SCAN_EXTENSIONS } from './trace-capabilities.ts'
+import { configIdentity, configKeyOf, TraceSnapshots, type TraceSnapshotMeta } from './trace-snapshot.ts'
+import { sha256Hex } from './source-evidence.ts'
+import { collectRows, rowText, type RowQuery, type RowSet } from './trace-rows.ts'
 import type { EdgeMode, ProjectContext, TraceDiagnostic } from './trace-evidence.ts'
 
-const SCAN_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.html', '.vue', '.svelte',
-  '.py', '.pyi', '.rs', '.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx', '.cppm', '.ixx', '.go', '.java', '.lua'])
 const FILE_CAP = 20_000
 const PER_FILE_BYTES = 2 * 1024 * 1024
 const WALK_VISIT_CAP = 200_000
@@ -137,7 +140,7 @@ export function collectCandidatesLocal(root: string, signal?: AbortSignal): { fi
         if (pythonMetadata(entry.name)) pythonFiles.push(rel)
         if (cargoMetadata(entry.name)) cargoFiles.push(rel)
         if (goMetadata(entry.name)) goFiles.push(rel)
-        if (SCAN_EXTS.has(path.extname(entry.name).toLowerCase()) || BINARY_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || entry.name === 'go.mod') files.push({ abs, rel })
+        if (TRACE_SCAN_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || BINARY_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || entry.name === 'go.mod') files.push({ abs, rel })
       }
     }
   }
@@ -309,6 +312,9 @@ export interface AssembledTrace {
   diagnostics: TraceDiagnostic[]
   project?: { configs: number; workspacePackages: number }
   compilation?: CompilationInfo
+  /** Which snapshot answered (M0.4): resolvable through
+   *  {@link lookupTraceSnapshot}, never assumed current. */
+  snapshot: TraceSnapshotMeta
 }
 
 export interface TraceAssemblyOptions { declarations?: string; compileCommands?: string; signal?: AbortSignal; workers?: AstWorkerPool }
@@ -316,6 +322,159 @@ interface GraphProbe { exists: boolean; identity: string | null }
 const GRAPH_CACHE = new Map<string, { signature: string; decls: string; contexts: Array<ProjectContext | undefined>; probes: Map<string, GraphProbe>; assembled: AssembledTrace }>()
 interface PendingAssembly { controller: AbortController; users: number; promise: Promise<AssembledTrace> }
 const PENDING = new Map<string, Map<AstWorkerPool | undefined, PendingAssembly>>()
+
+/**
+ * Process-local registry of built graphs, addressed by unguessable snapshot ID.
+ *
+ * Four per workspace: a query session rarely needs more than "the before one"
+ * and "the current one" per configuration, and an unbounded registry would pin
+ * whole graphs (real repos are hundreds of MB) for the life of the process.
+ */
+const SNAPSHOTS = new TraceSnapshots<AssembledTrace>({ perWorkspace: 4, total: 16 })
+
+/** Look a snapshot up by ID inside one workspace; a miss never falls back to
+ *  another cached graph. `workspace` is the same root the query was made in. */
+export function lookupTraceSnapshot(workspace: string, snapshotId: string) {
+  return SNAPSHOTS.get(snapshotId, path.resolve(workspace))
+}
+
+/** Test/diagnostic hook: the snapshots currently held for one workspace. */
+export function traceSnapshots(workspace: string, configKey?: string): TraceSnapshotMeta[] {
+  return SNAPSHOTS.list(path.resolve(workspace), configKey)
+}
+
+/** Passive snapshot counts for `/forge-status` (M0.5).
+ *
+ *  Answers "is there a graph I could reuse, and from when" without building a
+ *  graph: no scan, no sidecar spawn, no filesystem walk beyond reading the
+ *  in-memory registry. A workspace with no snapshots reports zero, not an error.
+ */
+export function traceSnapshotStatus(workspace: string | undefined): {
+  snapshots: number
+  configurations: number
+  liveCursors: number
+  newest: string | null
+} {
+  if (!workspace) return { snapshots: 0, configurations: 0, liveCursors: 0, newest: null }
+  const metas = SNAPSHOTS.list(path.resolve(workspace))
+  const now = Date.now()
+  let liveCursors = 0
+  for (const cursor of PAGE_CURSORS.values()) if (cursor.expires > now && cursor.workspace === path.resolve(workspace)) liveCursors++
+  return {
+    snapshots: metas.length,
+    configurations: new Set(metas.map(meta => meta.configKey)).size,
+    liveCursors,
+    newest: metas.length ? metas[metas.length - 1].createdAt : null,
+  }
+}
+
+/** Drop every stored snapshot (tests and explicit cache resets). */
+export function resetTraceSnapshots(): void {
+  SNAPSHOTS.clear()
+  PAGE_CURSORS.clear()
+}
+
+/** Rows per page. A reply is re-read by every later call, so a page has to stay
+ *  small enough to be worth its bytes; 500 is the ceiling that still fits. */
+const PAGE_ROWS_DEFAULT = 100
+const PAGE_ROWS_MAX = 500
+/** A cursor outlives a slow edit session, not the day. */
+const PAGE_CURSOR_TTL = 30 * 60 * 1000
+const PAGE_CURSOR_CAP = 64
+
+interface PageCursorEntry {
+  workspace: string
+  /** The snapshot the rows were computed from. Every later page re-reads it. */
+  snapshotId: string
+  query: RowQuery
+  offset: number
+  limit: number
+  expires: number
+}
+
+/**
+ * Live page cursors, keyed by an unguessable ID.
+ *
+ * Deliberately not an offset the client may send: an arbitrary offset lets a
+ * caller skip the range check (and skip past a row cap that was never applied).
+ * A cursor names one query against one snapshot; the offset lives here.
+ */
+const PAGE_CURSORS = new Map<string, PageCursorEntry>()
+
+function pageLimit(value: unknown): number | null {
+  if (value === undefined) return PAGE_ROWS_DEFAULT
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) return null
+  return Math.min(value, PAGE_ROWS_MAX)
+}
+
+function registerPageCursor(entry: Omit<PageCursorEntry, 'expires'>): string {
+  const now = Date.now()
+  for (const [id, cursor] of PAGE_CURSORS) if (cursor.expires <= now) PAGE_CURSORS.delete(id)
+  while (PAGE_CURSORS.size >= PAGE_CURSOR_CAP) {
+    const oldest = [...PAGE_CURSORS].sort((a, b) => a[1].expires - b[1].expires)[0]
+    PAGE_CURSORS.delete(oldest[0])
+  }
+  const id = randomBytes(9).toString('hex')
+  PAGE_CURSORS.set(id, { ...entry, expires: now + PAGE_CURSOR_TTL })
+  return id
+}
+
+function readPageCursor(id: string): PageCursorEntry | null {
+  const entry = PAGE_CURSORS.get(id)
+  if (!entry) return null
+  if (entry.expires <= Date.now()) {
+    PAGE_CURSORS.delete(id)
+    return null
+  }
+  return entry
+}
+
+/** Whether a cursor addresses the same query a call is asking for. A cursor
+ *  reused with a different target is a caller bug, not a page 2. */
+function samePageQuery(query: RowQuery, kind: string, value: string, edgeMode: EdgeMode): boolean {
+  if (query.kind !== kind || query.value !== value) return false
+  if (query.kind === 'exposes') return true
+  return query.edgeMode === edgeMode
+}
+
+/** The rows the paging layer owns, for kinds whose replies can exceed a page. */
+function pageQueryOf(kind: string, value: string, edgeMode: EdgeMode): RowQuery | null {
+  if (kind === 'exposes') return { kind: 'exposes', value }
+  if (kind === 'impact') return { kind: 'impact', value, edgeMode }
+  if (kind === 'file') return { kind: 'file', value, edgeMode }
+  return null
+}
+
+function renderPage(input: {
+  title: string
+  rows: RowSet
+  limit: number
+  offset: number
+  /** Cursor for the next page, when one exists. */
+  next: string | null
+  /** The page came from a graph that is no longer current. */
+  stale: { snapshotId: string } | null
+  /** Total across all pages; `rows.rows.length`. */
+  total: number
+}): string {
+  const { title, rows, limit, offset, next, stale, total } = input
+  const shown = rows.rows.slice(offset, offset + limit)
+  const lines = [
+    `## ${title}`,
+    `- 共 ${total} 行 · 本页 ${shown.length} 行（第 ${offset + 1}–${offset + shown.length} 行，页大小 ${limit}）`,
+    `- 遍历：${rows.traversalComplete ? '完成' : '⚠️ 达到遍历预算，仅覆盖已遍历范围'} · 结果：${rows.resultComplete ? '完整' : '⚠️ 受预算限制'}`,
+    ...(rows.limitations.length ? [`- 口径：${rows.limitations.map(limit => limit.reason).join('、')}`] : []),
+    ...(stale
+      ? [`- ⚠️ 本页来自旧快照 \`${stale.snapshotId}\`（stale）：只能用于回顾旧证据，不可作为当前修改计划的依据。需要当前结果请重新查询。`]
+      : []),
+    '### 行',
+    ...shown.map(rowText),
+    ...(!shown.length ? ['- 本页为空（偏移已超出结果范围）。'] : []),
+    ...(next ? [`- 后续：带上 cursor=${next} 获取下一页。`] : ['- 已是最后一页。']),
+  ]
+  return lines.join('\n')
+}
+
 
 /** The exact per-probe check: a file (links followed) with this real path. */
 function probeMatches(absolute: string, expected: GraphProbe): boolean {
@@ -409,16 +568,39 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   const go = hasGo && scan.goFiles.length ? loadGoProject(root, scan.goFiles, options.signal) : undefined
   // Fixed slot order: a context that disappears (undefined) must not match one that existed.
   const contexts: Array<ProjectContext | undefined> = [compilation, project, python, rust, go]
+  // What was asked for — independent of what the scan happens to find. Digests
+  // cover the *effective* inputs the graph used: the parsed declaration table
+  // and the compilation database signature (which itself folds file identity
+  // and content). Two configurations are never one key.
+  const config = configIdentity({
+    root,
+    declarations: options.declarations ? path.resolve(root, options.declarations) : null,
+    declarationsDigest: options.declarations ? sha256Hex(`${decls.status}\0${declsKey}`) : null,
+    compileCommands: options.compileCommands ? path.resolve(root, options.compileCommands) : (compilation?.info?.path ?? null),
+    compileCommandsDigest: compilation ? sha256Hex(compilation.signature) : null,
+    contexts: {
+      compilation: compilation?.signature,
+      project: project?.signature,
+      python: python?.signature,
+      rust: rust?.signature,
+      go: go?.signature,
+    },
+  })
+  const configKey = configKeyOf(config)
+  const native = indexerTraceWanted() && await indexerReady({ signal: options.signal })
   if (cached && cached.signature === scan.signature && cached.decls === declsKey
+    && cached.assembled.snapshot.configKey === configKey
     && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
     && scan.walkErrors === 0 && !scan.truncated) {
     // Resolution may probe ignored/non-JS files or missing paths. Revalidate
     // those too, so adding an asset or an index file invalidates the graph.
     // The sidecar decides when it can: the listings behind it are its kind of
     // work, and it reports "unavailable" (null) rather than guessing.
-    const native = indexerTraceWanted() && await indexerReady({ signal: options.signal })
     const remote = native ? await indexerProbesUnchanged(root, cached.probes, options.signal) : null
     if (remote ?? probesUnchanged(root, cached.probes)) {
+      // Same graph, same identity: keep its snapshot resolvable so the reply's
+      // token does not point at a slot evicted while this query was running.
+      SNAPSHOTS.restore(cached.assembled.snapshot, cached.assembled)
       return cached.assembled
     }
   }
@@ -432,16 +614,50 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   options.signal?.throwIfAborted()
   const probes = new Map<string, GraphProbe>()
   const graph = buildGraph(root, entries, decls, (rel, exists, identity) => probes.set(rel, { exists, identity: identity ?? null }), compilation?.resolve, project?.resolve, { python, rust, go })
-  const assembled = { graph, decls, scanned: scan.scanned, truncated: scan.truncated, parseErrors: scan.parseErrors, partialFiles: scan.partialFiles, walkErrors: scan.walkErrors,
+  const assembled: AssembledTrace = { graph, decls, scanned: scan.scanned, truncated: scan.truncated, parseErrors: scan.parseErrors, partialFiles: scan.partialFiles, walkErrors: scan.walkErrors,
     diagnostics: [...scan.diagnostics, ...project?.issues ?? [], ...python?.issues ?? [], ...rust?.issues ?? [], ...go?.issues ?? []],
     ...(project ? { project: { configs: project.configs, workspacePackages: project.workspacePackages } } : {}),
-    ...(compilation?.info ? { compilation: compilation.info } : {}) }
+    ...(compilation?.info ? { compilation: compilation.info } : {}),
+    // Announced before the object exists (it carries its own ID) and committed
+    // right after. A truncated scan still answers this query honestly; it is
+    // simply not reusable, and the meta says so.
+    snapshot: SNAPSHOTS.announce({
+      config,
+      configKey,
+      files: scan.entries.keys(),
+      probes: probes.size,
+      scanned: scan.scanned,
+      truncated: scan.truncated,
+      strength: 'observed',
+      provider: native ? 'native' : 'wasm',
+    }),
+  }
+  SNAPSHOTS.put(assembled.snapshot, assembled)
   if (!scan.truncated && scan.walkErrors === 0) {
     GRAPH_CACHE.delete(key)
     GRAPH_CACHE.set(key, { signature: scan.signature, decls: declsKey, contexts, probes, assembled })
     if (GRAPH_CACHE.size > 4) GRAPH_CACHE.delete(GRAPH_CACHE.keys().next().value!)
   }
   return assembled
+}
+
+/** The most recently assembled graph for `root`, if one is still cached.
+ *
+ *  Deliberately no IO and no staleness check. Callers that must never block —
+ *  the post-edit audit — want the graph *as it was*, and a snapshot taken one
+ *  edit ago is exactly the right one for "who else references this file", since
+ *  the edit changed this file, not its importers.
+ *
+ *  @returns the cached assembly, or `undefined` when no graph has been built.
+ *    Never builds one: a cold audit is silently skipped, not paid for. */
+export function peekTraceGraph(root: string): AssembledTrace | undefined {
+  let found: AssembledTrace | undefined
+  for (const [key, entry] of GRAPH_CACHE) {
+    try {
+      if (JSON.parse(key)[0] === root) found = entry.assembled
+    } catch { /* a key this module did not write */ }
+  }
+  return found
 }
 
 /** Share overlapping scans, while each caller retains its own cancellation.
@@ -492,14 +708,16 @@ export function createTraceTool(workers?: AstWorkerPool) {
   return {
     name: 'fftrace',
     description:
-      'Trace dependencies before changing code. Pick target= by question: who breaks if I change a file (run before any refactor) → impact:<path>; what a file imports → file:<path>; how A reaches B → path:<from> -> <to>; where an IPC channel registers/is called → ipc:<channel>; which channel a preload API reaches → api:<name>; which globals preloads expose and which members are used where → exposes: (all) or exposes:<global-or-file>; which keys one preload exposes (exposeInMainWorld) → file:<preload>; who defines/uses a window.* global → global:<name>; which scripts a page loads in order → page:<file.html>; where a symbol is defined when several files share the name → symbol:<name>. JS/TS resolution supports tsconfig/jsconfig paths/baseUrl/references, workspace package exports/imports, TypeScript program membership, and named imports through re-export barrels to the defining file (candidate reexport edges) (imported excluded files inherit the importing config; plain TS require() never joins a program). edgeMode=certain excludes candidate edges; diagnostics explains unresolved modules. Also covers HTML, Vue/Svelte script dependencies, Python (package roots from pyproject.toml/setup.cfg and src/ layout), Rust (Cargo path dependencies and declared target roots), C/C++, Go (go.work and local replace)/Java/Lua (literal package.path) candidates and TS ambient declarations. ' +
-      'ffi:<name> finds source boundary declarations and PE/ELF/WASM exports as separate evidence, never a verified cross-language call chain. Read-only; dynamic paths and external packages stay unresolved. Optional compile_commands.json resolves C/C++ include flags without executing commands.',
+      'Trace dependencies before changing code; read-only, never runs workspace code. Answers who breaks if a file changes, what a file imports, how A reaches B, where an IPC channel registers or a preload API lands, which globals preloads expose and who uses them, which scripts a page loads, where a name is defined, and FFI/binary exports. Targets: see the target parameter. Resolves tsconfig/jsconfig paths, baseUrl, project references, package exports/imports, re-export barrels and TS program membership; bare TS require() never joins a program. Covers JS/TS, HTML/Vue/Svelte, Python, Rust, C/C++, Go, Java, Lua and TS ambient declarations. Dynamic paths, external packages and generated code stay unresolved; edgeMode=certain drops candidates. ' +
+      'ffi:<name> reports source declarations and PE/ELF/WASM exports as separate evidence, never a verified call chain. Optional compile_commands.json supplies C/C++ include flags, never running commands.',
     parameters: {
-      target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<from> -> <to>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), symbol:<name>, or ffi:<export-or-declaration-name>.' },
+      target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<a> -> <b>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), symbol:<name>, ffi:<name>.' },
       declarations: { type: 'string', description: 'Absolute or workspace-relative JSON file, ≤256KiB: {apis:[{name,channel,kind,roles}],roleGlobals?:{role:global}}; kind=query/command/subscription.' },
       compileCommands: { type: 'string', description: 'Compilation database JSON (≤8MiB); defaults to workspace compile_commands.json for C/C++. Reads include flags without executing commands.' },
       edgeMode: { type: 'string', enum: ['all', 'certain'], description: 'File dependency edges for file:/impact:/path:. all (default) includes labelled candidates; certain excludes them. Static certainty does not prove runtime execution.' },
-      limit: { type: 'integer', description: 'symbol: 最多返回的定义数（1-200，默认 50）。' },
+      format: { type: 'string', enum: ['auto', 'summary', 'detail'], description: 'exposes: 视图：auto（默认）按规模分档，survey 折叠为每个 expose 一行，小桥接保留逐键站点；detail 展开全部逐键站点。' },
+      limit: { type: 'integer', description: 'symbol: 最多返回的定义数（1-200，默认 50）；file:/impact:/exposes: 每页行数（1-500，默认 100）。' },
+      cursor: { type: 'string', description: 'file:/impact:/exposes: 的后续页游标，取自上一页的 nextCursor；只能与同一 target/edgeMode 和同一 limit 一起使用，过期或换查询需重新发起。' },
     },
     output: {
       schema: {
@@ -509,7 +727,33 @@ export function createTraceTool(workers?: AstWorkerPool) {
           found: { type: 'boolean', required: true },
           target: { type: 'string', required: true },
           edgeMode: { type: 'string' },
+          snapshot: {
+            type: 'object', additionalProperties: false, properties: {
+              snapshotId: { type: 'string', required: true },
+              configKey: { type: 'string', required: true },
+              strength: { type: 'string', required: true, enum: ['observed', 'content-bound'] },
+              provider: { type: 'string', required: true, enum: ['wasm', 'native'] },
+              providerVersion: { type: 'string', required: true },
+              files: { type: 'integer', required: true },
+            },
+          },
           text: { type: 'string', required: true },
+          page: {
+            type: 'object', additionalProperties: false, properties: {
+              offset: { type: 'integer', required: true },
+              returned: { type: 'integer', required: true },
+              total: { type: 'integer', required: true },
+              limit: { type: 'integer', required: true },
+              nextCursor: { type: 'string' },
+              stale: { type: 'boolean', required: true },
+              snapshotId: { type: 'string', required: true },
+              traversalComplete: { type: 'boolean', required: true },
+              resultComplete: { type: 'boolean', required: true },
+              limitations: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+                reason: { type: 'string', required: true }, count: { type: 'integer' },
+              } } },
+            },
+          },
           scanned: { type: 'integer' },
           pages: { type: 'integer' },
           decls: { type: 'string' },
@@ -580,6 +824,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
       const symbol = /^\s*symbol\s*:\s*(.+?)\s*$/i.exec(raw)
       if (symbol) {
         if (args.edgeMode !== undefined && args.edgeMode !== 'all') return failure('edgeMode 不适用于 symbol: 查询。')
+        if (args.format !== undefined && args.format !== 'auto') return failure('format 不适用于 symbol: 查询。')
         const name = symbol[1]
         const found = await findDefinitions(exec, { name, ...(args.limit === undefined ? {} : { limit: args.limit }) }, workers)
         if ('error' in found) return found
@@ -604,6 +849,9 @@ export function createTraceTool(workers?: AstWorkerPool) {
       const edgeMode: EdgeMode = args.edgeMode === undefined || args.edgeMode === 'all' ? 'all' : args.edgeMode === 'certain' ? 'certain' : 'all'
       if (args.edgeMode !== undefined && args.edgeMode !== 'all' && args.edgeMode !== 'certain') return failure('edgeMode 仅接受 all 或 certain。')
       if (edgeMode === 'certain' && !['file', 'impact', 'path'].includes(target.kind)) return failure('edgeMode=certain 适用于 file:/impact:/path: 文件依赖查询。')
+      if (args.format !== undefined && args.format !== 'auto' && args.format !== 'summary' && args.format !== 'detail') return failure('format 仅接受 auto / summary / detail。')
+      const format: ExposesFormat = args.format === 'summary' || args.format === 'detail' ? args.format : 'auto'
+      if (format !== 'auto' && target.kind !== 'exposes') return failure('format 只影响 exposes: 查询的视图。')
       const root = path.resolve(workdirOf(exec))
       const declarations = typeof args.declarations === 'string' ? args.declarations : undefined
       const compileCommands = typeof args.compileCommands === 'string' ? args.compileCommands : undefined
@@ -621,9 +869,34 @@ export function createTraceTool(workers?: AstWorkerPool) {
       }
       const nativePaths = [declarations, compileCommands].filter((file): file is string => Boolean(file)).map(file => path.resolve(root, file))
       if (nativePaths.length) await exec?.authorizeNativePaths?.(nativePaths)
+      // ---- paging: resolve the cursor before building anything -------------
+      // A cursor names one query against one snapshot, and that snapshot is
+      // looked up (and held) before the fresh assembly runs: an assembly may
+      // evict the oldest snapshot in this workspace, and a page request must not
+      // lose the very graph it was asked to continue.
+      const pageSize = pageLimit(args.limit)
+      if (pageSize === null) return failure('limit 必须是 1–500 的整数。')
+      const pageQuery = pageQueryOf(target.kind, value, edgeMode)
+      const cursorArg = typeof args.cursor === 'string' ? args.cursor.trim() : ''
+      let cursorPage: { cursor: PageCursorEntry; stored: { meta: TraceSnapshotMeta; payload: AssembledTrace } } | null = null
+      if (cursorArg) {
+        if (!pageQuery) return failure('cursor 只适用于 file:/impact:/exposes: 的分页结果。')
+        const cursor = readPageCursor(cursorArg)
+        if (!cursor) return failure('分页游标不存在或已过期（30 分钟）；请重新发起查询。')
+        if (cursor.workspace !== root) return failure('分页游标属于另一个工作区。')
+        if (!samePageQuery(cursor.query, target.kind, value, edgeMode)) {
+          return failure('分页游标属于另一个查询；请用原来的 target/edgeMode 重试，或重新发起查询。')
+        }
+        if (args.limit !== undefined && args.limit !== cursor.limit) {
+          return failure('分页游标已固定页大小；继续翻页时不要改变 limit。')
+        }
+        const stored = lookupTraceSnapshot(root, cursor.snapshotId)
+        if (stored.status !== 'ok') return failure('分页所用的快照已不可用（可能已被淘汰）；请重新发起查询。')
+        cursorPage = { cursor, stored }
+      }
       const assembled = await assembleTraceGraph(root, { declarations, compileCommands, signal: exec?.signal, workers })
       const { graph, decls, scanned, truncated, parseErrors, partialFiles, walkErrors, compilation, project } = assembled
-      const result = trace(graph, target.kind, value, edgeMode)
+      const result = trace(graph, target.kind, value, edgeMode, format)
       // Whole-graph queries (impact/path/ipc/…) would bury real findings under
       // thousands of external-package rows (real-repo A2: 4,377 noise items);
       // a single-file query keeps them — one bounded, meaningful row each.
@@ -637,22 +910,140 @@ export function createTraceTool(workers?: AstWorkerPool) {
       const incomplete = truncated || parseErrors > 0 || partialFiles > 0 || walkErrors > 0 || decls.status === 'failed'
         || compilation?.status === 'failed' || Boolean(compilation?.unsupported) || result.analysis?.complete === false || graph.resolutionLimited === true || issues.length > 0 || resolutionIncomplete
       const derivedKeys = graph.namedEntries.size
+      // Two lines, not eight. The scan scope, the confidence legend and the
+      // candidate-edge policy are identical in every reply on a given repo, so
+      // repeating them per call is a constant tax on a question that cannot
+      // change them — and the same facts already travel in the structured
+      // fields (scanned / decls / diagnostics / incomplete). Keep what the
+      // answer depends on: coverage (so "not found" is never mistaken for
+      // "absent"), edgeMode (the caller chose it), and anything that limits
+      // trust in THIS answer.
+      const scopeBits = [
+        `${graph.stats.withFacts} 文件`,
+        `${graph.stats.pages} 页面`,
+        describeDecls(decls.status, decls.apis.length, decls.error),
+        ...(derivedKeys ? [`${derivedKeys} 推导键`] : []),
+        ...(truncated ? ['⚠️ 扫描截断'] : []),
+        edgeMode === 'certain' ? '仅确定边' : '含候选边',
+      ]
+      const caveats = [
+        ...(localUnresolved.length || externalUnresolved || issues.length
+          ? [`${localUnresolved.length} 项本地未解析${externalUnresolved ? `（另有 ${externalUnresolved} 项外部包）` : ''}，${issues.length} 项文件/工程问题`]
+          : []),
+        ...(incomplete
+          ? [`读取/解析失败 ${parseErrors} 处，部分解析 ${partialFiles} 文件，遍历失败 ${walkErrors} 处${truncated ? '，候选截断' : ''}${result.analysis?.complete === false ? '，查询遍历受限' : ''}${resolutionIncomplete ? '，存在配置或归属限制' : ''}${compilation?.status === 'failed' || compilation?.unsupported ? '，编译元数据不全' : ''}`]
+          : []),
+        ...(compilation ? [`编译数据库 ${compilation.status} · ${compilation.entries} 条${compilation.unsupported ? ` · ${compilation.unsupported} 条不支持` : ''}`] : []),
+        ...(graph.resolutionLimited ? ['模块归属或 Java 继承成员解析达预算，推断已停止'] : []),
+      ]
+      // Issue paths stay: they name the files whose facts are unreliable, which
+      // is actionable. The per-issue message is the same sentence every time, so
+      // it is dropped — except on a collapsed row, where the message is the only
+      // place the hidden count lives.
+      const issueRows = collapseIssues(issues).slice(0, 3).map(issue =>
+        `  - \`${issue.path}\` · ${issue.reason}${issue.path.endsWith('/…') ? ` · ${issue.message}` : ''}`)
       const header = [
-        `- 范围：${graph.stats.withFacts} 个源码/HTML/模块清单/二进制文件 · ${graph.stats.pages} 个页面 · ${describeDecls(decls.status, decls.apis.length, decls.error)}${derivedKeys ? `（另有 ${derivedKeys} 个 preload 键静态推导）` : ''}${truncated ? ' · ⚠️ 扫描已截断' : ''}`,
-        '- 置信度：literal / const / 同文件或跨文件 wrapper 为直连，declared 经 preload 声明表，静态推导键来自 `键: wrapper(\'通道\')`；动态参数不入边。结果中的 `路径:行` 可直接回填 ffedit / ff_read。',
-        `- 文件依赖边：${edgeMode === 'certain' ? '仅确定边' : '包含候选边'}；确定仅表示静态文件引用可解析，不保证运行时执行。`,
-        ...(localUnresolved.length || externalUnresolved || issues.length ? [`- 解析诊断：本地未解析 ${localUnresolved.length} 项${externalUnresolved ? `（另有 ${externalUnresolved} 项外部包导入，不参与文件边）` : ''}，文件/工程问题 ${issues.length} 项；详见 diagnostics（各最多 100 项）。`] : []),
-        ...collapseIssues(issues).slice(0, 5).map(issue => `- ⚠️ \`${issue.path}\` · ${issue.reason} · ${issue.message}`),
-        ...(compilation ? [`- 编译数据库：${compilation.status} · ${compilation.entries} 条本地记录 · ${compilation.unsupported} 条不支持${compilation.message ? ` · ${compilation.message}` : ''}；只对有记录的源文件应用 include 搜索路径。`] : []),
-        ...(graph.resolutionLimited ? ['- ⚠️ 模块归属或 Java 继承成员解析达到预算，相关推断已停止；未找到不能证明不存在依赖。'] : []),
-        ...(incomplete ? [`- ⚠️ 分析不完整：读取/解析失败 ${parseErrors} 处，部分解析 ${partialFiles} 个文件，遍历失败 ${walkErrors} 处${truncated ? '，候选已截断' : ''}${result.analysis?.complete === false ? '，查询遍历受限' : ''}${resolutionIncomplete ? '，存在配置或归属限制' : ''}${compilation?.status === 'failed' || compilation?.unsupported ? '，编译元数据未完整解析' : ''}；未找到仅表示已分析范围内无命中。`] : []),
+        `- 范围：${scopeBits.join(' · ')}`,
+        ...(caveats.length ? [`- 限制：${caveats.join('；')}。未找到仅表示已分析范围内无命中。`] : []),
+        ...issueRows,
       ].join('\n')
       const [title, ...rest] = result.text.split('\n')
+      const snapshotInfo = (meta: TraceSnapshotMeta) => ({
+        snapshotId: meta.snapshotId,
+        configKey: meta.configKey,
+        strength: meta.strength,
+        provider: meta.provider,
+        providerVersion: meta.providerVersion,
+        files: meta.files,
+      })
+      // ---- paging: rows, not text -----------------------------------------
+      // A page must never be a re-slice of an already-truncated reply, and every
+      // page reads the same snapshot so offsets stay aligned while the workspace
+      // moves underneath.
+      let paged: { text: string; page: Record<string, unknown>; snapshot: ReturnType<typeof snapshotInfo>; stale: boolean } | null = null
+      if (cursorPage) {
+        const { cursor, stored } = cursorPage
+        // Pages after the first may only come from the snapshot the cursor
+        // names. If the workspace has moved on, say so instead of merging the
+        // two states into something that was never true.
+        const stale = cursor.snapshotId !== assembled.snapshot.snapshotId
+        // Keep the old snapshot retained while it is being browsed: the next
+        // page request must find it again, not a fresh graph standing in.
+        SNAPSHOTS.restore(stored.meta, stored.payload)
+        const rows = collectRows(stored.payload.graph, cursor.query)
+        const nextOffset = cursor.offset + cursor.limit
+        const next = nextOffset < rows.rows.length
+          ? registerPageCursor({ workspace: root, snapshotId: cursor.snapshotId, query: cursor.query, offset: nextOffset, limit: cursor.limit })
+          : null
+        const returned = Math.max(0, Math.min(cursor.limit, rows.rows.length - cursor.offset))
+        paged = {
+          text: renderPage({ title: title.replace(/^##\s*/, ''), rows, limit: cursor.limit, offset: cursor.offset, next, stale: stale ? { snapshotId: cursor.snapshotId } : null, total: rows.rows.length }),
+          snapshot: snapshotInfo(stored.meta),
+          stale,
+          page: {
+            offset: cursor.offset, returned, total: rows.rows.length, limit: cursor.limit,
+            ...(next ? { nextCursor: next } : {}), stale,
+            snapshotId: cursor.snapshotId,
+            traversalComplete: rows.traversalComplete, resultComplete: rows.resultComplete,
+            limitations: rows.limitations,
+          },
+        }
+      } else if (pageQuery && !(target.kind === 'exposes' && format === 'summary')) {
+        // An explicit format=summary asks for the collapsed view; overriding it
+        // with rows would be answering a different question. An explicit `limit`
+        // asks for rows, so it always gets them — even when they would fit in a
+        // single page, because the overview is a summary, not the row list.
+        const rows = collectRows(graph, pageQuery)
+        if (args.limit !== undefined || rows.rows.length > pageSize) {
+          const next = pageSize < rows.rows.length
+            ? registerPageCursor({ workspace: root, snapshotId: assembled.snapshot.snapshotId, query: pageQuery, offset: pageSize, limit: pageSize })
+            : null
+          paged = {
+            text: renderPage({ title: title.replace(/^##\s*/, ''), rows, limit: pageSize, offset: 0, next, stale: null, total: rows.rows.length }),
+            snapshot: snapshotInfo(assembled.snapshot),
+            stale: false,
+            page: {
+              offset: 0, returned: Math.min(pageSize, rows.rows.length), total: rows.rows.length, limit: pageSize,
+              ...(next ? { nextCursor: next } : {}), stale: false,
+              snapshotId: assembled.snapshot.snapshotId,
+              traversalComplete: rows.traversalComplete, resultComplete: rows.resultComplete,
+              limitations: rows.limitations,
+            },
+          }
+        }
+      }
+      if (paged) {
+        return {
+          found: result.found,
+          target: `${target.kind}:${value}`,
+          edgeMode,
+          text: paged.text,
+          snapshot: paged.snapshot,
+          page: paged.page,
+          scanned,
+          pages: graph.stats.pages,
+          decls: decls.status,
+          parseErrors,
+          partialFiles,
+          walkErrors,
+          incomplete,
+          diagnostics,
+          ...(project ? { project } : {}),
+          ...(graph.resolutionLimited ? { resolutionLimited: true } : {}),
+          ...(compilation ? { compilation } : {}),
+          // A stale page describes a graph the workspace has left; pairing it
+          // with the current analysis would assert a state that never existed.
+          ...(!paged.stale && result.analysis ? { analysis: result.analysis } : {}),
+          ...(!paged.stale && result.ffi ? { ffi: result.ffi } : {}),
+          ...(truncated ? { truncated: true } : {}),
+        }
+      }
       return {
         found: result.found,
         target: `${target.kind}:${value}`,
         edgeMode,
         text: [title, header, ...rest].join('\n'),
+        snapshot: snapshotInfo(assembled.snapshot),
         scanned,
         pages: graph.stats.pages,
         decls: decls.status,

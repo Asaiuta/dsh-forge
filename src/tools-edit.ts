@@ -46,6 +46,7 @@ import { createTicket, deleteTicket, loadTicket } from './tickets.ts'
 import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
 import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
 import { detectLanguage, enclosingSymbol, parseFile, syntaxValid } from './ast.ts'
+import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import {
   type FinderPool,
   type ForgeExec,
@@ -398,10 +399,49 @@ export function createEditTool(pool: FinderPool) {
             },
           },
           reports: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          audit: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              status: { type: 'string', required: true, enum: ['partial', 'not_run', 'stale'] },
+              reason: {
+                type: 'string',
+                required: true,
+                enum: ['legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale'],
+              },
+              detail: { type: 'string' },
+              verdict: { type: 'string' },
+              coverage: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  requested: { type: 'array', items: { type: 'string' } },
+                  analyzed: { type: 'integer' },
+                  traversalComplete: { type: 'boolean' },
+                  resultComplete: { type: 'boolean' },
+                  limitations: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                },
+              },
+              baseline: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  source: { type: 'string', enum: ['cached-graph', 'none'] },
+                  snapshot: { type: 'string', enum: ['pre-write'] },
+                  snapshotId: { type: 'string' },
+                  strength: { type: 'string', enum: ['observed', 'content-bound'] },
+                  scanned: { type: 'integer' },
+                  truncated: { type: 'boolean' },
+                },
+              },
+              globals: { type: 'array', items: { type: 'object', additionalProperties: true } },
+              rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            },
+          },
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; note?: string }) => {
+      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; audit?: EditAudit; note?: string }) => {
         const lines: string[] = []
         if (value.status === 'ticket') {
           lines.push(`ambiguous target — nothing written; ticket ${value.ticket} signed. Apply it with ffedit {ticket: "${value.ticket}", choice: <index>} (no path, no steps)`)
@@ -423,6 +463,7 @@ export function createEditTool(pool: FinderPool) {
           }
         }
         if (value.syntaxWarning) lines.push(`[warn] ${value.syntaxWarning}`)
+        if (value.audit) lines.push(...renderAudit(value.audit as Parameters<typeof renderAudit>[0]))
         if (value.note) lines.push(`[${value.note}]`)
         return text(lines.join('\n'))
       },
@@ -478,11 +519,16 @@ export function createEditTool(pool: FinderPool) {
       }
       const abs = resolveFilePath(exec, rawPath)
       const workdir = canonicalWorkspace(workdirOf(exec))
-      return withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
+      // The write lock covers the batch only. Auditing after it releases keeps a
+      // slow graph read from holding construction back; the post-write hash is
+      // carried out of the lock so a later writer becomes `stale`, not a finding.
+      const committed: ApplyResult | { throwable: string } = await withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
         try {
-          return shapeApplyResult(await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode: 'atomic', exec, revertOnSyntaxError: args.revertOnSyntaxError === true }))
-        } catch (cause) { return failure(causeMessage(cause)) }
+          return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode: 'atomic', exec, revertOnSyntaxError: args.revertOnSyntaxError === true })
+        } catch (cause) { return { throwable: causeMessage(cause) } }
       }))
+      if ('throwable' in committed) return failure(committed.throwable)
+      return shapeCommitted(committed, { workdir, abs, steps })
     },
   } as const
 }
@@ -536,38 +582,49 @@ async function decideTicket(pool: FinderPool, id: string, args: Record<string, u
   const abs = ticket.file
   const workdir = ticket.workdir
   await exec?.authorizeNativePaths?.([workdir, abs])
-  return withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
-    const live = loadTicket(id)
-    if ('error' in live) return failure(live.error)
-    // All choices refer to one original snapshot; any drift requires a new decision.
-    const stillThere = existsSync(abs) && sha256(readFileSync(abs)) === ticket.sourceHash
-      && chosen.every(candidate => candidate.startOffset !== undefined ? new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(abs)).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').slice(candidate.startOffset, candidate.endOffset) === step.find
-        : verifyCandidateStillMatches(abs, step.find ?? '', candidate.start, candidate.end))
-    if (stillThere) {
-      const result = await applyBatch(pool, {
-        abs,
-        workdir,
-        steps: ticket.steps,
-        reason: ticket.reason,
-        actor: actorOf(exec),
-        mode: 'atomic',
-        ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}),
-        exec,
-        pinned: [...ticket.decisions, ...chosen.map(candidate => ({ ...candidate, stepIndex: ticket.stepIndex }))],
-      })
-      if (result.ok || 'ticket' in result) {
-        // Success consumes the ticket; a NEW ambiguity (another target step
-        // of the same batch) supersedes it with the fresh ticket.
-        deleteTicket(id)
+  // Same split as a fresh batch: commit under the lock, audit after it. A
+  // ticket reply must not produce a different audit story than the same edit
+  // sent directly — that difference is how "I answered the ticket" ends up
+  // looking checked when it was not.
+  const committed: { result: ApplyResult } | { fresh: ApplyResult } | { throwable: string } = await withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
+    try {
+      const live = loadTicket(id)
+      if ('error' in live) return { throwable: live.error }
+      // All choices refer to one original snapshot; any drift requires a new decision.
+      const stillThere = existsSync(abs) && sha256(readFileSync(abs)) === ticket.sourceHash
+        && chosen.every(candidate => candidate.startOffset !== undefined ? new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(abs)).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').slice(candidate.startOffset, candidate.endOffset) === step.find
+          : verifyCandidateStillMatches(abs, step.find ?? '', candidate.start, candidate.end))
+      if (stillThere) {
+        const result = await applyBatch(pool, {
+          abs,
+          workdir,
+          steps: ticket.steps,
+          reason: ticket.reason,
+          actor: actorOf(exec),
+          mode: 'atomic',
+          ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}),
+          exec,
+          pinned: [...ticket.decisions, ...chosen.map(candidate => ({ ...candidate, stepIndex: ticket.stepIndex }))],
+        })
+        if (result.ok || 'ticket' in result) {
+          // Success consumes the ticket; a NEW ambiguity (another target step
+          // of the same batch) supersedes it with the fresh ticket.
+          deleteTicket(id)
+        }
+        return { result }
       }
-      return shapeApplyResult(result)
-    }
-    // Invalidated — re-plan against current content.
-    deleteTicket(id)
-    const fresh = await applyBatch(pool, { abs, workdir, steps: ticket.steps, reason: ticket.reason,
-      actor: actorOf(exec), mode: 'atomic', noWrite: true })
-    return 'ticket' in fresh ? shapeApplyResult(fresh) : failure(!fresh.ok && 'error' in fresh ? fresh.error : 'ticket invalidated; re-send ffedit against current content')
+      // Invalidated — re-plan against current content.
+      deleteTicket(id)
+      const fresh = await applyBatch(pool, { abs, workdir, steps: ticket.steps, reason: ticket.reason,
+        actor: actorOf(exec), mode: 'atomic', noWrite: true })
+      return { fresh }
+    } catch (cause) { return { throwable: causeMessage(cause) } }
   }))
+  if ('throwable' in committed) return failure(committed.throwable)
+  if ('fresh' in committed) {
+    return 'ticket' in committed.fresh ? shapeApplyResult(committed.fresh) : failure(!committed.fresh.ok && 'error' in committed.fresh ? committed.fresh.error : 'ticket invalidated; re-send ffedit against current content')
+  }
+  return shapeCommitted(committed.result, { workdir, abs, steps: ticket.steps, kind: 'ticket' })
 }
 
 /** Project the engine result onto the tool output shape. Hard failures keep
@@ -609,6 +666,30 @@ function shapeApplyResult(result: ApplyResult): Record<string, unknown> {
     })
     .join('; ')
   return { error: detail ? `${result.error} — ${detail}` : result.error }
+}
+
+/**
+ * The one place a landable batch turns into a tool reply, audit included.
+ *
+ * Both ffedit paths (a fresh batch and a ticket reply) go through here, so the
+ * same bytes produce the same audit sentence regardless of which entry point
+ * wrote them. A no-change batch and an ambiguity ticket wrote nothing, so they
+ * carry no audit at all: pretending to recheck untouched bytes is exactly the
+ * "unrun looks like passed" failure the audit status vocabulary exists to stop.
+ */
+function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket' }): Record<string, unknown> {
+  const shaped = shapeApplyResult(result)
+  if (!result.ok || result.noChange) return shaped
+  const audit = auditCommit({
+    workspace: context.workdir,
+    batchId: result.batchId,
+    kind: context.kind ?? 'edit',
+    changed: [{ rel: relForward(context.workdir, context.abs), abs: context.abs }],
+    steps: context.steps,
+    hash: result.hash,
+    syntaxWarning: result.syntaxWarning !== undefined,
+  })
+  return { ...shaped, audit }
 }
 
 // ---------------------------------------------------------------------------

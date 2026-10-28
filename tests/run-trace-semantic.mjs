@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-semantic-'))
 const previous = process.env.DSH_FORGE_AST_WORKERS, pool = new AstWorkerPool()
@@ -221,7 +222,7 @@ try {
   for (const file of ['java/duplicate/Helper.java', 'cpp/duplicate.cppm', 'modules/duplicate/module-info.java']) fs.unlinkSync(path.join(root, file))
   const restored = await assembleTraceGraph(root)
   resetTraceFactsCache(); process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { workers: pool }), restored)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { workers: pool }), restored, 'worker vs sequential java/cpp facts')
   ok('Worker extraction and sequential extraction agree on all new facts and complete graph data after refresh')
   for (let i = 0; i <= 65; i++) put(`java/limited/P${i}.java`, `package limited; class P${i}${i < 65 ? ' extends P' + (i + 1) : ''} {}\n`)
   put('java/limited/Helper.java', 'package limited; class Helper {}\n')

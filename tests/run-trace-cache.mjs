@@ -6,6 +6,7 @@ import path from 'node:path'
 import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { extractTraceFile } from '../lib/trace-facts.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-cache-'))
 const previousWorkers = process.env.DSH_FORGE_AST_WORKERS
@@ -77,7 +78,9 @@ try {
   assert.equal(coverage.parseErrors, 1)
   assert.ok(coverage.partialFiles >= 1)
   assert.equal(coverage.incomplete, true)
-  assert.match(coverage.text, /分析不完整.*已分析范围/)
+  // The incomplete-analysis notice is one "限制" line now; what it must still
+  // carry is the promise that "not found" is scoped to what was analysed.
+  assert.match(coverage.text, /限制[\s\S]*已分析范围/)
   const nonDirectory = await assembleTraceGraph(path.join(root, 'main.js'))
   assert.equal(nonDirectory.walkErrors, 1)
   fs.unlinkSync(path.join(root, 'large.js'))
@@ -89,7 +92,7 @@ try {
   clear()
   process.env.DSH_FORGE_AST_WORKERS = '2'
   const parallel = await assembleTraceGraph(root, { declarations: 'decls.json', workers: pool })
-  assert.deepEqual(parallel, sequential)
+  sameGraphExceptSnapshot(parallel, sequential, 'parallel vs sequential')
   ok('parallel and sequential pipelines produce the same complete graph')
 
   const rootOne = path.join(root, 'root-one'), rootTwo = path.join(root, 'root-two'), rootAlias = path.join(root, 'root-alias')
