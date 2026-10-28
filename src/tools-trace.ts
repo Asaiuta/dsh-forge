@@ -21,6 +21,9 @@ import { parseTarget, trace, type ExposesFormat } from './trace-queries.ts'
 import { loadCompilationDatabase, resetCompilationCache, type CompilationInfo } from './compile-commands.ts'
 import { scriptFacts, jsReferences, topLevelAliasNames, type TraceFileFacts } from './facts.ts'
 import { workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
+import { readBoundedFile } from './fs-paths.ts'
+import { extractTraceFileFromBytes } from './trace-facts.ts'
+import { fileSetDigestOf, loadBaseline, saveBaseline, type CaptureBaseline, type CapturedFile } from './trace-capture.ts'
 import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from './ast-pool.ts'
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
 import { indexerCollectCandidates, indexerProbesUnchanged, indexerReady, indexerStatPaths, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
@@ -38,6 +41,17 @@ import type { EdgeMode, ProjectContext, TraceDiagnostic } from './trace-evidence
 
 const FILE_CAP = 20_000
 const PER_FILE_BYTES = 2 * 1024 * 1024
+/** Total source bytes one capture may read. Above this the capture stops and
+ *  says so; a partial baseline cannot answer "no new problem". Overridable so a
+ *  test can force the truncated case without materializing 256 MiB. */
+function captureReadBudget(): number {
+  const raw = process.env.DSH_FORGE_CAPTURE_BUDGET_BYTES
+  if (raw !== undefined) {
+    const value = Number(raw)
+    if (Number.isFinite(value) && value >= 0) return value
+  }
+  return 256 * 1024 * 1024
+}
 const WALK_VISIT_CAP = 200_000
 
 function failure(error: string): ToolFailure {
@@ -207,8 +221,9 @@ export function resetTraceFactsCache(): void {
 }
 
 /** Scan one root: per-file facts (HTML scanner + AST extractor). */
-async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool) {
+async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool, capture = false) {
   const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors } = await collectCandidates(root, signal)
+  if (capture) return scanFactsForCapture(root, files, { projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors }, signal)
   // Discovery never follows directory links below root. Check root's own
   // identity once so retargeting an alias cannot reuse another tree's facts,
   // even when every source file happens to have identical stat metadata.
@@ -295,6 +310,115 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
     signature: JSON.stringify([rootIdentity, stamps, outcomes.map(value => [Boolean(value.value), value.parseErrors, value.partialFiles, value.diagnostics]), truncated, walkErrors]) }
 }
 
+/**
+ * The formal capture read (M1.1).
+ *
+ * Deliberately separate from the fast scanner rather than a flag inside it.
+ * The fast path is optimized for reuse: it consults the stat cache, hands whole
+ * languages to the sidecar and remembers what it parsed. A capture must do the
+ * opposite of every one of those things — read each file itself, extract from
+ * the exact bytes it read, and never take a cached fact as this content —
+ * because the hash it records is a promise about those bytes.
+ *
+ * Files are read sequentially: memory is the constraint here (a 256 MiB capture
+ * read would be a 256 MiB live set if it went parallel), and capture is an
+ * explicit, occasional action rather than a per-query cost.
+ */
+async function scanFactsForCapture(
+  root: string,
+  files: Array<{ abs: string; rel: string }>,
+  context: { projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number },
+  signal?: AbortSignal,
+) {
+  let rootIdentity: string | null = null
+  try { rootIdentity = realpathSync(root) } catch { /* walkErrors reports an inaccessible root */ }
+  const entries = new Map<string, TraceFileFacts>()
+  const captures = new Map<string, CapturedFile>()
+  const diagnostics: TraceDiagnostic[] = []
+  const budget = captureReadBudget()
+  let parseErrors = 0, partialFiles = 0, capturedBytes = 0, truncated = context.truncated
+  for (const { abs, rel } of files) {
+    signal?.throwIfAborted()
+    const binary = BINARY_EXTENSIONS.has(path.extname(abs).toLowerCase())
+    const cap = binary ? MAX_BINARY_BYTES : PER_FILE_BYTES
+    let before
+    try {
+      before = statSync(abs)
+    } catch (cause) {
+      parseErrors++
+      diagnostics.push({ path: rel, reason: 'stat_failed', message: cause instanceof Error ? cause.message : String(cause) })
+      continue
+    }
+    if (before.size > cap) {
+      parseErrors++
+      diagnostics.push({ path: rel, reason: 'file_too_large', message: '文件超过 Trace 单文件读取上限。' })
+      continue
+    }
+    if (capturedBytes + before.size > budget) {
+      truncated = true
+      diagnostics.push({ path: rel, reason: 'capture_budget', message: `捕获读取超过 ${(budget / 1048576).toFixed(1)} MiB 预算，其余文件未读取。` })
+      break
+    }
+    let raw: Buffer
+    try {
+      raw = readBoundedFile(abs, cap)
+    } catch (cause) {
+      parseErrors++
+      diagnostics.push({ path: rel, reason: 'read_failed', message: cause instanceof Error ? cause.message : String(cause) })
+      continue
+    }
+    capturedBytes += raw.length
+    // The bytes above may be a torn read: a writer can replace the file between
+    // the stat and the read. Re-stating is what lets the baseline notice, and a
+    // capture that noticed is not content-bound.
+    let stable = true
+    try {
+      const after = statSync(abs)
+      stable = after.size === before.size && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs
+    } catch {
+      stable = false
+    }
+    if (!stable) {
+      partialFiles++
+      diagnostics.push({ path: rel, reason: 'capture_unstable', message: '捕获读取期间文件发生变化，本文件的事实不作为内容基线。' })
+      continue
+    }
+    const outcome = await extractTraceFileFromBytes(abs, raw, { strict: true })
+    parseErrors += outcome.parseErrors
+    partialFiles += outcome.partialFiles
+    for (const issue of outcome.diagnostics ?? []) diagnostics.push({ ...issue, path: rel })
+    if (outcome.parseErrors === 0) captures.set(rel, { path: rel, rawHash: outcome.rawHash, textHash: outcome.textHash, bytes: raw.length })
+    if (outcome.value) entries.set(rel, outcome.value)
+  }
+  return {
+    entries,
+    projectFiles: context.projectFiles,
+    pythonFiles: context.pythonFiles,
+    cargoFiles: context.cargoFiles,
+    goFiles: context.goFiles,
+    diagnostics,
+    scanned: files.length,
+    truncated,
+    parseErrors,
+    partialFiles,
+    walkErrors: context.walkErrors,
+    captures,
+    capturedBytes,
+    signature: JSON.stringify([rootIdentity, [...captures.values()].map(file => [file.path, file.rawHash]), truncated, context.walkErrors]),
+  }
+}
+
+/** One line for a capture reply. Silence would let a caller believe the fast
+ *  path ran; saying "persisted: false, here is why" is the whole point. */
+function captureHeader(capture: AssembledTrace['capture']): string {
+  if (!capture) return ''
+  const scope = `捕获 ${capture.files} 文件 · ${(capture.bytes / 1024).toFixed(0)} KB`
+  if (capture.persisted) {
+    return `- ${scope} · 已保存内容基线（content-bound；快照 ID 可用于改动前后比较）${capture.evicted ? ` · 已轮换最旧基线 ${capture.evicted}` : ''}`
+  }
+  return `- ${scope} · ⚠️ 未保存基线：${capture.saveError ?? '未知原因'}；本次结果只描述当前状态`
+}
+
 function describeDecls(status: string, apis: number, error?: string): string {
   if (status === 'ok') return `preload 声明表 ${apis} 个 API`
   if (status === 'absent') return '无 preload 声明表（只有字面量边）'
@@ -315,9 +439,28 @@ export interface AssembledTrace {
   /** Which snapshot answered (M0.4): resolvable through
    *  {@link lookupTraceSnapshot}, never assumed current. */
   snapshot: TraceSnapshotMeta
+  /** Set only on a capture (`capture=true`): what was read and whether the
+   *  baseline reached disk. Absent means this was an ordinary fast-path scan. */
+  capture?: {
+    files: number
+    bytes: number
+    persisted: boolean
+    path?: string
+    evicted?: string
+    saveError?: string
+  }
 }
 
-export interface TraceAssemblyOptions { declarations?: string; compileCommands?: string; signal?: AbortSignal; workers?: AstWorkerPool }
+export interface TraceAssemblyOptions {
+  declarations?: string
+  compileCommands?: string
+  signal?: AbortSignal
+  workers?: AstWorkerPool
+  /** Read every file as bytes and persist a content-bound baseline (M1.1).
+   *  Bypasses the warm-graph cache and the sidecar: the hash must describe the
+   *  bytes that were parsed, and no cached fact qualifies. */
+  capture?: boolean
+}
 interface GraphProbe { exists: boolean; identity: string | null }
 const GRAPH_CACHE = new Map<string, { signature: string; decls: string; contexts: Array<ProjectContext | undefined>; probes: Map<string, GraphProbe>; assembled: AssembledTrace }>()
 interface PendingAssembly { controller: AbortController; users: number; promise: Promise<AssembledTrace> }
@@ -372,6 +515,64 @@ export function traceSnapshotStatus(workspace: string | undefined): {
 export function resetTraceSnapshots(): void {
   SNAPSHOTS.clear()
   PAGE_CURSORS.clear()
+}
+
+export type BeforeEvidence =
+  | { ok: true; snapshotId: string; rawHash: string; source: 'capture'; createdAt: string }
+  | { ok: false; reason: 'unavailable' | 'not_covered' | 'drift' | 'observed_only'; detail: string }
+
+/**
+ * Validate a snapshot ID offered as *before* evidence for one file edit (M1.1).
+ *
+ * The caller is about to write, and an edit that says "verified against
+ * snapshot X" is claiming the write happened to the file X described. Three
+ * things can make that claim false, and each has its own answer:
+ *
+ *   - the snapshot is gone or belongs elsewhere → `unavailable`;
+ *   - the capture never read this file → `not_covered` (a baseline that did not
+ *     see the file cannot have a surprise about it);
+ *   - the bytes on disk are not the bytes that were captured → `drift`.
+ *
+ * An ordinary in-process snapshot (`strength: observed`) is *not* enough: it
+ * checked a file set and resolution probes, never the contents, so it has no
+ * per-file hash to compare. That is `observed_only`, which points at `capture`.
+ *
+ * Returning `ok` does not mean the edit is correct — only that the before-hash
+ * exists and still matches. Nothing here reads the graph.
+ */
+export function resolveBeforeEvidence(workspace: string, snapshotId: string, absoluteFile: string): BeforeEvidence {
+  const root = path.resolve(workspace)
+  const relative = path.relative(root, absoluteFile).split(path.sep).join('/')
+  if (relative.startsWith('../') || path.isAbsolute(relative)) {
+    return { ok: false, reason: 'not_covered', detail: `文件 ${absoluteFile} 不在工作区 ${root} 内，无法用该快照的基线校验` }
+  }
+  const inProcess = SNAPSHOTS.get(snapshotId, root)
+  const stored = loadBaseline(root, snapshotId)
+  if (stored.ok) {
+    const baseline = stored.baseline
+    const recorded = baseline.files.find(file => file.path === relative)
+    if (!recorded) {
+      return { ok: false, reason: 'not_covered', detail: `基线 ${snapshotId} 未覆盖 ${relative}（捕获时该文件不存在、被跳过或超限）；请重新捕获或省略 snapshotId` }
+    }
+    let current: string | null = null
+    try { current = sha256Hex(readFileSync(absoluteFile)) } catch { current = null }
+    if (current !== recorded.rawHash) {
+      return {
+        ok: false, reason: 'drift',
+        detail: current === null
+          ? `${relative} 在捕获后已被删除，不能作为该基线的编辑对象`
+          : `${relative} 在捕获后已改变（捕获 ${recorded.rawHash.slice(0, 12)}… ≠ 现在 ${current.slice(0, 12)}…）；请重新捕获或以普通编辑提交`,
+      }
+    }
+    return { ok: true, snapshotId, rawHash: recorded.rawHash, source: 'capture', createdAt: baseline.createdAt }
+  }
+  if (inProcess.status === 'ok') {
+    return {
+      ok: false, reason: 'observed_only',
+      detail: `快照 ${snapshotId} 是 observed 强度（只校验了文件集合，没有逐文件内容身份），无法校验 beforeHash；请用 fftrace capture=true 生成内容基线`,
+    }
+  }
+  return { ok: false, reason: 'unavailable', detail: `${snapshotId}：${stored.detail}` }
 }
 
 /** Rows per page. A reply is re-read by every later call, so a page has to stay
@@ -537,8 +738,9 @@ function probesUnchanged(root: string, probes: ReadonlyMap<string, GraphProbe>):
 }
 
 async function assemble(root: string, key: string, options: TraceAssemblyOptions): Promise<AssembledTrace> {
+  const capture = options.capture === true
   const decls = await loadPreloadDecls(root, options.declarations, options.signal)
-  const scan = await scanFacts(root, options.signal, options.workers)
+  const scan = await scanFacts(root, options.signal, options.workers, capture)
   // One pass over the facts answers everything the five loaders need to be
   // called or skipped. The JS file-reference map needed a pass of its own
   // anyway, and the other four only ever asked one question each.
@@ -587,8 +789,10 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
     },
   })
   const configKey = configKeyOf(config)
-  const native = indexerTraceWanted() && await indexerReady({ signal: options.signal })
-  if (cached && cached.signature === scan.signature && cached.decls === declsKey
+  const native = !capture && indexerTraceWanted() && await indexerReady({ signal: options.signal })
+  // A capture must never answer from a cached graph: its whole product is a hash
+  // of the bytes it read *now*. The fast path is unaffected.
+  if (!capture && cached && cached.signature === scan.signature && cached.decls === declsKey
     && cached.assembled.snapshot.configKey === configKey
     && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
     && scan.walkErrors === 0 && !scan.truncated) {
@@ -614,6 +818,11 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   options.signal?.throwIfAborted()
   const probes = new Map<string, GraphProbe>()
   const graph = buildGraph(root, entries, decls, (rel, exists, identity) => probes.set(rel, { exists, identity: identity ?? null }), compilation?.resolve, project?.resolve, { python, rust, go })
+  const captured = capture ? (scan as { captures: Map<string, CapturedFile>; capturedBytes: number }).captures : undefined
+  // A capture is only content-bound when every file it listed was read cleanly.
+  // Truncation, a partial parse or an unstable read downgrade the claim instead
+  // of being papered over by the files that happened to succeed.
+  const contentBound = capture && captured !== undefined && !scan.truncated && scan.partialFiles === 0
   const assembled: AssembledTrace = { graph, decls, scanned: scan.scanned, truncated: scan.truncated, parseErrors: scan.parseErrors, partialFiles: scan.partialFiles, walkErrors: scan.walkErrors,
     diagnostics: [...scan.diagnostics, ...project?.issues ?? [], ...python?.issues ?? [], ...rust?.issues ?? [], ...go?.issues ?? []],
     ...(project ? { project: { configs: project.configs, workspacePackages: project.workspacePackages } } : {}),
@@ -628,12 +837,55 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
       probes: probes.size,
       scanned: scan.scanned,
       truncated: scan.truncated,
-      strength: 'observed',
-      provider: native ? 'native' : 'wasm',
+      strength: contentBound ? 'content-bound' : 'observed',
+      // Capture never trusts the sidecar for facts: it has to hash the same
+      // bytes it parsed, and the sidecar reports no content identity for its
+      // input yet.
+      provider: !capture && native ? 'native' : 'wasm',
     }),
   }
   SNAPSHOTS.put(assembled.snapshot, assembled)
-  if (!scan.truncated && scan.walkErrors === 0) {
+  if (captured) {
+    assembled.capture = {
+      files: captured.size,
+      bytes: (scan as { capturedBytes: number }).capturedBytes,
+      persisted: false,
+    }
+    if (contentBound) {
+      const files = [...captured.values()].sort((a, b) => a.path.localeCompare(b.path))
+      const baseline: CaptureBaseline = {
+        schema: 'trace-capture/1',
+        snapshotId: assembled.snapshot.snapshotId,
+        workspaceId: root,
+        configKey,
+        config,
+        provider: 'wasm',
+        providerVersion: 'wasm-content-bound',
+        createdAt: assembled.snapshot.createdAt,
+        strength: 'content-bound',
+        files,
+        fileSetDigest: fileSetDigestOf(files),
+        probes: probes.size,
+        scanned: scan.scanned,
+        truncated: false,
+        partialFiles: 0,
+        capturedBytes: assembled.capture.bytes,
+        facts: Object.fromEntries(scan.entries),
+      }
+      const saved = saveBaseline(baseline)
+      if (saved.ok) {
+        assembled.capture = { ...assembled.capture, persisted: true, path: saved.path, ...(saved.evicted ? { evicted: saved.evicted } : {}) }
+      } else {
+        assembled.capture = { ...assembled.capture, persisted: false, saveError: saved.detail }
+      }
+    } else {
+      assembled.capture = {
+        ...assembled.capture,
+        saveError: `捕获不完整（截断=${scan.truncated}，部分解析=${scan.partialFiles}），不能作为内容基线保存`,
+      }
+    }
+  }
+  if (!capture && !scan.truncated && scan.walkErrors === 0) {
     GRAPH_CACHE.delete(key)
     GRAPH_CACHE.set(key, { signature: scan.signature, decls: declsKey, contexts, probes, assembled })
     if (GRAPH_CACHE.size > 4) GRAPH_CACHE.delete(GRAPH_CACHE.keys().next().value!)
@@ -665,7 +917,7 @@ export function peekTraceGraph(root: string): AssembledTrace | undefined {
 export function assembleTraceGraph(root: string, options: TraceAssemblyOptions = {}): Promise<AssembledTrace> {
   options.signal?.throwIfAborted()
   root = path.resolve(root)
-  const key = JSON.stringify([root, options.declarations ? path.resolve(root, options.declarations) : null, options.compileCommands ? path.resolve(root, options.compileCommands) : null])
+  const key = JSON.stringify([root, options.declarations ? path.resolve(root, options.declarations) : null, options.compileCommands ? path.resolve(root, options.compileCommands) : null, options.capture === true ? 'capture' : 'fast'])
   let owners = PENDING.get(key)
   if (!owners) { owners = new Map(); PENDING.set(key, owners) }
   let job = owners.get(options.workers)
@@ -718,6 +970,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
       format: { type: 'string', enum: ['auto', 'summary', 'detail'], description: 'exposes: 视图：auto（默认）按规模分档，survey 折叠为每个 expose 一行，小桥接保留逐键站点；detail 展开全部逐键站点。' },
       limit: { type: 'integer', description: 'symbol: 最多返回的定义数（1-200，默认 50）；file:/impact:/exposes: 每页行数（1-500，默认 100）。' },
       cursor: { type: 'string', description: 'file:/impact:/exposes: 的后续页游标，取自上一页的 nextCursor；只能与同一 target/edgeMode 和同一 limit 一起使用，过期或换查询需重新发起。' },
+      capture: { type: 'boolean', description: '正式捕获路径：逐文件读取字节、按同一份内容提取事实并保存内容基线（跨进程可用于改动前后比较）。绕过缓存与 sidecar，比普通查询慢；不完整时明确报错而不谎称基线。' },
     },
     output: {
       schema: {
@@ -735,6 +988,16 @@ export function createTraceTool(workers?: AstWorkerPool) {
               provider: { type: 'string', required: true, enum: ['wasm', 'native'] },
               providerVersion: { type: 'string', required: true },
               files: { type: 'integer', required: true },
+            },
+          },
+          capture: {
+            type: 'object', additionalProperties: false, properties: {
+              files: { type: 'integer', required: true },
+              bytes: { type: 'integer', required: true },
+              persisted: { type: 'boolean', required: true },
+              path: { type: 'string' },
+              evicted: { type: 'string' },
+              saveError: { type: 'string' },
             },
           },
           text: { type: 'string', required: true },
@@ -894,7 +1157,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
         if (stored.status !== 'ok') return failure('分页所用的快照已不可用（可能已被淘汰）；请重新发起查询。')
         cursorPage = { cursor, stored }
       }
-      const assembled = await assembleTraceGraph(root, { declarations, compileCommands, signal: exec?.signal, workers })
+      const assembled = await assembleTraceGraph(root, { declarations, compileCommands, signal: exec?.signal, workers, capture: args.capture === true })
       const { graph, decls, scanned, truncated, parseErrors, partialFiles, walkErrors, compilation, project } = assembled
       const result = trace(graph, target.kind, value, edgeMode, format)
       // Whole-graph queries (impact/path/ipc/…) would bury real findings under
@@ -1019,6 +1282,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
           edgeMode,
           text: paged.text,
           snapshot: paged.snapshot,
+          ...(assembled.capture ? { capture: assembled.capture } : {}),
           page: paged.page,
           scanned,
           pages: graph.stats.pages,
@@ -1042,8 +1306,9 @@ export function createTraceTool(workers?: AstWorkerPool) {
         found: result.found,
         target: `${target.kind}:${value}`,
         edgeMode,
-        text: [title, header, ...rest].join('\n'),
+        text: [title, captureHeader(assembled.capture), header, ...rest].filter(Boolean).join('\n'),
         snapshot: snapshotInfo(assembled.snapshot),
+        ...(assembled.capture ? { capture: assembled.capture } : {}),
         scanned,
         pages: graph.stats.pages,
         decls: decls.status,

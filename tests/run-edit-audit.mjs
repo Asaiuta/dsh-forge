@@ -435,5 +435,89 @@ const assertNoFalsePass = (audit, label) => {
   } finally { ws.close() }
 }
 
+// --- case 15: a named snapshot gates the write ------------------------------
+{
+  const ws = workspace({ 'preloads/chart.js': PRELOAD(), ...CHART_CONSUMERS })
+  const files = createFileTool()
+  try {
+    resetTraceFactsCache()
+    const captured = await assembleTraceGraph(ws.root, { capture: true })
+    assert.equal(captured.capture?.persisted, true, captured.capture?.saveError ?? 'capture must persist')
+    const id = captured.snapshot.snapshotId
+
+    // Unchanged file: the write is allowed and says what it was checked against.
+    const allowed = await ws.tool.execute({
+      path: 'preloads/chart.js',
+      find: "  unusedThing: () => ipcRenderer.invoke('chart:unused'),",
+      replaceWith: '  spareThing: () => 0,',
+      reason: 'test: edit authorized by a capture baseline',
+      snapshotId: id,
+    }, ws.exec)
+    assert.equal(allowed.status, 'applied', allowed.error)
+    assert.deepEqual(allowed.beforeEvidence, { snapshotId: id, verified: true })
+
+    // The file is not the captured file any more: the same id must now refuse,
+    // and the refusal must leave the file alone.
+    const drifted = await ws.tool.execute({
+      path: 'preloads/chart.js',
+      find: '  spareThing: () => 0,',
+      replaceWith: '  spareThing: () => 1,',
+      reason: 'test: edit refused after drift',
+      snapshotId: id,
+    }, ws.exec)
+    assert.notEqual(drifted.error, undefined, 'drift must refuse the write')
+    assert.match(drifted.error, /drift/)
+    assert.equal(ws.read('preloads/chart.js').includes('spareThing: () => 0,'), true, 'a refused write changes nothing')
+
+    // A file the capture never read is not_covered — not a pass, not a block on
+    // ordinary editing. `renderer/panel.js` was captured, so use a file created
+    // after the capture: the baseline demonstrably predates it.
+    ws.put('renderer/late.js', 'window.chartAPI.listCharts()\n')
+    const uncovered = await ws.tool.execute({
+      path: 'renderer/late.js',
+      find: 'window.chartAPI.listCharts()',
+      replaceWith: 'window.chartAPI.listCharts()',
+      reason: 'test: file created after the capture',
+      snapshotId: id,
+    }, ws.exec)
+    assert.match(uncovered.error ?? '', /not_covered/)
+
+    // An observed-only snapshot has no per-file hash to offer.
+    const observed = await assembleTraceGraph(ws.root)
+    const weak = await ws.tool.execute({
+      path: 'preloads/chart.js',
+      find: '  spareThing: () => 0,',
+      replaceWith: '  spareThing: () => 2,',
+      reason: 'test: observed-only snapshot',
+      snapshotId: observed.snapshot.snapshotId,
+    }, ws.exec)
+    assert.match(weak.error ?? '', /observed_only/)
+
+    // Omitting snapshotId stays an ordinary edit.
+    const plain = await ws.tool.execute({
+      path: 'preloads/chart.js',
+      find: '  spareThing: () => 0,',
+      replaceWith: '  spareThing: () => 3,',
+      reason: 'test: ordinary edit without a baseline',
+    }, ws.exec)
+    assert.equal(plain.status, 'applied', plain.error)
+    assert.equal(plain.beforeEvidence, undefined)
+
+    // ff_file: a create is expected to be absent, so creating a new file under
+    // a baseline succeeds; overwriting a captured file as a "create" is refused.
+    const created = await files.execute({ action: 'create', path: 'preloads/new.js', content: 'module.exports = 2\n', reason: 'test: create under a baseline', snapshotId: id }, ws.exec)
+    assert.equal(created.batch > 0, true, JSON.stringify(created))
+    const covered = await files.execute({ action: 'create', path: 'preloads/chart.js', content: 'module.exports = 3\n', overwrite: true, reason: 'test: create over a captured file', snapshotId: id }, ws.exec)
+    assert.notEqual(covered.error, undefined, 'a create over a captured file must be refused')
+    // Re-capture so the file is again exactly what a baseline describes; then the
+    // refusal is specifically "this is an overwrite, not a create".
+    const fresh = await assembleTraceGraph(ws.root, { capture: true })
+    const overCaptured = await files.execute({ action: 'create', path: 'preloads/chart.js', content: 'module.exports = 3\n', overwrite: true, reason: 'test: overwrite a captured file as create', snapshotId: fresh.snapshot.snapshotId }, ws.exec)
+    assert.match(overCaptured.error ?? '', /overwrite|covers/)
+    assert.equal(ws.read('preloads/chart.js').includes('module.exports = 3'), false, 'the refused create wrote nothing')
+    ok('a snapshotId gates the write: verified passes, drift/observed/not_covered refuse by name')
+  } finally { ws.close() }
+}
+
 console.log(`\n${passed} post-edit audit groups passed`)
 try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmpdir cleanup fallback */ }

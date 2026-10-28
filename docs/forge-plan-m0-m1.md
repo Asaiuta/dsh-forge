@@ -1,6 +1,6 @@
 # M0–M1：证据契约与 Electron 闭环实施手册
 
-状态：M0 已实施（M0.1–M0.4、M0.6、M0.7 落地并有测试；M0.5 已落地）。M1 待实施。先读[公共契约](forge-plan-contracts.md)；下面新增字段/函数/脚本均为实施目标，不是当前能力。任务保持与[路线图](forge-capability-roadmap-2026-10-28.md)同号。
+状态：M0 已实施（M0.1–M0.7 全部落地并有测试）。M1.1 已实施（内容基线捕获、`snapshotId` 编辑门槛、跨进程复用）。M1.2 起待实施。先读[公共契约](forge-plan-contracts.md)；M1.2 及以后章节中的新增字段/函数/脚本仍是实施目标，不是当前能力。任务保持与[路线图](forge-capability-roadmap-2026-10-28.md)同号。
 
 ## M0 实施记录
 
@@ -18,8 +18,24 @@
 
 实施中确认的两处边界（后续任务不能当已完成）：
 
-1. 快照强度在 M0 只能是 `observed`：文件集合与解析探针经过核对，单文件内容未进入身份。要声称 `content-bound` 必须走 M1.1 的捕获路径。
+1. ~~快照强度在 M0 只能是 `observed`~~：M1.1 已提供 `capture=true` 的 `content-bound` 路径；但普通快路径的快照仍是 `observed`，且没有捕获就无法声称“知道新增问题”。M1.2 的桥接差分必须建立在捕获基线上。
 2. 桥接站点的位置证据只有行号。范围身份（起止列）属于 M1.2，因此当前“同一行两次调用”只能计为两行记录，不能报“精确调用次数”。
+
+## M1.1 实施记录
+
+| 产物 | 位置 | 测试 |
+|---|---|---|
+| 捕获扫描（逐文件读字节、严格 UTF-8、双次 stat 判稳定） | `src/tools-trace.ts` 的 `scanFactsForCapture` | `run-trace-capture` |
+| 单次读取的 facts 入口 | `src/ast.ts` `fileFactsFromText`、`src/trace-facts.ts` `extractTraceFileFromBytes` | `run-trace-capture`、`run-trace-languages` |
+| 私有基线存储（TTL/条数/字节预算、原子写、轮换） | `src/trace-capture.ts` | `run-trace-capture` |
+| `capture` 参数与 `capture` 输出段 | `src/tools-trace.ts` | `run-trace-capture` |
+| `snapshotId` 编辑门槛 | `resolveBeforeEvidence()`；`ffedit`/`ff_file` 在写锁内校验 | `run-edit-audit` |
+
+三处刻意保留的边界：
+
+1. **捕获用 WASM，不借 sidecar 的 facts。** sidecar 目前不返回其输入的内容身份，用它的结果就等于用两份不同来源的内容互相背书。原生路径要重新做 parity 才能进入基线。
+2. **不完整即不保存。** 截断、部分解析、读取期间文件变化都会把强度降为 `observed` 并给出 `saveError`；手工构造的截断记录也会被 `saveBaseline` 拒绝。基线从不把“少看了几个文件”包装成“没有问题”。
+3. **编辑门槛不是编辑许可。** `snapshotId` 通过只说明 beforeHash 存在且仍匹配；`drift`/`not_covered`/`observed_only`/`unavailable` 都会拒绝写入并说明原因，省略 `snapshotId` 仍是普通编辑。
 
 ## M0.1 能力矩阵与文档对齐
 

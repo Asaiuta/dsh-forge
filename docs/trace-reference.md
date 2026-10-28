@@ -10,6 +10,38 @@
 
 每次装配都注册一个不可猜的 `snapshotId`，并在输出 `snapshot` 里返回。快照只能按其 ID 与所属工作区解析；找不到（淘汰、进程重启、别的工作区）时返回 `snapshot_unavailable`，绝不替换成另一张图。旧快照可以用作 before 证据，但不能代表当前状态。M0 的快照强度是 `observed`：文件集合与解析探针经过核对，单文件内容未纳入身份；`content-bound` 属于 M1.1 的捕获路径。
 
+## 内容基线（capture）
+
+普通查询的快照强度是 `observed`：它核对文件集合与解析探针，没有逐文件重算内容哈希。要拿到能跨进程、跨编辑比较的基线，用 `capture=true`。
+
+```json
+{"target":"exposes:chartAPI","capture":true}
+```
+
+- 捕获逐文件读取字节（单文件 2 MiB、总读取 256 MiB 预算），用**同一份内容**提取事实：读一次、哈希一次、解析一次，不存在“先读磁盘解析、再读一遍算哈希”的窗口。
+- 字节必须是严格 UTF-8；UTF-16、非 UTF-8、含 NUL 的文件会被拒绝并计入 `partialFiles`，不做有损解码后冒充。
+- 读取前后各取一次 stat；不一致说明读到了撕裂内容，该文件不计入基线并记 `capture_unstable`。
+- 捕获绕过热缓存与 sidecar：sidecar 目前不返回其输入的内容身份，用它的结果等于让两份不同来源互相背书。
+- 完整捕获（无截断、无部分解析）才写基线，`snapshot.strength` 为 `content-bound`；否则降级为 `observed`，`capture.persisted=false` 并给出 `saveError`，手工构造的截断记录同样会被拒绝。
+- 基线存放在插件私有数据区（不在工程内），24 小时 TTL、每工作区 20 条、总 128 MiB；超限轮换最旧一条并在 `capture.evicted` 说明。写入走临时文件 + 重命名，读到半写文件会被判为 `corrupt` 而不是当成可用基线。
+- 输出新增 `capture: {files, bytes, persisted, path?, evicted?, saveError?}`；未使用 `capture` 时该字段不出现。
+
+基线可以跨进程加载（`snapshotId` 在重启后仍可解析），但只有 `observed` 快照的进程内 ID 不行。
+
+## 编辑门槛：snapshotId
+
+`ffedit` 与 `ff_file` 接受可选 `snapshotId`，把“这次写入对象就是基线记录的那份内容”作为写入前提，校验在写锁内完成：
+
+| 结果 | 含义 | 行为 |
+|---|---|---|
+| 覆盖且未变 | 文件在基线内且字节一致 | 写入，输出 `beforeEvidence: {snapshotId, verified: true}` |
+| `drift` | 捕获后文件被改/删 | 拒绝写入，文件不变 |
+| `not_covered` | 基线没读过这个文件 | 拒绝写入（`ff_file create` 例外：不存在的文件本就该缺席） |
+| `observed_only` | 快照是普通查询产生的 | 拒绝并提示用 `capture=true` |
+| `unavailable` | ID 不存在/过期/属于别的工作区 | 拒绝 |
+
+门槛只证明 beforeHash 存在且仍匹配，不证明这次改动正确；省略 `snapshotId` 就是普通编辑，不会被隐式拦截。
+
 输出的 `parseErrors`、`partialFiles`、`walkErrors`、`resolutionLimited` 与 `incomplete` 表示分析覆盖度；出现失败、部分解析、截断时，“未找到”只针对已分析范围。
 
 根 `.gitignore` 生效，跳过 `node_modules` / `.git` / `.dsh` 和目录链接；候选上限 20,000，源码上限 2 MiB，二进制上限 32 MiB。

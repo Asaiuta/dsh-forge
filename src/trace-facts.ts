@@ -1,7 +1,8 @@
 /** Bridge-independent per-file extraction shared by the main thread and AST workers. */
 import path from 'node:path'
-import { fileFacts, factsFromText, MAX_AST_FILE_BYTES, normalizeText } from './ast.ts'
+import { fileFactsFromText, factsFromText, MAX_AST_FILE_BYTES, normalizeText } from './ast.ts'
 import { readBoundedFile } from './fs-paths.ts'
+import { canonicalize, sha256Hex } from './source-evidence.ts'
 import { emptyFacts, mergeFacts, scanComponentScripts, scanHtmlFacts, type FileFacts, type RequireFact, type TraceFileFacts } from './facts.ts'
 import { supportsModuleFacts } from './module-facts.ts'
 import { binaryFacts, BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
@@ -18,14 +19,70 @@ export interface TraceFileOutcome {
 export type TextFactsParser = (text: string, syntax: JsSyntax) => Promise<{ facts: FileFacts; partial: boolean } | null>
 const wasmTextFacts: TextFactsParser = (text, syntax) => factsFromText(text, null, syntax)
 
+/** One file's facts plus the byte identity they were extracted from. */
+export interface TraceBytesOutcome extends TraceFileOutcome {
+  /** SHA-256 of the exact bytes passed in. */
+  rawHash: string
+  /** SHA-256 of the canonical text derived from those bytes. */
+  textHash: string
+  bytes: number
+}
+
+/**
+ * Extract one file from bytes the caller already read.
+ *
+ * The reason this exists (M1.1): a "content-bound" capture must hash the bytes
+ * it parsed. Reading the file here would allow the disk to move in between, and
+ * the recorded hash would then describe content no parser ever saw.
+ *
+ * `strict` decides how undecodable bytes are handled. Editing and capture use
+ * strict UTF-8 and refuse the file, because a lossy decode produces a hash that
+ * is not the file's own content. The ordinary read path stays lenient so a file
+ * with stray bytes still yields the facts it always did.
+ */
+export async function extractTraceFileFromBytes(
+  file: string,
+  raw: Buffer,
+  options: { strict?: boolean; parseText?: TextFactsParser } = {},
+): Promise<TraceBytesOutcome> {
+  const parseText = options.parseText ?? wasmTextFacts
+  const bytes = raw.length
+  let text: string
+  try {
+    text = options.strict ? canonicalize(raw).text : normalizeText(raw.toString('utf8'))
+  } catch (cause) {
+    return {
+      value: null, parseErrors: 1, partialFiles: 0,
+      rawHash: sha256Hex(raw), textHash: '', bytes,
+      diagnostics: [{ reason: 'unsupported_encoding', message: cause instanceof Error ? cause.message : String(cause) }],
+    }
+  }
+  const outcome = BINARY_EXTENSIONS.has(path.extname(file).toLowerCase())
+    ? binaryOutcome(file, raw)
+    : await extractTraceText(file, text, parseText)
+  return { ...outcome, rawHash: sha256Hex(raw), textHash: sha256Hex(text), bytes }
+}
+
+function binaryOutcome(file: string, raw: Buffer): TraceFileOutcome {
+  const metadata = binaryFacts(raw)
+  return { value: { kind: 'binary', metadata }, parseErrors: 0, partialFiles: Number(metadata.limitations.length > 0) }
+}
+
 export async function extractTraceFile(file: string, parseText: TextFactsParser = wasmTextFacts): Promise<TraceFileOutcome> {
   try {
-    if (BINARY_EXTENSIONS.has(path.extname(file).toLowerCase())) {
-      const metadata = binaryFacts(readBoundedFile(file, MAX_BINARY_BYTES))
-      return { value: { kind: 'binary', metadata }, parseErrors: 0, partialFiles: Number(metadata.limitations.length > 0) }
-    }
+    const cap = BINARY_EXTENSIONS.has(path.extname(file).toLowerCase()) ? MAX_BINARY_BYTES : MAX_AST_FILE_BYTES
+    const raw = readBoundedFile(file, cap)
+    if (BINARY_EXTENSIONS.has(path.extname(file).toLowerCase())) return binaryOutcome(file, raw)
+    return await extractTraceText(file, normalizeText(raw.toString('utf8')), parseText)
+  } catch (cause) {
+    return { value: null, parseErrors: 1, partialFiles: 0, diagnostics: [{ reason: 'read_or_parse_failed', message: cause instanceof Error ? cause.message : String(cause) }] }
+  }
+}
+
+/** Everything that only needs text: manifests, components, HTML, source files. */
+async function extractTraceText(file: string, text: string, parseText: TextFactsParser): Promise<TraceFileOutcome> {
+  try {
     if (path.basename(file) === 'go.mod') {
-      const text = normalizeText(readBoundedFile(file, MAX_AST_FILE_BYTES).toString('utf8'))
       const declarations = [...text.matchAll(/^\s*module\s+(?:"([^"\r\n]+)"|([^\s]+))\s*(?:\/\/.*)?$/gm)]
       const module = declarations.length === 1 ? declarations[0][1] ?? declarations[0][2] : null
       return { value: { kind: 'manifest', module }, parseErrors: 0, partialFiles: module ? 0 : 1 }
@@ -35,7 +92,6 @@ export async function extractTraceFile(file: string, parseText: TextFactsParser 
       const framework = ext === '.vue' ? 'vue' : ext === '.svelte' ? 'svelte' : null
       if (framework) {
         // Components expose script dependencies only; scopes stay separate.
-        const text = normalizeText(readBoundedFile(file, MAX_AST_FILE_BYTES).toString('utf8'))
         const scripts: Array<{ syntax: JsSyntax; imports: RequireFact[]; requires: RequireFact[] }> = []
         let parseErrors = 0
         let partial = false
@@ -58,7 +114,7 @@ export async function extractTraceFile(file: string, parseText: TextFactsParser 
       }
       // The workspace cache already validated stat/ctime. On a miss, hash the
       // bytes so a same-size edit with restored mtime cannot hit an older parse.
-      const parsed = await fileFacts(file, null)
+      const parsed = await fileFactsFromText(file, text, null)
       if (!parsed.value) return { value: null, parseErrors: 1, partialFiles: 0, diagnostics: [{ reason: 'parse_failed', message: parsed.error ?? 'AST 未返回解析结果。' }] }
       if (supportsModuleFacts(parsed.value.lang)) {
         const { modules = [], moduleInfo, ffi } = parsed.value.facts
@@ -66,7 +122,7 @@ export async function extractTraceFile(file: string, parseText: TextFactsParser 
       }
       return { value: { kind: 'js', lang: parsed.value.lang, ...parsed.value.facts }, parseErrors: 0, partialFiles: Number(parsed.value.partial) }
     }
-    const html = scanHtmlFacts(normalizeText(readBoundedFile(file, MAX_AST_FILE_BYTES).toString('utf8')))
+    const html = scanHtmlFacts(text)
     let merged: FileFacts | undefined
     let parseErrors = 0
     let partial = false

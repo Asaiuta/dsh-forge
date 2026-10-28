@@ -47,6 +47,10 @@ import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
 import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
 import { detectLanguage, enclosingSymbol, parseFile, syntaxValid } from './ast.ts'
 import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
+import { resolveBeforeEvidence } from './tools-trace.ts'
+
+/** The refusal half of {@link resolveBeforeEvidence}: only failures reach the reply. */
+type BeforeRejection = Extract<Awaited<ReturnType<typeof resolveBeforeEvidence>>, { ok: false }>
 import {
   type FinderPool,
   type ForgeExec,
@@ -365,6 +369,7 @@ export function createEditTool(pool: FinderPool) {
       revertOnSyntaxError: { type: 'boolean', description: 'Default false: reject introduced syntax errors in a clean file; dirty files stay report-only.' },
       ticket: { type: 'string', description: 'Ticket id from an ambiguous ffedit. Applies that saved batch; requires a path-less resend carrying choice.' },
       choice: { type: 'string', description: 'Ticket only: one candidate index ("2"), several unique indexes ("2,3" or "#2 #3"), or "all" for every candidate.' },
+      snapshotId: { type: 'string', description: 'Optional: a content-bound baseline from fftrace capture=true. Validated (same workspace, file covered, bytes unchanged); a mismatch refuses the write instead of editing a file that is no longer what the baseline saw. Omit for an ordinary edit.' },
     },
     output: {
       schema: {
@@ -438,10 +443,18 @@ export function createEditTool(pool: FinderPool) {
               rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
             },
           },
+          beforeEvidence: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              snapshotId: { type: 'string', required: true },
+              verified: { type: 'boolean', required: true },
+            },
+          },
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; audit?: EditAudit; note?: string }) => {
+      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; audit?: EditAudit; beforeEvidence?: { snapshotId: string; verified: boolean }; note?: string }) => {
         const lines: string[] = []
         if (value.status === 'ticket') {
           lines.push(`ambiguous target — nothing written; ticket ${value.ticket} signed. Apply it with ffedit {ticket: "${value.ticket}", choice: <index>} (no path, no steps)`)
@@ -462,6 +475,7 @@ export function createEditTool(pool: FinderPool) {
             lines.push(`  step ${r.index}: ${bits.join(', ')}${r.reason ? ` — ${r.reason}` : ''}`)
           }
         }
+        if (value.beforeEvidence) lines.push(`before-evidence: ${value.beforeEvidence.snapshotId} (content-bound, bytes unchanged at write time)`)
         if (value.syntaxWarning) lines.push(`[warn] ${value.syntaxWarning}`)
         if (value.audit) lines.push(...renderAudit(value.audit as Parameters<typeof renderAudit>[0]))
         if (value.note) lines.push(`[${value.note}]`)
@@ -519,16 +533,31 @@ export function createEditTool(pool: FinderPool) {
       }
       const abs = resolveFilePath(exec, rawPath)
       const workdir = canonicalWorkspace(workdirOf(exec))
+      const snapshotId = typeof args.snapshotId === 'string' ? args.snapshotId.trim() : ''
       // The write lock covers the batch only. Auditing after it releases keeps a
       // slow graph read from holding construction back; the post-write hash is
       // carried out of the lock so a later writer becomes `stale`, not a finding.
-      const committed: ApplyResult | { throwable: string } = await withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
+      // The before-evidence check runs *inside* the lock: hashing outside it
+      // would let another writer land between the check and the write, which is
+      // exactly the window the check exists to close.
+      const committed: ApplyResult | { throwable: string } | { beforeRejected: BeforeRejection } = await withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
         try {
+          if (snapshotId !== '') {
+            const before = resolveBeforeEvidence(workdir, snapshotId, abs)
+            if (!before.ok) return { beforeRejected: before }
+          }
           return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode: 'atomic', exec, revertOnSyntaxError: args.revertOnSyntaxError === true })
         } catch (cause) { return { throwable: causeMessage(cause) } }
       }))
       if ('throwable' in committed) return failure(committed.throwable)
-      return shapeCommitted(committed, { workdir, abs, steps })
+      if ('beforeRejected' in committed) {
+        const before = committed.beforeRejected
+        // Nothing was written. Say which of the three ways the baseline failed,
+        // and that plain editing is still available — an unusable baseline must
+        // not read as "this edit is forbidden".
+        return failure(`snapshot ${snapshotId} rejected before writing (${before.reason}): ${before.detail}`)
+      }
+      return shapeCommitted(committed, { workdir, abs, steps, ...(snapshotId !== '' ? { beforeSnapshot: snapshotId } : {}) })
     },
   } as const
 }
@@ -677,9 +706,13 @@ function shapeApplyResult(result: ApplyResult): Record<string, unknown> {
  * carry no audit at all: pretending to recheck untouched bytes is exactly the
  * "unrun looks like passed" failure the audit status vocabulary exists to stop.
  */
-function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket' }): Record<string, unknown> {
+function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket'; beforeSnapshot?: string }): Record<string, unknown> {
   const shaped = shapeApplyResult(result)
-  if (!result.ok || result.noChange) return shaped
+  // Reported even when nothing changed: the caller asked "was this file still
+  // the one the baseline described", and that answer is independent of whether
+  // the batch turned out to be a no-op.
+  const evidence = context.beforeSnapshot ? { snapshotId: context.beforeSnapshot, verified: true } : undefined
+  if (!result.ok || result.noChange) return evidence ? { ...shaped, beforeEvidence: evidence } : shaped
   const audit = auditCommit({
     workspace: context.workdir,
     batchId: result.batchId,
@@ -689,7 +722,7 @@ function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: st
     hash: result.hash,
     syntaxWarning: result.syntaxWarning !== undefined,
   })
-  return { ...shaped, audit }
+  return { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), audit }
 }
 
 // ---------------------------------------------------------------------------
