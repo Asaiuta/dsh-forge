@@ -102,13 +102,18 @@ write('renderer/extra.js', extraLines)
 
 const appLines = [
   "const extra = require('./extra.js')",
-  "const api = window.chatAPI || window.electronAPI",
+  "const api = window.chatAPI; void window.electronAPI",
   "function runApp() {",
   "  api.getList()",
-  "  window.chatAPI.saveSettings({})",
-  "  window.chatAPI.mystery()",
+  "  const fallback = window.chatAPI || window.electronAPI",
+  "  fallback.getList()",
+  "  window.chatAPI.saveSettings({}); const holder={api:window.chatAPI,read(){}}; holder.read()",
+  "  window.chatAPI.mystery(); const factory=()=>window.chatAPI; factory.name",
   "  ipcRenderer.send('chat:direct', {})",
   "  extra.help()",
+  "  ;[{}].map(api => api.read())",
+  "  ;(() => {let fallback = {read(){}}; fallback = {read(){}}; fallback.read()})()",
+  "  let apiCopy={read(){}}; apiCopy=apiCopy; apiCopy.read()",
   "}",
 ]
 write('renderer/app.js', appLines)
@@ -185,6 +190,8 @@ const T = {
   aRequire: mark(appLines, "require('./extra.js')"),
   aAlias: mark(appLines, 'const api ='),
   aGetList: mark(appLines, 'api.getList()'),
+  aFallbackAlias: mark(appLines, 'const fallback ='),
+  aFallbackCall: mark(appLines, 'fallback.getList()'),
   aSave: mark(appLines, 'window.chatAPI.saveSettings'),
   aMystery: mark(appLines, 'window.chatAPI.mystery'),
   aSend: mark(appLines, "ipcRenderer.send('chat:direct'"),
@@ -312,6 +319,8 @@ const expectedUses = [
   `chatAPI renderer/app.js:${T.aMystery}`,
   `chatAPI renderer/mod-entry.js:${T.meGetList}`,
   `electronAPI renderer/app.js:${T.aAlias}`,
+  `chatAPI renderer/app.js:${T.aFallbackAlias}`,
+  `electronAPI renderer/app.js:${T.aFallbackAlias}`,
 ]
 const actualUses = []
 for (const [name, items] of graph.guses) for (const u of items) actualUses.push(`${name} ${u.path}:${u.line}`)
@@ -331,6 +340,10 @@ const bridge = evaluate('bridge.refs', expectedBridge, actualBridge)
 // ---- bridge.unknown (undeclared API access must be visible, not dropped) ---
 const unknown = evaluate('bridge.unknown', [`mystery renderer/app.js:${T.aMystery}`],
   graph.unknownBridge.map(b => `${b.name} ${b.path}:${b.line}`))
+
+// ---- bridge.unbound (a fallback site is visible without choosing a branch) --
+evaluate('bridge.unbound', [`fallback.getList renderer/app.js:${T.aFallbackCall}`],
+  graph.unboundBridge.map(b => `${b.object}.${b.name} ${b.path}:${b.line}`))
 
 // ---- dep.edges (module graph) ----------------------------------------------
 const expectedDeps = [

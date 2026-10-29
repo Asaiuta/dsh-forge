@@ -36,7 +36,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
   const disposers = []
   let passed = 0
   const ok = message => console.log(`ok ${++passed} - ${message}`)
-  const mount = (defaultMode) => {
+  const mount = (defaultMode, checkSeams = {}) => {
     const provider = Object.create(defaultMode ? SandboxedFileSystem.prototype : LocalFileSystem.prototype)
     provider.config = { cwd: root, diffBasisMaxBytes: 10 * 1024 * 1024 }
     provider.locks = new Map(); provider.internals = {}; provider.defaultMode = defaultMode
@@ -44,7 +44,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     const policy = { resolve({ session }) {
       return SandboxPolicyService.prototype.resolve.call({ defaultMode, workspaceRoot: outside, overrideOf: value => value.mode }, { session })
     } }
-    const host = { fs: provider, get: name => name === 'sandboxPolicy' ? policy : undefined,
+    const host = { fs: provider, get: name => name === 'sandboxPolicy' ? policy : checkSeams[name],
       on: (name, fn) => listeners.set(name, fn),
       waterfall: (name, ...args) => listeners.get(name)?.(...args),
       emit(name, ...args) { observations.push({ path: args[0].displayPath, targetKey: args[0].targetKey, value: args[1] }); listeners.get(name)?.(...args) },
@@ -72,7 +72,8 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     activation.provide('agents', { list: () => [{ctx:scope}] })
     const mounted = activation.plugin({ name:'forge-loader-regression', Config, inject, apply }, { registration:'takeover', takeover:['read','glob','grep'], prewarm:false })
     await new Promise(resolve=>setImmediate(resolve))
-    assert.equal(globalDefinitions.length,6); assert.equal(scopedDefinitions.length,3)
+    assert.equal(globalDefinitions.length,7); assert.equal(scopedDefinitions.length,3)
+    assert.ok(globalDefinitions.some(tool => tool.name === 'ffcheck'))
     assert.equal(sections.length,1)
     const activationGuidance = sections[0].text({scope})
     assert.match(activationGuidance,/read view=outline/)
@@ -80,7 +81,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     assert.match(activationGuidance,/Search file contents → grep with a regular-expression pattern/)
     assert.ok(!activationGuidance.includes('mode=name') && !activationGuidance.includes('patterns for'))
     mounted.dispose(); await new Promise(resolve=>setImmediate(resolve))
-    ok('the installed Cordis loader validates the complete plugin Config and activates all 9 takeover tools')
+    ok('the installed Cordis loader validates the complete plugin Config and activates all 10 takeover tools including ffcheck')
     for (const defaultMode of ['read-only', 'workspace-write', 'danger-full-access']) {
       const { call } = mount(defaultMode)
       for (const mode of [undefined, 'read-only', 'workspace-write', 'danger-full-access']) {
@@ -124,6 +125,52 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     assert.ok(rollback.newBatch)
     assert.equal(fs.readFileSync(path.join(root,'ticket.txt'),'utf8'),'A\nA\n')
     ok('every registered read tool success contract, including ticket resolution, immutable diff and rollback, materialize in the actual SDK')
+
+    put('sdk-check.js', 'const value = 1\n')
+    await call('ff_read', {path:'sdk-check.js'}, exec)
+    const checkedEdit = await call('ffedit', {path:'sdk-check.js',find:'value = 1',replaceWith:'value = 2',reason:'installed SDK verification'}, exec)
+    assert.equal(checkedEdit.status, 'applied')
+    const checkedBatch = await call('ffcheck', {action:'static',batches:[checkedEdit.batch],checks:['syntax']}, exec)
+    assert.equal(checkedBatch.status, 'passed')
+    assert.equal(checkedBatch.verification.persisted, true)
+    const checkedHistory = await call('ffhistory', {batch:checkedEdit.batch,checks:true}, exec)
+    assert.ok(checkedHistory.items.length > 0)
+    assert.ok(checkedHistory.items[0].diffs.length > 0)
+    assert.ok(checkedHistory.items[0].checks.some(record => checkedBatch.verification.id.startsWith(record.id)))
+    const checkedDelete = await call('ff_file', {action:'remove',path:'sdk-check.js',reason:'installed SDK zero-check evidence'}, exec)
+    const zeroChecked = await call('ffcheck', {action:'static',batches:[checkedDelete.batch],checks:['syntax']}, exec)
+    assert.equal(zeroChecked.status, 'not_run')
+    assert.equal(zeroChecked.syntax.checked, 0)
+    ok('installed SDK validates ffcheck and history results, including a deleted input with zero executed syntax checks')
+
+    // Only the SDK output validator is real here; approval/process seams are
+    // controlled fixtures, and this case sends no command to the desktop.
+    const emptyStream = {readFrom: () => ({text:'',nextOffset:0,lossy:false})}
+    const stoppedHost = mount('workspace-write', {
+      approval: {request: async () => 'allowed-once'},
+      subprocess: {spawn: () => ({done:Promise.resolve({exitCode:null,signal:'SIGTERM'}),collected:{stdout:emptyStream,stderr:emptyStream}})},
+    })
+    const stoppedExec = {...execFor('workspace-write'),callId:'offline-sdk-terminated'}
+    const stoppedPlan = await stoppedHost.call('ffcheck', {action:'plan',inputs:['ticket.txt'],checks:[],recipes:[{id:'stopped',kind:'process',program:process.execPath,argv:[]}]}, stoppedExec)
+    const stoppedRun = await stoppedHost.call('ffcheck', {action:'run',checkPlanId:stoppedPlan.checkPlanId}, stoppedExec)
+    assert.equal(stoppedRun.status, 'failed')
+    assert.equal(stoppedRun.reason, 'nonzero_exit')
+    assert.equal(stoppedRun.runs[0].exitCode, null)
+    ok('installed SDK accepts a nullable exit from a controlled signal-termination seam without fabricating exit zero')
+
+    let deniedSpawned = false
+    const deniedHost = mount('workspace-write', {
+      approval: {request: async () => 'rejected'},
+      subprocess: {spawn: () => {deniedSpawned = true; throw new Error('denied command must not start')}},
+    })
+    const deniedExec = {...execFor('workspace-write'),callId:'offline-sdk-denied'}
+    const deniedPlan = await deniedHost.call('ffcheck', {action:'plan',inputs:['ticket.txt'],checks:[],recipes:[{id:'denied',kind:'process',program:process.execPath,argv:[]}]}, deniedExec)
+    const deniedRun = await deniedHost.call('ffcheck', {action:'run',checkPlanId:deniedPlan.checkPlanId}, deniedExec)
+    assert.equal(deniedRun.status, 'denied')
+    assert.equal(deniedRun.runs[0].status, 'denied')
+    assert.equal(deniedSpawned, false)
+    assert.equal(deniedRun.verification.persisted, true)
+    ok('installed SDK materializes a controlled approval denial and its archived result without starting a process')
 
     put('race.js')
     const raced = execFor('workspace-write'), before = observations.length

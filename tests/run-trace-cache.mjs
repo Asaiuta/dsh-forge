@@ -70,6 +70,75 @@ try {
   assert.equal(reAliased.graph.bridgeRefs.get('read')[0].alias, 'other')
   ok('alias and declaration changes refresh bridge classification without phantom refs')
 
+  const bindingRoot = path.join(root, 'bindings')
+  fs.mkdirSync(bindingRoot)
+  const bindingWrite = (file, source) => fs.writeFileSync(path.join(bindingRoot, file), source)
+  const localSource = 'const api=window.bridgeA; { const api={read(){}}; api.read() } function shadow(api){api.read()} api.read(); function second(){const api=window.bridgeB;api.read()} function ordinary(item){item.read()} let unrelated={read(){}};unrelated={read(){}};unrelated.read()\n'
+  try {
+    bindingWrite('preload.js', "contextBridge.exposeInMainWorld('bridgeA', {read(){}}); contextBridge.exposeInMainWorld('bridgeB', {read(){}})\n")
+    bindingWrite('local.js', localSource)
+    bindingWrite('qualified.js', 'const bridgeA=window.bridgeB;window.bridgeA.read();bridgeA.read()\n')
+    bindingWrite('fallback.js', 'const choice=window.bridgeA || window.bridgeB;choice.read()\n')
+    bindingWrite('alias-only.js', 'const pageApi=window.bridgeA || window.bridgeB\n')
+    bindingWrite('elsewhere.js', 'const item=window.bridgeA;const unrelated=window.bridgeA\n')
+    bindingWrite('consumer.js', 'pageApi.read()\n')
+    bindingWrite('index.html', '<script src="alias-only.js"></script><script src="consumer.js"></script>')
+    const defaults = await assembleTraceGraph(bindingRoot)
+    assert.equal(defaults.snapshot.strength, 'observed')
+    assert.equal(defaults.graph.bridgeByObject.get('bridgeA').length, 2)
+    assert.equal(defaults.graph.bridgeByObject.get('bridgeB').length, 2)
+    assert.ok(defaults.graph.unboundBridge.some(ref => ref.path === 'fallback.js' && ref.object === 'choice'))
+    assert.ok(defaults.graph.unboundBridge.some(ref => ref.path === 'consumer.js' && ref.object === 'pageApi'))
+    assert.ok(!defaults.graph.unboundBridge.some(ref => ref.object === 'item' || ref.object === 'unrelated'))
+    assert.equal((await assembleTraceGraph(bindingRoot)).graph, defaults.graph)
+    ok(`default ${defaults.snapshot.provider} binds each occurrence, keeps cross-page fallbacks unknown and reuses its warm graph`)
+
+    const before = fs.statSync(path.join(bindingRoot, 'local.js'))
+    bindingWrite('local.js', localSource.replace('window.bridgeA', 'window.bridgeB'))
+    fs.utimesSync(path.join(bindingRoot, 'local.js'), before.atime, before.mtime)
+    const drifted = await assembleTraceGraph(bindingRoot)
+    assert.notEqual(drifted.graph, defaults.graph)
+    assert.equal(drifted.graph.bridgeByObject.get('bridgeA').length, 1)
+    assert.equal(drifted.graph.bridgeByObject.get('bridgeB').length, 3)
+    bindingWrite('local.js', localSource)
+    process.env.DSH_FORGE_TRACE_NATIVE = '0'
+    clear()
+    const wasmBindings = await assembleTraceGraph(bindingRoot)
+    assert.equal(wasmBindings.snapshot.provider, 'wasm')
+    assert.deepEqual(wasmBindings.graph.bridgeByObject, defaults.graph.bridgeByObject)
+    assert.deepEqual(wasmBindings.graph.unboundBridge, defaults.graph.unboundBridge)
+    ok('bridge bindings match the WASM path and refresh after an equal-size edit with restored mtime')
+    if (previousNative === undefined) delete process.env.DSH_FORGE_TRACE_NATIVE
+    else process.env.DSH_FORGE_TRACE_NATIVE = previousNative
+    clear()
+
+    if (defaults.snapshot.provider === 'native') {
+      const badSource = Buffer.concat([Buffer.from('const bad=window.bridgeA;bad.read()\n// '), Buffer.from([0xff])])
+      bindingWrite('bad.js', badSource)
+      const rejected = await assembleTraceGraph(bindingRoot)
+      assert.equal(rejected.snapshot.strength, 'observed')
+      assert.ok(rejected.partialFiles > 0)
+      assert.ok(rejected.diagnostics.some(issue => issue.path === 'bad.js' && issue.reason === 'bridge_binding_unavailable'))
+      assert.ok(rejected.graph.unboundBridge.some(ref => ref.path === 'bad.js'))
+      assert.ok(!rejected.graph.bridgeByObject.get('bridgeA').some(ref => ref.path === 'bad.js'))
+      const stamp = fs.statSync(path.join(bindingRoot, 'bad.js'))
+      const validSource = Buffer.from(badSource); validSource[validSource.length - 1] = 120
+      bindingWrite('bad.js', validSource)
+      fs.utimesSync(path.join(bindingRoot, 'bad.js'), stamp.atime, stamp.mtime)
+      const recovered = await assembleTraceGraph(bindingRoot)
+      assert.ok(!recovered.graph.unboundBridge.some(ref => ref.path === 'bad.js'))
+      assert.ok(recovered.graph.bridgeByObject.get('bridgeA').some(ref => ref.path === 'bad.js'))
+      assert.equal(recovered.partialFiles, 0)
+      ok('native facts with an unavailable strict-byte supplement stay unknown and retry after repair')
+    } else console.log('SKIPPED native binding supplement failure case: native sidecar is not active')
+  } finally {
+    if (previousNative === undefined) delete process.env.DSH_FORGE_TRACE_NATIVE
+    else process.env.DSH_FORGE_TRACE_NATIVE = previousNative
+    assert.equal(path.dirname(path.resolve(bindingRoot)), path.resolve(root))
+    fs.rmSync(bindingRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    clear()
+  }
+
   write('large.js', "ipcMain.handle('cache:hidden', () => {});" + ' '.repeat(2 * 1024 * 1024))
   write('broken.js', 'function broken( {')
   const exec = { agent: { session: { header: { cwd: root } } } }

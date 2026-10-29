@@ -85,13 +85,13 @@ const rows = FORGE_CAPABILITIES.map((capability) => ({
 
 {
   const plan = planRegistration(resolveConfig(undefined), rows)
-  assert.equal(plan.global.length, 9)
+  assert.equal(plan.global.length, 10)
   assert.deepEqual(plan.scoped, [])
   ok('additive puts the whole table on the global registry')
 }
 {
   const plan = planRegistration(resolveConfig({ registration: 'takeover', takeover: ['read'] }), rows)
-  assert.equal(plan.global.length, 8)
+  assert.equal(plan.global.length, 9)
   assert.ok(!plan.global.some((row) => row.forge === 'ff_read'), 'the taken-over row must not also register globally')
   assert.deepEqual(plan.scoped.map((row) => [row.forge, row.native]), [['ff_read', 'read']])
   ok('takeover moves exactly the listed row into the scoped list')
@@ -101,7 +101,7 @@ const rows = FORGE_CAPABILITIES.map((capability) => ({
   const surface = surfaceFor(plan, ADDITIVE_SURFACE)
   assert.equal(surface.read, 'read')
   assert.equal(surface.grep, 'ffgrep')
-  assert.equal(surfaceNames(surface).length, 9)
+  assert.equal(surfaceNames(surface).length, 10)
   ok('the surface renames only the taken-over capability')
 }
 
@@ -176,7 +176,7 @@ function scopedAgent() {
   const plugin = ctx.plugin(apply, { registration: 'takeover', takeover: ['read'] })
   await new Promise((resolve) => setImmediate(resolve))
 
-  assert.equal(globalTools.length, 8, `expected 8 global tools, got ${globalTools.length}: ${globalTools}`)
+  assert.equal(globalTools.length, 9, `expected 9 global tools, got ${globalTools.length}: ${globalTools}`)
   assert.ok(!globalTools.includes('read'), 'the taken-over name must not be registered globally')
   assert.ok(!globalTools.includes('ff_read'), 'the taken-over tool must not exist under both names')
 

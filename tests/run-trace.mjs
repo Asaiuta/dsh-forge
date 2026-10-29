@@ -124,7 +124,7 @@ module.exports = { escapeHtml }
 `)
 
 
-write('renderer/app.js', `const api = window.chatAPI || window.electronAPI
+write('renderer/app.js', `const api = window.chatAPI; void window.electronAPI
 const helper = require('./helper.js')
 async function boot() {
   const list = await api.getList()

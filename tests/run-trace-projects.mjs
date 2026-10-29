@@ -336,7 +336,7 @@ try {
   for (const dispose of apply({ fs: { resolve: async file => ({ targetKey: file, displayPath: file }), processPath: target => target.targetKey, processPathFromHostPath: file => file },
     tools: { register: definition => { definitions.push(definition) } }, commands: { register() {} } }, { prewarm: false })) if (typeof dispose === 'function') disposers.push(dispose)
   try {
-    assert.equal(definitions.length, 9)
+    assert.equal(definitions.length, 10)
     const definition = definitions.find(tool => tool.name === 'fftrace'), runtime = Object.create(ToolRuntime.prototype)
     runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
     for (const args of [{ target: 'file:diagnostics.js' }, { target: 'path:app/src/main.ts -> alternate/lib/core.ts', edgeMode: 'certain' }]) {

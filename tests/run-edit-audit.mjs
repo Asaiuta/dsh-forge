@@ -105,7 +105,7 @@ const assertNoFalsePass = (audit, label) => {
     const audit = result.audit
     assertNoFalsePass(audit, 'stranded rename')
     assert.equal(audit.status, 'partial')
-    assert.equal(audit.reason, 'legacy_heuristic')
+    assert.equal(audit.reason, 'ast_diff')
     assert.equal(audit.rows.length, 1, JSON.stringify(audit))
     assert.equal(audit.rows[0].member, 'togglePin')
     // Two real call sites in two files. The third mention lives in a comment and
@@ -119,7 +119,7 @@ const assertNoFalsePass = (audit, label) => {
     assert.ok(audit.baseline.snapshotId, 'the baseline must name the graph that answered (M0.4)')
     assert.equal(audit.baseline.strength, 'observed', 'M0 graphs are observed, not content-bound')
     assert.deepEqual(audit.coverage.requested, ['preloads/chart.js'])
-    assert.ok(audit.coverage.limitations.some(item => item.reason === 'name_match_heuristic'))
+    assert.ok(audit.coverage.limitations.some(item => item.reason === 'static_references_only'), 'the remaining limitation is static resolution, not name matching')
     ok('rename that strands call sites is reported with counts and an explicit partial status')
   } finally { ws.close() }
 }
@@ -140,7 +140,7 @@ const assertNoFalsePass = (audit, label) => {
     const audit = result.audit
     assertNoFalsePass(audit, 'clean rename')
     assert.equal(audit.status, 'partial')
-    assert.equal(audit.reason, 'legacy_heuristic')
+    assert.equal(audit.reason, 'ast_diff')
     assert.deepEqual(audit.rows, [])
     assert.deepEqual(audit.globals, [])
     assert.match(audit.verdict, /no statically visible consumer/)
@@ -195,7 +195,7 @@ const assertNoFalsePass = (audit, label) => {
 
 // --- case 5: edits outside the bridge surface --------------------------------
 {
-  const ws = workspace({ 'preloads/chart.js': PRELOAD(), ...CHART_CONSUMERS })
+  const ws = workspace({ 'preloads/chart.js': PRELOAD(), ...CHART_CONSUMERS, 'util/plain.js': 'const x = 1\n' })
   try {
     resetTraceFactsCache()
     await assembleTraceGraph(ws.root)
@@ -207,22 +207,43 @@ const assertNoFalsePass = (audit, label) => {
     }, ws.exec)
     assert.equal(consumerEdit.status, 'applied')
     assertNoFalsePass(consumerEdit.audit, 'consumer file')
-    assert.equal(consumerEdit.audit.status, 'not_run')
-    assert.equal(consumerEdit.audit.reason, 'not_applicable')
-    assert.match(consumerEdit.audit.detail, /no bridge surface/)
+    // This edit introduces a call to a member the provider does not offer. Since
+    // M1.2 the audit resolves that from the AST instead of asking whether a name
+    // disappeared from the edited text, so it is a finding — and correctly
+    // attributed to this batch.
+    assert.equal(consumerEdit.audit.status, 'partial')
+    assert.equal(consumerEdit.audit.reason, 'ast_diff')
+    assert.equal(consumerEdit.audit.rows.length, 1, JSON.stringify(consumerEdit.audit))
+    assert.equal(consumerEdit.audit.rows[0].member, 'pinToggle')
+    assert.match(consumerEdit.audit.rows[0].sample[0], /renderer\/other\.js/)
 
-    const literalEdit = await ws.tool.execute({
+    // A provider edit that keeps its surface intact is a completed diff that
+    // broke nothing — reported as such, not as "nothing was checked".
+    const cleanEdit = await ws.tool.execute({
       path: 'preloads/chart.js',
       find: "  listCharts: () => ipcRenderer.invoke('chart:list'),",
-      replaceWith: "  listCharts: () => ipcRenderer.invoke('chart:list-all'),",
-      reason: 'test: a provider edit that renames no identifier',
+      replaceWith: "  listCharts: () => ipcRenderer.invoke('chart:list') ,",
+      reason: 'test: a whitespace-only provider edit',
     }, ws.exec)
-    assert.equal(literalEdit.status, 'applied')
-    assertNoFalsePass(literalEdit.audit, 'no removed names')
-    assert.equal(literalEdit.audit.status, 'not_run')
-    assert.equal(literalEdit.audit.reason, 'not_applicable')
-    assert.match(literalEdit.audit.detail, /removed no identifier/)
-    ok('edits with no bridge surface or no removed identifier are not_applicable, not clean checks')
+    assert.equal(cleanEdit.status, 'applied', cleanEdit.error)
+    assertNoFalsePass(cleanEdit.audit, 'clean provider edit')
+    assert.equal(cleanEdit.audit.reason, 'ast_diff')
+    assert.deepEqual(cleanEdit.audit.rows, [])
+    assert.deepEqual(cleanEdit.audit.globals, [])
+    assert.match(cleanEdit.audit.verdict, /no statically visible consumer/)
+
+    // A file with no bridge surface on either side is genuinely not applicable.
+    const plainAfter = await ws.tool.execute({
+      path: 'util/plain.js',
+      find: 'const x = 1',
+      replaceWith: 'const x = 2',
+      reason: 'test: a file with no bridge surface',
+    }, ws.exec)
+    assert.equal(plainAfter.status, 'applied', plainAfter.error)
+    assert.equal(plainAfter.audit.status, 'not_run')
+    assert.equal(plainAfter.audit.reason, 'not_applicable')
+    assert.match(plainAfter.audit.detail, /no bridge surface/)
+    ok('consumer-side breakage is a finding; a surface-preserving edit is a completed diff; no surface is not_applicable')
   } finally { ws.close() }
 }
 
@@ -268,26 +289,39 @@ const assertNoFalsePass = (audit, label) => {
   } finally { ws.close() }
 }
 
-// --- case 8: an internal failure is reported, never swallowed ----------------
+// --- case 8: the audit reads bytes and facts, never the requested steps ------
 {
+  // M1.2 replaced the text heuristic with an AST diff, so the batch's `find` /
+  // `replaceWith` strings are no longer an input. That is the point: the answer
+  // is derived from what the file now contains, not from what a caller claimed
+  // it was changing. A step whose fields explode must therefore change nothing.
   const ws = workspace({ 'preloads/chart.js': PRELOAD() })
   try {
     resetTraceFactsCache()
     await assembleTraceGraph(ws.root)
-    const throwing = [{ get find() { throw new Error('injected audit failure') } }]
-    const audit = auditEdit(ws.root, 'preloads/chart.js', throwing, ws.abs('preloads/chart.js'))
-    assertNoFalsePass(audit, 'internal error')
-    assert.equal(audit.reason, 'audit_error')
-    assert.match(audit.detail, /injected audit failure/)
-    ok('an audit exception produces audit_error instead of silence')
+    const poisoned = [{ get find() { throw new Error('steps must not be read') } }]
+    const audit = await auditEdit(ws.root, 'preloads/chart.js', poisoned, ws.abs('preloads/chart.js'))
+    assertNoFalsePass(audit, 'steps are not an input')
+    assert.notEqual(audit.reason, 'audit_error', audit.detail)
+    assert.equal(audit.reason, 'ast_diff')
+    ok('the audit derives its answer from the file, not from the requested steps')
+
+    // A file that vanished after commit is a stated reason, never silence and
+    // never a clean bill.
+    const gone = await auditEdit(ws.root, 'preloads/chart.js', [], ws.abs('preloads/missing.js'))
+    assertNoFalsePass(gone, 'missing file')
+    assert.equal(gone.status, 'not_run')
+    assert.match(gone.detail, /no longer exists/)
+    ok('an unreadable edited file is reported as not run with its reason')
   } finally { ws.close() }
 }
 
-// --- case 9: a stale name in a comment hides a real miss ---------------------
+// --- case 9: a name in a comment does not hide a real miss -------------------
 {
-  // The member name survives in the preload's own comment, so the text check
-  // believes the member is still provided. This false negative is exactly why
-  // `legacy_heuristic` may only ever be `partial`; M1.2's AST diff replaces it.
+  // Under the old text heuristic, the member name surviving in the preload's own
+  // comment made the miss invisible: the check searched the shipped text for the
+  // name and found it. The AST diff reads the object literal, so a comment is not
+  // evidence of a provided member.
   const ws = workspace({ 'preloads/chart.js': PRELOAD('togglePin', 'togglePin note: keep the pin state across the session'), ...CHART_CONSUMERS })
   try {
     resetTraceFactsCache()
@@ -302,9 +336,11 @@ const assertNoFalsePass = (audit, label) => {
     const audit = result.audit
     assertNoFalsePass(audit, 'comment blind spot')
     assert.equal(audit.status, 'partial')
-    assert.deepEqual(audit.rows, [], `the comment hides the miss by design: ${JSON.stringify(audit.rows)}`)
-    assert.doesNotMatch(audit.verdict, /passed|verified/, 'a heuristic may not claim verification')
-    ok('a name surviving in a comment is reported as a partial run, never as passed')
+    assert.equal(audit.rows.length, 1, JSON.stringify(audit.rows))
+    assert.equal(audit.rows[0].member, 'togglePin')
+    assert.equal(audit.rows[0].sites, 2, JSON.stringify(audit.rows[0]))
+    assert.doesNotMatch(audit.verdict, /passed|verified/, 'a diff may not claim runtime verification')
+    ok('a name surviving only in a comment no longer hides the miss')
   } finally { ws.close() }
 }
 
@@ -323,7 +359,7 @@ const assertNoFalsePass = (audit, label) => {
     assert.equal(result.status, 'applied')
     // Someone else writes after the batch committed.
     fs.appendFileSync(ws.abs('preloads/chart.js'), '\n// later writer\n')
-    const audit = auditEdit(ws.root, 'preloads/chart.js', steps, ws.abs('preloads/chart.js'), { hash: result.hash })
+    const audit = await auditEdit(ws.root, 'preloads/chart.js', steps, ws.abs('preloads/chart.js'), { hash: result.hash })
     assertNoFalsePass(audit, 'stale bytes')
     assert.equal(audit.status, 'stale')
     assert.equal(audit.reason, 'stale')
@@ -363,10 +399,13 @@ const assertNoFalsePass = (audit, label) => {
     assert.equal(answered.status, 'applied', answered.error)
     assertNoFalsePass(answered.audit, 'ticket reply')
     assert.equal(answered.audit.status, 'partial')
-    assert.equal(answered.audit.reason, 'legacy_heuristic')
-    assert.equal(answered.audit.rows[0].member, 'togglePin')
-    assert.equal(answered.audit.rows[0].sites, 2, JSON.stringify(answered.audit.rows[0]))
-    ok('a ticket reply carries the same audit as a direct edit')
+    assert.equal(answered.audit.reason, 'ast_diff')
+    // This fixture exposes `chartAPI` twice, so the provider binding is
+    // ambiguous. The diff refuses to pick one and report a guess; what it must
+    // do is *say* it could not decide, and never read as a clean pass.
+    assert.deepEqual(answered.audit.rows, [])
+    assert.match(answered.audit.verdict, /ambiguous|无法|多个/)
+    ok('a ticket reply audits identically, and an ambiguous provider is stated rather than guessed')
   } finally { ws.close() }
 }
 

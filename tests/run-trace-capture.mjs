@@ -183,10 +183,10 @@ try {
     }
     // And the record itself cannot be stored by hand either.
     const forged = saveBaseline({
-      schema: 'trace-capture/1', snapshotId: 'a'.repeat(24), workspaceId: root,
-      configKey: 'k', config: { root, declarations: null, declarationsDigest: null, compileCommands: null, compileCommandsDigest: null, contexts: [], extractor: 'trace-snapshot/1' },
+      schema: 'trace-capture/2', snapshotId: 'a'.repeat(24), workspaceId: root,
+      configKey: 'k', config: { root, declarations: null, declarationsDigest: null, compileCommands: null, compileCommandsDigest: null, contexts: [], extractor: 'trace-snapshot/2' },
       provider: 'wasm', providerVersion: 'wasm', createdAt: new Date().toISOString(), strength: 'content-bound',
-      files: [], fileSetDigest: fileSetDigestOf([]), probes: 0, scanned: 0, truncated: true, partialFiles: 0, capturedBytes: 0, facts: {},
+      files: [], fileSetDigest: fileSetDigestOf([]), probes: 0, scanned: 0, truncated: true, partialFiles: 0, parseErrors: 0, walkErrors: 0, capturedBytes: 0, facts: {},
     })
     assert.equal(forged.ok, false)
     assert.equal(forged.reason, 'incomplete')
