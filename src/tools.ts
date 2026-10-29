@@ -898,6 +898,28 @@ function renderNamePage(args: unknown, value: FindRenderValue): Array<{ type: 't
  * asking for the next page — the only honest move is to say the list is capped
  * and name the two arguments that narrow it.
  */
+/**
+ * Convert the built-in `glob`'s `{root, paths}` answer into this tool's page.
+ *
+ * `size`/`modified`/`git` are required by the item schema, and the built-in walk
+ * does not stat what it lists. They are reported empty rather than invented: a
+ * `size: 0` would be a wrong fact, while `''` reads as "not reported". The page
+ * renders paths only.
+ *
+ * @param value - the built-in's raw value.
+ * @returns the page, or `undefined` when the value is not the built-in's shape.
+ */
+function nativeGlobFromBuiltin(value: unknown): FindRenderValue | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const paths = (value as { paths?: unknown }).paths
+  if (!Array.isArray(paths)) return undefined
+  const listed = paths.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+  return {
+    items: listed.map((path) => ({ path, size: 0, modified: '', git: '' })),
+    totalMatched: listed.length,
+  }
+}
+
 function renderNativeGlobPage(value: FindRenderValue): Array<{ type: 'text'; text: string }> {
   const header: string[] = []
   if (value.items.length === 0) {
@@ -995,6 +1017,14 @@ async function nameSearch(pool: FinderPool, args: Record<string, unknown>, patte
 }
 
 /**
+ * The built-in `glob` name, and the only name this branch ever delegates to.
+ *
+ * Same rule as {@link NATIVE_GREP_NAME}: the fallback has to address the
+ * built-in, and asking for a scoped `glob` would resolve back to ourselves.
+ */
+const NATIVE_GLOB_NAME = 'glob'
+
+/**
  * The built-in `glob` arguments, verbatim: a pattern and a directory, nothing
  * else. Kept as a typed constant so the native branch is checked against the
  * same schema spec as the forge branch instead of collapsing into a union.
@@ -1013,26 +1043,77 @@ const FORGE_FIND_PARAMETERS: ParameterSchemaSpec = {
 }
 
 /** fffind — fuzzy file-name search, plus glob path listing under `mode=glob`. */
-export function createFindTool(pool: FinderPool, nativeName?: 'glob') {
+export function createFindTool(pool: FinderPool, nativeName?: 'glob', delegation?: NativeDelegate) {
   // Serving as the built-in `glob`: its argument contract is `{pattern, path}`
   // and nothing else — no mode, no page, no limit — and its answer is a plain
   // path list. Admitting the rest would let the built-in guidance (which stays
   // visible under takeover) describe arguments this tool does not have.
   const native = nativeName === 'glob'
-  const nativeGlob = (args: Record<string, unknown>, exec: ForgeExec | undefined) => {
+  const nativeGlob = async (
+    args: Record<string, unknown>,
+    exec: ForgeExec | undefined,
+    raw: ForgeExec | undefined,
+  ) => {
     const pattern = typeof args.pattern === 'string' ? args.pattern.trim() : ''
     if (pattern === '') return failure('pattern is required')
+    const rawPath = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
+    // The built-in's own argument shape — never this tool's.
+    const builtin = { pattern, ...(rawPath === undefined ? {} : { path: rawPath }) }
+    const canDelegate = delegation !== undefined && delegation.available(NATIVE_GLOB_NAME)
+
+    // A glob in `path` is not a path. The built-in answers with an error and so
+    // does this; treating it as a constraint would answer a different question
+    // (the same rule `nativeGrep` applies).
+    if (canDelegate && rawPath !== undefined && /[*?{[]/.test(rawPath)) {
+      const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
+      if (!delegated.ok) return failure(delegated.error)
+      const page = nativeGlobFromBuiltin(delegated.value)
+      if (page !== undefined) return page
+      return failure('glob answered in an unexpected shape')
+    }
+
     // One page's worth is the whole answer here: there is no `page` argument to
     // continue with, so asking for the maximum keeps the cap from being the
     // thing that silently decides what the caller sees.
-    return globSearch(pool, { ...args, limit: GLOB_LIMIT_MAX, page: 0 }, pattern, exec)
+    const result = await globSearch(pool, { ...args, limit: GLOB_LIMIT_MAX, page: 0 }, pattern, exec)
+
+    if (isFailure(result)) {
+      if (!canDelegate) return result
+      // A path the index cannot re-root onto (another drive, a bare file, a
+      // directory outside every scope) is exactly where the disk walk answers.
+      const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
+      if (!delegated.ok) return result
+      return nativeGlobFromBuiltin(delegated.value) ?? result
+    }
+
+    if (result.items.length > 0 || !canDelegate) return result
+
+    // Empty page. The index holds no .gitignore'd path and no node_modules —
+    // precisely what the built-in walk does hold — so "nothing in the index"
+    // must not become "nothing at all". This is the one place the takeover can
+    // answer a narrower question than the tool it replaced, and the note says
+    // which side answered.
+    const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
+    if (!delegated.ok) {
+      const note = [result.note, `the on-disk check could not run (${delegated.error})`].filter(Boolean).join('; ')
+      return { ...result, ...(note === '' ? {} : { note }) }
+    }
+    const page = nativeGlobFromBuiltin(delegated.value)
+    if (page === undefined) return result
+    if (page.items.length === 0) {
+      return { items: [], totalMatched: 0, note: 'no match in the index and none on disk' }
+    }
+    return {
+      ...page,
+      note: 'the index had no match — these paths come from the built-in walk on disk, so .gitignore\'d paths and node_modules are included',
+    }
   }
   return {
     name: native ? 'glob' : 'fffind',
     description: native
       ? 'List files whose paths match a glob pattern. A pattern with no "/" matches the basename at any depth ("*.ts" ≙ "**/*.ts"); include a separator to anchor the depth. ' +
         'Files only — directories are never returned; descend with "dir/**". ' +
-        'Searches the workspace index, so .gitignore\'d paths and node_modules are NOT covered — pass path at one of them to search it.'
+        'Searches the workspace index, which holds no .gitignore\'d paths and no node_modules; when the index has no match the same pattern is re-run over the disk, and the note says which one answered.'
       : 'Find files. mode=name (default) fuzzily matches file names and paths, tolerating typos; mode=glob lists files whose paths match a glob and paginates by page. ' +
         'Both list FILES only — directories are never returned; descend with "dir/**". ' +
         'Pass path at any directory on the host — node_modules, another drive, another checkout — and the index re-roots onto it, reaching subtrees the workspace excludes. ' +
@@ -1055,8 +1136,8 @@ export function createFindTool(pool: FinderPool, nativeName?: 'glob') {
           : findModeOf(args) === 'glob' ? renderGlobPage(value) : renderNamePage(args, value),
     },
     isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      if (native) return nativeGlob(args, exec)
+    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined, raw?: ForgeExec) {
+      if (native) return nativeGlob(args, exec, raw)
       const explicit = typeof args.mode === 'string' && args.mode.trim() !== '' ? args.mode.trim() : undefined
       if (explicit !== undefined && !(FIND_MODES as readonly string[]).includes(explicit)) {
         return failure(`mode must be one of ${FIND_MODES.join(', ')} (or omitted for name) — got: ${args.mode}`)
@@ -1241,12 +1322,17 @@ export function createStatusCommand(
       // Whether the built-in handle actually resolves is not visible from any
       // config: it depends on which layer the host registered its fs tools in.
       // Without this line "the takeover silently stopped delegating" and "the
-      // takeover is fine" look identical.
-      const delegationLine = registration?.mode === 'takeover' && registration.takenOver.includes('grep')
-        ? registration.delegate?.available('grep') === true
-          ? '内置委托：可用（索引答不上时回退内置 grep）'
-          : '内置委托：不可用（grep 只走索引，空结果未被磁盘复核）'
-        : undefined
+      // takeover is fine" look identical. Both taken-over search tools report
+      // separately — they fall back on different triggers, and one resolving
+      // says nothing about the other.
+      const delegating = registration?.mode === 'takeover'
+        ? ['grep', 'glob'].filter((name) => registration.takenOver.includes(name))
+        : []
+      const delegationLine = registration === undefined || delegating.length === 0
+        ? undefined
+        : `内置委托：${delegating
+            .map((name) => `${name} ${registration.delegate?.available(name) === true ? '可用' : '不可用（只走索引）'}`)
+            .join('、')}`
       const statusHead = [modeLine, delegationLine].filter((line): line is string => line !== undefined)
 
       if (live.length === 0) {

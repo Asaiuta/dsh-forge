@@ -23,3 +23,9 @@
 - insert:
     - id: dsh-forge
       name: dsh-forge
+    # 设置页的宿主侧通道（GET/POST /forge-config）。独立成一行，因为它 inject
+    # ['webServer','configEditor']：headless / SDK profile 没有 webServer，这一行
+    # 由 cordis 直接跳过，主行照常加载。保存走 configEditor.edit()（写 profile
+    # patch + Loader 正常生命周期），registration/takeover 才会真正重新注册。
+    - id: dsh-forge-http
+      name: 'dsh-forge/http'

@@ -26,7 +26,7 @@ const result = await build({
   // without standing up the native finder. `src/overlay.ts` is an entry for the
   // same reason: its TTL and matching rules have to be testable without a
   // finder, and they are the part that can silently disagree with the engine.
-  entryPoints: ['src/index.ts', 'src/core.ts', 'src/tools.ts', 'src/absence.ts', 'src/overlay.ts', 'src/delegate.ts', 'src/tools-symbol.ts', 'src/ast.ts', 'src/edit-engine.ts', 'src/ledger.ts', 'src/tickets.ts', 'src/tools-edit.ts', 'src/history.ts', 'src/tools-files.ts', 'src/tools-read.ts', 'src/facts.ts', 'src/trace-facts.ts', 'src/decls.ts', 'src/linkgraph.ts', 'src/tools-trace.ts', 'src/edit-audit.ts', 'src/tools-cards.ts', 'src/cards.ts', 'src/distill.ts', 'src/ast-worker.ts', 'src/ast-pool.ts', 'src/indexer-client.ts', 'src/config.ts', 'src/registration.ts', 'src/guidance.ts', 'src/trace-capabilities.ts', 'src/source-evidence.ts', 'src/trace-snapshot.ts', 'src/trace-rows.ts', 'src/trace-capture.ts', 'src/bridge-check.ts', 'src/bridge-scan.ts', 'src/tools-check.ts', 'src/check-host.ts', 'src/check-plan.ts', 'src/verification.ts', 'src/tap.ts', 'src/types-check.ts'],
+  entryPoints: ['src/index.ts', 'src/http-plugin.ts', 'src/config-api.ts', 'src/core.ts', 'src/tools.ts', 'src/absence.ts', 'src/overlay.ts', 'src/delegate.ts', 'src/tools-symbol.ts', 'src/ast.ts', 'src/edit-engine.ts', 'src/ledger.ts', 'src/tickets.ts', 'src/tools-edit.ts', 'src/history.ts', 'src/tools-files.ts', 'src/tools-read.ts', 'src/facts.ts', 'src/trace-facts.ts', 'src/decls.ts', 'src/linkgraph.ts', 'src/tools-trace.ts', 'src/edit-audit.ts', 'src/tools-cards.ts', 'src/cards.ts', 'src/distill.ts', 'src/ast-worker.ts', 'src/ast-pool.ts', 'src/indexer-client.ts', 'src/config.ts', 'src/registration.ts', 'src/guidance.ts', 'src/trace-capabilities.ts', 'src/source-evidence.ts', 'src/trace-snapshot.ts', 'src/trace-rows.ts', 'src/trace-capture.ts', 'src/bridge-check.ts', 'src/bridge-scan.ts', 'src/tools-check.ts', 'src/check-host.ts', 'src/check-plan.ts', 'src/verification.ts', 'src/tap.ts', 'src/types-check.ts'],
   outdir: 'lib',
   bundle: true,
   splitting: true,
@@ -39,10 +39,86 @@ const result = await build({
   metafile: true,
 })
 
-// Prune chunks the build did not write (content hashes change when the graph
-// does), then drop entry outputs whose source is gone, then assert every chunk
-// reference resolves so a broken build fails here instead of as
-// ERR_MODULE_NOT_FOUND at first import.
+// ---------------------------------------------------------------------------
+// Browser half: the settings page.
+//
+// The shell loads a client bundle through `window.__ModuleLoader__`, so it is
+// emitted as CJS wrapped in a `load({ id, factory })` call — the same shape the
+// shipped bundles carry. `react`, its jsx runtimes and the ui primitives stay
+// external because the shell supplies them from its frozen platform table; a
+// bundle that inlined its own React would render into a different dispatcher
+// than the page it lives in.
+//
+// `src/client` is excluded from tsconfig.json on purpose: react and the
+// primitives are not installable here (they ship inside the app), so a local
+// stub would only confirm the stub. esbuild catches the mechanical errors and
+// the assertions below catch the contract ones.
+// ---------------------------------------------------------------------------
+const CLIENT_ID = 'dsh-forge'
+
+const platformExternal = [
+  'react',
+  'react-dom',
+  'react/jsx-runtime',
+  'react/jsx-dev-runtime',
+  'scheduler',
+  '@deepseek-ai/dsh-client-*',
+  '@deepseek-ai/cordis',
+]
+
+await build({
+  entryPoints: ['src/client/index.tsx'],
+  outfile: 'lib/client.js',
+  bundle: true,
+  format: 'cjs',
+  platform: 'browser',
+  target: ['es2022'],
+  jsx: 'automatic',
+  sourcemap: true,
+  // The comment header the shipped bundles carry; the loader keys modules by
+  // `id`, and other bundles reach this one by that same id.
+  banner: {
+    js: `window.__ModuleLoader__.load({\n\tid: ${JSON.stringify(CLIENT_ID)},\n\tfactory: (require) => {\n\t\tvar module = { exports: {} };\n\t\tvar exports = module.exports;\n\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });`,
+  },
+  footer: { js: '\t\treturn module.exports;\n\t}\n});' },
+  external: platformExternal,
+  logLevel: 'info',
+})
+
+// ---------------------------------------------------------------------------
+// Browser-half contract gate.
+//
+// Four failures are silent at runtime and expensive to diagnose from a
+// screenshot, so they are asserted here instead: a missing slot registration
+// (page never appears), a wrong row key (it appears on no plane at all), a route
+// typo (the page renders "读取中…" forever while the host is healthy), and a
+// `node:` import (throws at module evaluation inside the shell, before `apply`).
+// ---------------------------------------------------------------------------
+const clientBundle = readFileSync('lib/client.js', 'utf8')
+for (const marker of [
+  '__ModuleLoader__',
+  'settings.section',
+  'plugins.row.config',
+  'dsh-forge#dsh-forge',
+  '/forge-config',
+]) {
+  if (!clientBundle.includes(marker)) {
+    throw new Error(`lib/client.js is missing ${JSON.stringify(marker)} — the settings page cannot mount`)
+  }
+}
+if (/require\("node:/.test(clientBundle)) {
+  throw new Error('lib/client.js imports a node: builtin — the browser half must stay DOM-only')
+}
+// `require("react")` is expected (that is what "external" means: the shell's
+// loader supplies it). *Inlined* React is the failure — it would carry its own
+// dispatcher and render into a different one than the page it lives in.
+if (clientBundle.includes('ReactCurrentDispatcher') || clientBundle.includes('Symbol.for("react.element")')) {
+  throw new Error('lib/client.js inlines react — the shell must supply it from its platform table')
+}
+if (!clientBundle.includes('require("react/jsx-runtime")')) {
+  throw new Error('lib/client.js does not resolve react/jsx-runtime through the shell loader')
+}
+
 const written = new Set(Object.keys(result.metafile.outputs).map((p) => p.replace(/\\/g, '/').replace(/^lib\//, '')))
 let pruned = 0
 let stale = 0
@@ -52,6 +128,11 @@ for (const name of readdirSync('lib')) {
     continue
   }
   if (!name.endsWith('.js')) continue
+  // The browser half has no `src/client.ts` to compare against — its source is
+  // `src/client/index.tsx`. Without this guard the stale-entry sweep deletes the
+  // page it was just written, and the failure surfaces as a plugin whose row
+  // simply has no Configure button.
+  if (name === 'client.js') continue
   if (existsSync(join('src', `${name.slice(0, -3)}.ts`))) continue
   unlinkSync(join('lib', name))
   if (existsSync(join('lib', `${name}.map`))) unlinkSync(join('lib', `${name}.map`))

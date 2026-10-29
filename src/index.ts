@@ -164,7 +164,7 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
       native: 'glob',
       build: (as) =>
         defineForgeTool(
-          { ...createFindTool(pool, as === 'glob' ? 'glob' : undefined), ...(as === undefined ? {} : { registerAs: as }) },
+          { ...createFindTool(pool, as === 'glob' ? 'glob' : undefined, as === 'glob' ? delegation : undefined), ...(as === undefined ? {} : { registerAs: as }) },
           guard,
           integration,
         ),

@@ -128,6 +128,100 @@ export function canonicalize(raw: Buffer): { text: string; bom: boolean; eol: 'L
 }
 
 /**
+ * Incremental {@link canonicalize}: same conversions, same refusals, no
+ * whole-file buffer.
+ *
+ * `canonicalize` needs the entire file in memory, and then some: raw bytes,
+ * decoded string, and the `split('\n')` array the callers build on top of it —
+ * three copies before a single line is emitted. That is why a 200 MB file could
+ * not be read at all, and why the read path was capped at what fits comfortably
+ * rather than at what is safe. Feeding 256 KB at a time keeps the peak flat
+ * while producing **byte-identical** canonical text, so line numbers, edits and
+ * hashes keep meaning the same thing.
+ *
+ * Two things a chunk boundary can cut in half are held across calls: an
+ * incomplete UTF-8 sequence (the decoder's own state) and a lone `\r` that may
+ * be the first half of a `\r\n` (this class's `pendingCR`). Decoding without
+ * holding the second is how a CRLF file split at exactly the wrong byte becomes
+ * one extra line — which is worse than failing, because the numbers still look
+ * plausible.
+ */
+export class CanonicalStream {
+  private readonly decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+  private bomPending = true
+  private pendingCR = false
+  private sawBom = false
+
+  /**
+   * Decode the next raw chunk.
+   *
+   * @param chunk - the next slice of the file, in file order.
+   * @returns the canonical text this chunk produced; may be shorter than the
+   *   chunk, and may be empty when the chunk ended mid-sequence.
+   * @throws {SourceEncodingError} on bytes that are not valid UTF-8.
+   */
+  push(chunk: Buffer): string {
+    return this.normalize(this.decode(chunk, true))
+  }
+
+  /**
+   * End the stream and take whatever is still held.
+   *
+   * Must be called: without the final flush a file truncated mid-sequence would
+   * decode to its valid prefix instead of being refused, and a trailing lone `\r`
+   * would disappear instead of becoming a line break.
+   *
+   * @returns the remaining canonical text (usually one line break or nothing).
+   * @throws {SourceEncodingError} when the file ends inside a UTF-8 sequence.
+   */
+  end(): string {
+    const tail = this.normalize(this.decode(undefined, false))
+    if (!this.pendingCR) return tail
+    this.pendingCR = false
+    return `${tail}\n`
+  }
+
+  /** Whether the file began with a byte-order mark (reported, never kept). */
+  get bom(): boolean {
+    return this.sawBom
+  }
+
+  private decode(chunk: Buffer | undefined, stream: boolean): string {
+    try {
+      return this.decoder.decode(chunk, { stream })
+    } catch {
+      throw new SourceEncodingError('not valid UTF-8 — the file cannot be edited or positioned as text')
+    }
+  }
+
+  private normalize(text: string): string {
+    let out = text
+    // ignoreBOM keeps U+FEFF in the output so it can be reported and stripped
+    // exactly once — the same contract `canonicalize` implements.
+    if (this.bomPending && out !== '') {
+      this.bomPending = false
+      if (out.charCodeAt(0) === 0xfeff) {
+        this.sawBom = true
+        out = out.slice(1)
+      }
+    }
+    if (this.pendingCR) {
+      this.pendingCR = false
+      out = `\r${out}`
+    }
+    // A `\r` at the very end may be the first half of a `\r\n` whose `\n` is in
+    // the next chunk. Held instead of folded, because folding it here would emit
+    // two breaks where the file has one.
+    if (out.endsWith('\r')) {
+      this.pendingCR = true
+      out = out.slice(0, -1)
+    }
+    if (out.indexOf('\r') === -1) return out
+    return out.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
+}
+
+/**
  * Read a source file exactly once and derive every identity from that read.
  *
  * One Buffer feeds the hash and the parse: hashing a second read would certify
@@ -221,6 +315,25 @@ export function rangeForLines(text: string, startLine1: number, endLine1: number
   const start = lineStartOffset(text, startLine1)
   const end = lineStartOffset(text, endLine1 + 1)
   return { start: positionAt(text, start), end: positionAt(text, end) }
+}
+
+/**
+ * The range a **windowed** read emitted, from the emitted text alone.
+ *
+ * {@link rangeForSlice} needs the whole file to find where the first line
+ * starts; a streaming read never had the whole file, only lines
+ * `startLine1 …` and the knowledge that they began at a line boundary. Given
+ * that, the range is exactly the positions {@link positionAt} would produce at
+ * offsets `0 … text.length` — so this is the same answer, computed locally
+ * instead of by walking the file.
+ */
+export function rangeForWindow(text: string, startLine1: number): SourceRange {
+  const first = Math.max(1, startLine1) - 1
+  const parts = text.split('\n')
+  return {
+    start: { line: first, character: 0 },
+    end: { line: first + parts.length - 1, character: parts[parts.length - 1].length },
+  }
 }
 
 /**

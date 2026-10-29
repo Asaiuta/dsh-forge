@@ -440,11 +440,21 @@ async function main() {
     // The fallback is invisible from config alone: whether the built-in handle
     // resolves depends on which registry layer the host put its fs tools in.
     const wired = createStatusCommand(pool, { mode: 'takeover', takenOver: ['read', 'grep'], delegate: { available: () => true, run: async () => ({ ok: false, error: 'x' }) } })
-    assert.match((await wired.handler({ rawInput: '' })).text, /内置委托：可用/)
+    assert.match((await wired.handler({ rawInput: '' })).text, /内置委托：grep 可用/)
     const unwired = createStatusCommand(pool, { mode: 'takeover', takenOver: ['read', 'grep'], delegate: { available: () => false, run: async () => ({ ok: false, error: 'x' }) } })
-    assert.match((await unwired.handler({ rawInput: '' })).text, /内置委托：不可用/)
+    assert.match((await unwired.handler({ rawInput: '' })).text, /内置委托：grep 不可用/)
     const noGrep = createStatusCommand(pool, { mode: 'takeover', takenOver: ['read'] })
     assert.doesNotMatch((await noGrep.handler({ rawInput: '' })).text, /内置委托/, 'grep not taken over: the line must not appear at all')
+    // Each taken-over search tool reports on its own: they fall back on
+    // different triggers, and one resolving says nothing about the other.
+    const both = createStatusCommand(pool, {
+      mode: 'takeover',
+      takenOver: ['read', 'grep', 'glob'],
+      delegate: { available: (name) => name === 'glob', run: async () => ({ ok: false, error: 'x' }) },
+    })
+    const bothText = (await both.handler({ rawInput: '' })).text
+    assert.match(bothText, /grep 不可用（只走索引）/, bothText)
+    assert.match(bothText, /glob 可用/, bothText)
     ok('/forge-status reports whether the built-in fallback is actually reachable')
   }
 
