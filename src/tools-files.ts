@@ -338,7 +338,7 @@ export function createFileTool() {
         // File identity changed, not bridge membership: the audit says so
         // explicitly instead of leaving this entry point silent. Without this,
         // a move that strands consumers would look identical to a clean run.
-        const audit = auditCommit({
+        const audit = await auditCommit({
           workspace,
           batchId: committed.batch,
           kind: 'file',

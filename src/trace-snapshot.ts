@@ -31,7 +31,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 
 /** Bumped whenever the extraction schema changes meaning (not on refactors). */
-export const TRACE_SNAPSHOT_SCHEMA = 'trace-snapshot/1'
+export const TRACE_SNAPSHOT_SCHEMA = 'trace-snapshot/2'
 
 /** Fixed slot order, so a context that disappears cannot be mistaken for one
  *  that never existed. */

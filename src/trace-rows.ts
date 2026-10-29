@@ -46,7 +46,7 @@ export interface RowSet {
   rows: TraceRow[]
   /** Did the graph walk finish (impact/path), or is this a direct fact scan? */
   traversalComplete: boolean
-  /** Was the row computation itself bounded? */
+  /** Did the row computation retain complete attribution within its scope? */
   resultComplete: boolean
   /** Why rows may be missing, when they may be. */
   limitations: Array<{ reason: string; count?: number }>
@@ -108,9 +108,10 @@ function exposeRows(g: TraceGraph, filter: string): RowSet {
   return {
     rows: sortRows([...deduped.values()]),
     traversalComplete: true,
-    resultComplete: true,
+    resultComplete: g.unboundBridge.length === 0,
     limitations: [
       { reason: 'static_visible_only' },
+      ...(g.unboundBridge.length > 0 ? [{ reason: 'unknown_binding', count: g.unboundBridge.length }] : []),
       ...(exposures === 0 ? [{ reason: 'no_matching_exposure' }] : []),
     ],
   }

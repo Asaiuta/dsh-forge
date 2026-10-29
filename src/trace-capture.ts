@@ -33,7 +33,7 @@ import type { TraceFileFacts } from './facts.ts'
 import type { TraceConfigIdentity } from './trace-snapshot.ts'
 
 /** Bumped when the stored shape changes; old files are then simply unusable. */
-export const CAPTURE_SCHEMA = 'trace-capture/1'
+export const CAPTURE_SCHEMA = 'trace-capture/2'
 
 /** Baseline lifetime. Short on purpose: a baseline answers "what did this look
  *  like during this edit session", not "what did the tree look like last week". */
@@ -71,6 +71,8 @@ export interface CaptureBaseline {
   scanned: number
   truncated: boolean
   partialFiles: number
+  parseErrors: number
+  walkErrors: number
   /** Bytes actually read (source candidates only). */
   capturedBytes: number
   /** Canonical facts, keyed by workspace-relative path. */
@@ -154,11 +156,11 @@ export function baselineStats(workspaceId: string): { count: number; bytes: numb
  * later "no new problem" verdict would then cover files the baseline never saw.
  */
 export function saveBaseline(baseline: CaptureBaseline): CaptureSave {
-  if (baseline.truncated || baseline.partialFiles > 0 || baseline.strength !== 'content-bound') {
+  if (!completeBaseline(baseline)) {
     return {
       ok: false,
       reason: 'incomplete',
-      detail: `捕获不完整（截断=${baseline.truncated}，部分解析=${baseline.partialFiles}）；不能作为内容基线保存`,
+      detail: `捕获不完整（截断=${baseline.truncated}，读取/解析失败=${baseline.parseErrors}，部分解析=${baseline.partialFiles}，遍历失败=${baseline.walkErrors}，覆盖=${baseline.files.length}/${baseline.scanned}）；不能作为内容基线保存`,
     }
   }
   const payload = JSON.stringify(baseline)
@@ -220,11 +222,22 @@ export function loadBaseline(workspaceId: string, snapshotId: string, now: numbe
   if (fileSetDigestOf(parsed.files) !== parsed.fileSetDigest) {
     return { ok: false, reason: 'corrupt', detail: '文件清单与摘要不一致' }
   }
+  if (!completeBaseline(parsed)) return { ok: false, reason: 'corrupt', detail: '基线没有完整的读取、解析与遍历证据' }
   const age = now - Date.parse(parsed.createdAt)
   if (!Number.isFinite(age) || age > ttlMs()) {
     return { ok: false, reason: 'expired', detail: `基线已超过 ${Math.round(ttlMs() / 3600000)} 小时有效期` }
   }
   return { ok: true, baseline: parsed, path: file }
+}
+
+function completeBaseline(baseline: CaptureBaseline): boolean {
+  return baseline.schema === CAPTURE_SCHEMA && baseline.strength === 'content-bound'
+    && baseline.truncated === false && baseline.partialFiles === 0
+    && baseline.parseErrors === 0 && baseline.walkErrors === 0
+    && Number.isSafeInteger(baseline.scanned) && baseline.scanned >= 0
+    && baseline.files.length === baseline.scanned
+    && new Set(baseline.files.map(file => file.path)).size === baseline.scanned
+    && baseline.files.every(file => Object.hasOwn(baseline.facts, file.path))
 }
 
 /** Digest over the sorted file list. Recomputable from the record alone, so a

@@ -39,6 +39,7 @@ import { createExecutionGuard, type ForgeFileSystem, type ForgeFsEvents, type Fo
 import { createNativeDelegate } from './delegate.ts'
 import { createFileTool } from './tools-files.ts'
 import { createReadTool } from './tools-read.ts'
+import { createCheckTool } from './tools-check.ts'
 import { createTraceTool } from './tools-trace.ts'
 import { createCardsTool } from './tools-cards.ts'
 import { AstWorkerPool } from './ast-pool.ts'
@@ -183,6 +184,10 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
         ),
     },
     { forge: 'fftrace', build: () => defineForgeTool(createTraceTool(workers), guard, integration) },
+    // The check tool reads `approval` and `subprocess` by name at call time. A
+    // host without `get` gets a closed lookup rather than a mount failure: the
+    // tool then reports `unavailable`, which is the honest answer.
+    { forge: 'ffcheck', build: () => defineForgeTool(createCheckTool({ get: name => optionalService(host, name) }), guard, integration) },
     { forge: 'ff_cards', build: () => defineForgeTool(createCardsTool(config.cards), guard, integration) },
   ]
 

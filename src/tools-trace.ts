@@ -14,7 +14,6 @@
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import ignore from 'ignore'
 import { bridgeGlobalsOf, loadPreloadDecls } from './decls.ts'
 import { buildGraph, deriveRoleGlobals, exposedGlobalsOf, normalizeTraceFile, parseDependencyPath, type TraceGraph } from './linkgraph.ts'
 import { parseTarget, trace, type ExposesFormat } from './trace-queries.ts'
@@ -28,18 +27,19 @@ import { astWorkerAuto, astWorkerCount, parallelTrace, type AstWorkerPool } from
 import { extractTraceFile, selectBridgeFacts, type TraceFileOutcome } from './trace-facts.ts'
 import { indexerCollectCandidates, indexerProbesUnchanged, indexerReady, indexerStatPaths, indexerTextFacts, indexerTraceFacts, indexerTraceLang, indexerTraceWanted } from './indexer-client.ts'
 import { BINARY_EXTENSIONS, MAX_BINARY_BYTES } from './binary-facts.ts'
-import { loadJsProject, projectMetadata } from './js-project.ts'
-import { loadPythonProject, pythonMetadata } from './python-project.ts'
-import { cargoMetadata, loadRustProject } from './rust-project.ts'
-import { goMetadata, loadGoProject } from './go-project.ts'
+import { loadJsProject } from './js-project.ts'
+import { loadPythonProject } from './python-project.ts'
+import { loadRustProject } from './rust-project.ts'
+import { loadGoProject } from './go-project.ts'
 import { findDefinitions } from './tools-symbol.ts'
 import { TRACE_SCAN_EXTENSIONS } from './trace-capabilities.ts'
 import { configIdentity, configKeyOf, TraceSnapshots, type TraceSnapshotMeta } from './trace-snapshot.ts'
+import { collectCandidatesLocal, candidateFilesOf } from './trace-candidates.ts'
 import { sha256Hex } from './source-evidence.ts'
+export { collectCandidatesLocal } from './trace-candidates.ts'
 import { collectRows, rowText, type RowQuery, type RowSet } from './trace-rows.ts'
 import type { EdgeMode, ProjectContext, TraceDiagnostic } from './trace-evidence.ts'
 
-const FILE_CAP = 20_000
 const PER_FILE_BYTES = 2 * 1024 * 1024
 /** Total source bytes one capture may read. Above this the capture stops and
  *  says so; a partial baseline cannot answer "no new problem". Overridable so a
@@ -52,7 +52,6 @@ function captureReadBudget(): number {
   }
   return 256 * 1024 * 1024
 }
-const WALK_VISIT_CAP = 200_000
 
 function failure(error: string): ToolFailure {
   return { error }
@@ -88,80 +87,6 @@ function text(value: string): Array<{ type: 'text'; text: string }> {
   return [{ type: 'text', text: value }]
 }
 
-/** Rules per root, reused while .gitignore is unchanged: the matcher caches
- *  each path's verdict, which a fresh instance per scan would discard. */
-const IGNORE_RULES = new Map<string, { text: string; rules: ReturnType<typeof ignore> }>()
-
-/** Collect supported source, HTML, manifests and binaries, root-.gitignore-aware, capped.
- *
- *  This is the reference the sidecar walk in `rust_indexer/src/candidates.rs`
- *  is held to, entry for entry and order included: tests/run-trace-candidates
- *  compares the two lists outright, so a rule that drifts on one side and not
- *  the other fails the suite instead of quietly changing what gets scanned. */
-export function collectCandidatesLocal(root: string, signal?: AbortSignal): { files: Array<{ abs: string; rel: string }>; projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number } {
-  let walkErrors = 0
-  let text = ''
-  const gitignore = path.join(root, '.gitignore')
-  if (existsSync(gitignore)) {
-    try { text = readFileSync(gitignore, 'utf8') } catch { walkErrors++ }
-  }
-  let cached = IGNORE_RULES.get(root)
-  if (!cached || cached.text !== text) {
-    cached = { text, rules: ignore().add(text) }
-    IGNORE_RULES.delete(root)
-    IGNORE_RULES.set(root, cached)
-    if (IGNORE_RULES.size > 8) IGNORE_RULES.delete(IGNORE_RULES.keys().next().value!)
-  }
-  const rules = cached.rules
-  const files: Array<{ abs: string; rel: string }> = []
-  const projectFiles: string[] = []
-  const pythonFiles: string[] = []
-  const cargoFiles: string[] = []
-  const goFiles: string[] = []
-  let visited = 0
-  let truncated = false
-  const walk = (dir: string, prefix = ''): void => {
-    signal?.throwIfAborted()
-    if (files.length >= FILE_CAP || visited > WALK_VISIT_CAP) {
-      truncated = true
-      return
-    }
-    let entries
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      walkErrors++
-      return
-    }
-    for (const entry of entries) {
-      if (files.length >= FILE_CAP || visited > WALK_VISIT_CAP) {
-        truncated = true
-        return
-      }
-      visited++
-      const abs = path.join(dir, entry.name)
-      const rel = prefix + entry.name
-      if (rules.ignores(rel)) continue
-      if (entry.isDirectory()) {
-        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.dsh') continue
-        // Host-owned artifact containers (any dot-directory carrying the _dsh
-        // marker, e.g. .workbuddy/_dsh/asar-out) are runtime dumps, not
-        // workspace source — detection is structural, never by directory name.
-        if (entry.name.startsWith('.') && existsSync(path.join(abs, '_dsh'))) continue
-        walk(abs, rel + '/')
-      } else if (entry.isFile()) {
-        if (projectMetadata(entry.name)) projectFiles.push(rel)
-        if (pythonMetadata(entry.name)) pythonFiles.push(rel)
-        if (cargoMetadata(entry.name)) cargoFiles.push(rel)
-        if (goMetadata(entry.name)) goFiles.push(rel)
-        if (TRACE_SCAN_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || BINARY_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || entry.name === 'go.mod') files.push({ abs, rel })
-      }
-    }
-  }
-  walk(root)
-  return { files: files.sort((a, b) => a.rel.localeCompare(b.rel)), projectFiles: projectFiles.sort(), pythonFiles: pythonFiles.sort(), cargoFiles: cargoFiles.sort(), goFiles: goFiles.sort(), truncated, walkErrors }
-}
-
 /** Discovery, walked by the sidecar when it can. The order it returns is
  *  irrelevant: `localeCompare` and plain `sort()` are the contract here, and
  *  neither has a byte-order equivalent in Rust. */
@@ -191,7 +116,8 @@ async function collectCandidates(root: string, signal?: AbortSignal): Promise<Re
 
 /**
  * Cache bridge-independent facts; select bridge references after discovering
- * aliases across the workspace. No source file needs the old second parse.
+ * aliases across the workspace. Legacy receiver bindings are populated once
+ * before graph construction, then reuse this same cache.
  */
 interface CachedFacts {
   mtimeMs: number
@@ -199,6 +125,7 @@ interface CachedFacts {
   ctimeMs: number
   value: TraceFileOutcome
 }
+type FileStamp = [string, number, number, number] | [string, null]
 const FACTS_CACHE = new Map<string, CachedFacts>()
 const FACTS_CACHE_CAP = 6000
 
@@ -220,10 +147,88 @@ export function resetTraceFactsCache(): void {
   resetCompilationCache()
 }
 
+/** Older sidecars omit lexical receivers. Replace only their bridge candidate
+ * files with facts from one stable byte read; never splice bindings into facts
+ * extracted from an unidentified native read. The ordinary facts cache owns
+ * these replacements too, so a warm graph needs no additional parsing. */
+async function supplementBridgeBindings(
+  files: Array<{ abs: string; rel: string }>,
+  outcomes: TraceFileOutcome[],
+  stamps: FileStamp[],
+  declaredGlobals: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<number, boolean>> {
+  const updated = new Map<number, boolean>()
+  const replace = async (index: number): Promise<void> => {
+    if (updated.has(index)) return
+    const original = outcomes[index]
+    const entry = original.value!
+    if (entry.kind !== 'js' && entry.kind !== 'html') return
+    const facts = scriptFacts(entry)!
+    const stamp = stamps[index]
+    if (stamp.length !== 4) return
+    const stable = (): boolean => {
+      const current = statSync(files[index].abs)
+      return current.mtimeMs === stamp[1] && current.size === stamp[2] && current.ctimeMs === stamp[3]
+    }
+    let bound: TraceFileOutcome
+    signal?.throwIfAborted()
+    try {
+      if (!stable()) throw new Error('补足桥接绑定前文件已发生变化。')
+      const raw = readBoundedFile(files[index].abs, PER_FILE_BYTES)
+      if (raw.length !== stamp[2] || !stable()) throw new Error('补足桥接绑定的读取期间文件发生变化。')
+      bound = await extractTraceFileFromBytes(files[index].abs, raw, { strict: true })
+      if (!stable()) throw new Error('补足桥接绑定的解析期间文件发生变化。')
+    } catch (cause) {
+      bound = { value: null, parseErrors: 1, partialFiles: 0,
+        diagnostics: [{ reason: 'bridge_binding_unavailable', message: cause instanceof Error ? cause.message : String(cause) }] }
+    }
+    signal?.throwIfAborted()
+    if (bound.value && bound.parseErrors === 0 && bound.partialFiles === 0) {
+      outcomes[index] = { value: bound.value, parseErrors: 0, partialFiles: 0 }
+      updated.set(index, true)
+      return
+    }
+    // Keep visible native sites as unknown when the supplement is unavailable.
+    // Page aliases must be uncertain too, including declarations without calls.
+    const unknown = {
+      ...facts,
+      bridge: facts.bridge.map(ref => ({ ...ref, receiver: {
+        object: ref.object, local: false, qualified: false, viaAlias: false, uncertain: true,
+      } })),
+      bridgeAliases: facts.bridgeAliases.map(alias => ({ ...alias, uncertain: true })),
+    }
+    outcomes[index] = {
+      value: entry.kind === 'js' ? { ...entry, ...unknown } : { ...entry, facts: unknown },
+      parseErrors: original.parseErrors + bound.parseErrors,
+      partialFiles: Math.max(1, original.partialFiles),
+      diagnostics: [...original.diagnostics ?? [], ...bound.diagnostics ?? [],
+        { reason: 'bridge_binding_unavailable', message: '桥接接收者绑定未补足，相关站点与页面别名保持未确定。' }],
+    }
+    updated.set(index, false)
+  }
+  // Bind alias declarations first: a fallback in one classic script can affect
+  // a consumer in another even when the declaring file has no member calls.
+  for (let index = 0; index < outcomes.length; index++) {
+    const facts = outcomes[index].value && scriptFacts(outcomes[index].value!)
+    if (facts?.bridgeAliases.some(alias => alias.binding === undefined)) await replace(index)
+  }
+  const entries = new Map(files.flatMap((file, index) => outcomes[index].value ? [[file.rel, outcomes[index].value!] as const] : []))
+  const globals = new Set([...declaredGlobals, ...Object.values(deriveRoleGlobals(entries)), ...exposedGlobalsOf(entries),
+    ...topLevelAliasNames([...entries.values()].map(entry => ({ facts: scriptFacts(entry) })))])
+  for (let index = 0; index < outcomes.length; index++) {
+    const facts = outcomes[index].value && scriptFacts(outcomes[index].value!)
+    if (!facts) continue
+    const effective = new Set([...globals, ...facts.bridgeAliases.map(alias => alias.name)])
+    if (facts.bridge.some(ref => ref.receiver === undefined && effective.has(ref.object))) await replace(index)
+  }
+  return updated
+}
+
 /** Scan one root: per-file facts (HTML scanner + AST extractor). */
-async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool, capture = false) {
-  const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors } = await collectCandidates(root, signal)
-  if (capture) return scanFactsForCapture(root, files, { projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors }, signal)
+async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool, capture = false, declaredGlobals: readonly string[] = []) {
+  const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors, ignoreHash } = capture ? collectCandidatesLocal(root, signal) : await collectCandidates(root, signal)
+  if (capture) return scanFactsForCapture(root, files, { projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors, ignoreHash }, signal)
   // Discovery never follows directory links below root. Check root's own
   // identity once so retargeting an alias cannot reuse another tree's facts,
   // even when every source file happens to have identical stat metadata.
@@ -231,7 +236,7 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
   try { rootIdentity = realpathSync(root) } catch { /* walkErrors reports an inaccessible root */ }
   const entries = new Map<string, TraceFileFacts>()
   const outcomes: TraceFileOutcome[] = Array(files.length)
-  const stamps: Array<[string, number, number, number] | [string, null]> = []
+  const stamps: FileStamp[] = []
   const missing: Array<{ index: number; file: string; cacheKey: string; bytes: number; mtimeMs: number; ctimeMs: number }> = []
   let parseErrors = 0
   let partialFiles = 0
@@ -294,11 +299,18 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
   }
   signal?.throwIfAborted()
   missing.forEach((item, index) => {
-    const value = parsed[index]!
-    outcomes[item.index] = value
-    // Failed reads must be retried: permission changes need not change stat.
-    if (value.value && value.parseErrors === 0) rememberFacts(item.cacheKey, item.mtimeMs, item.bytes, item.ctimeMs, value)
+    outcomes[item.index] = parsed[index]!
   })
+  const supplemented = await supplementBridgeBindings(files, outcomes, stamps, declaredGlobals, signal)
+  for (const index of new Set([...missing.map(item => item.index), ...supplemented.keys()])) {
+    const value = outcomes[index]
+    const stamp = stamps[index]
+    if (stamp.length !== 4) continue
+    const cacheKey = JSON.stringify([rootIdentity, files[index].abs])
+    // Failed reads must be retried: permission changes need not change stat.
+    if (value.value && value.parseErrors === 0 && supplemented.get(index) !== false) rememberFacts(cacheKey, stamp[1], stamp[2], stamp[3], value)
+    else FACTS_CACHE.delete(cacheKey)
+  }
   outcomes.forEach((outcome, index) => {
     parseErrors += outcome.parseErrors
     partialFiles += outcome.partialFiles
@@ -327,7 +339,7 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
 async function scanFactsForCapture(
   root: string,
   files: Array<{ abs: string; rel: string }>,
-  context: { projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number },
+  context: { projectFiles: string[]; pythonFiles: string[]; cargoFiles: string[]; goFiles: string[]; truncated: boolean; walkErrors: number; ignoreHash?: string | null },
   signal?: AbortSignal,
 ) {
   let rootIdentity: string | null = null
@@ -403,6 +415,8 @@ async function scanFactsForCapture(
     partialFiles,
     walkErrors: context.walkErrors,
     captures,
+    traceFiles: candidateFilesOf({ files, ...context }),
+    ignoreHash: context.ignoreHash,
     capturedBytes,
     signature: JSON.stringify([rootIdentity, [...captures.values()].map(file => [file.path, file.rawHash]), truncated, context.walkErrors]),
   }
@@ -449,6 +463,12 @@ export interface AssembledTrace {
     evicted?: string
     saveError?: string
   }
+  /** Exact source bytes read by a capture, including an in-memory formal check. */
+  capturedFiles?: readonly CapturedFile[]
+  /** Inputs used for a formal scan, including configuration and negative probes. */
+  inputHashes?: ReadonlyMap<string, string | null>
+  /** Discovery scope: adding a source/config file invalidates a previous check. */
+  traceFiles?: readonly string[]
 }
 
 export interface TraceAssemblyOptions {
@@ -460,6 +480,23 @@ export interface TraceAssemblyOptions {
    *  Bypasses the warm-graph cache and the sidecar: the hash must describe the
    *  bytes that were parsed, and no cached fact qualifies. */
   capture?: boolean
+  /** A formal check needs the same reads without rotating saved edit baselines. */
+  persistCapture?: boolean
+  /**
+   * Extra global names to treat as bridge roots for this assembly (M1.2).
+   *
+   * Member facts are filtered against the known bridge globals, which is what
+   * keeps `api.member` noise out of an ordinary reply. A *diff* needs the
+   * opposite: when a provider file is deleted, its global stops being known, and
+   * the filter then erases every consumer of it — the deletion would look like a
+   * clean run because the evidence vanished with the evidence source.
+   *
+   * Passing the before-state's globals keeps those consumers visible so the diff
+   * can report them as orphaned. Graphs built this way are deliberately never
+   * cached: they answer a different question than the default selection, and a
+   * warmer cache handing that answer to an ordinary query would be wrong.
+   */
+  extraGlobals?: readonly string[]
 }
 interface GraphProbe { exists: boolean; identity: string | null }
 const GRAPH_CACHE = new Map<string, { signature: string; decls: string; contexts: Array<ProjectContext | undefined>; probes: Map<string, GraphProbe>; assembled: AssembledTrace }>()
@@ -663,7 +700,7 @@ function renderPage(input: {
   const lines = [
     `## ${title}`,
     `- 共 ${total} 行 · 本页 ${shown.length} 行（第 ${offset + 1}–${offset + shown.length} 行，页大小 ${limit}）`,
-    `- 遍历：${rows.traversalComplete ? '完成' : '⚠️ 达到遍历预算，仅覆盖已遍历范围'} · 结果：${rows.resultComplete ? '完整' : '⚠️ 受预算限制'}`,
+    `- 遍历：${rows.traversalComplete ? '完成' : '⚠️ 达到遍历预算，仅覆盖已遍历范围'} · 结果：${rows.resultComplete ? '完整' : '⚠️ 不完整（见口径）'}`,
     ...(rows.limitations.length ? [`- 口径：${rows.limitations.map(limit => limit.reason).join('、')}`] : []),
     ...(stale
       ? [`- ⚠️ 本页来自旧快照 \`${stale.snapshotId}\`（stale）：只能用于回顾旧证据，不可作为当前修改计划的依据。需要当前结果请重新查询。`]
@@ -739,8 +776,9 @@ function probesUnchanged(root: string, probes: ReadonlyMap<string, GraphProbe>):
 
 async function assemble(root: string, key: string, options: TraceAssemblyOptions): Promise<AssembledTrace> {
   const capture = options.capture === true
+  const extraGlobals = options.extraGlobals ?? []
   const decls = await loadPreloadDecls(root, options.declarations, options.signal)
-  const scan = await scanFacts(root, options.signal, options.workers, capture)
+  const scan = await scanFacts(root, options.signal, options.workers, capture, [...bridgeGlobalsOf(decls), ...extraGlobals])
   // One pass over the facts answers everything the five loaders need to be
   // called or skipped. The JS file-reference map needed a pass of its own
   // anyway, and the other four only ever asked one question each.
@@ -792,7 +830,7 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   const native = !capture && indexerTraceWanted() && await indexerReady({ signal: options.signal })
   // A capture must never answer from a cached graph: its whole product is a hash
   // of the bytes it read *now*. The fast path is unaffected.
-  if (!capture && cached && cached.signature === scan.signature && cached.decls === declsKey
+  if (!capture && extraGlobals.length === 0 && cached && cached.signature === scan.signature && cached.decls === declsKey
     && cached.assembled.snapshot.configKey === configKey
     && contexts.every((context, index) => cached.contexts[index]?.signature === context?.signature && cached.contexts[index]?.valid() !== false)
     && scan.walkErrors === 0 && !scan.truncated) {
@@ -813,7 +851,7 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   // plus literal exposeInMainWorld names count as bridge roots even without a
   // declarations file, so per-key usage of exposed globals survives the
   // post-scan bridge filter.
-  const bridge = [...new Set([...bridgeGlobalsOf(decls), ...Object.values(deriveRoleGlobals(scan.entries)), ...exposedGlobalsOf(scan.entries), ...aliases])]
+  const bridge = [...new Set([...bridgeGlobalsOf(decls), ...Object.values(deriveRoleGlobals(scan.entries)), ...exposedGlobalsOf(scan.entries), ...aliases, ...extraGlobals])]
   const entries = new Map([...scan.entries].map(([rel, entry]) => [rel, selectBridgeFacts(entry, bridge)]))
   options.signal?.throwIfAborted()
   const probes = new Map<string, GraphProbe>()
@@ -823,6 +861,7 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   // Truncation, a partial parse or an unstable read downgrade the claim instead
   // of being papered over by the files that happened to succeed.
   const contentBound = capture && captured !== undefined && !scan.truncated && scan.partialFiles === 0
+    && scan.parseErrors === 0 && scan.walkErrors === 0 && captured.size === scan.scanned
   const assembled: AssembledTrace = { graph, decls, scanned: scan.scanned, truncated: scan.truncated, parseErrors: scan.parseErrors, partialFiles: scan.partialFiles, walkErrors: scan.walkErrors,
     diagnostics: [...scan.diagnostics, ...project?.issues ?? [], ...python?.issues ?? [], ...rust?.issues ?? [], ...go?.issues ?? []],
     ...(project ? { project: { configs: project.configs, workspacePackages: project.workspacePackages } } : {}),
@@ -846,15 +885,21 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
   }
   SNAPSHOTS.put(assembled.snapshot, assembled)
   if (captured) {
+    assembled.capturedFiles = [...captured.values()].sort((a, b) => a.path.localeCompare(b.path))
+    assembled.traceFiles = (scan as { traceFiles: string[] }).traceFiles
+    const inputHashes = new Map<string, string | null>(assembled.capturedFiles.map(file => [file.path, file.rawHash]))
+    inputHashes.set('.gitignore', (scan as { ignoreHash?: string | null }).ignoreHash ?? null)
+    for (const [file, hash] of project?.inputHashes ?? []) inputHashes.set(file, hash)
+    assembled.inputHashes = inputHashes
     assembled.capture = {
       files: captured.size,
       bytes: (scan as { capturedBytes: number }).capturedBytes,
       persisted: false,
     }
-    if (contentBound) {
-      const files = [...captured.values()].sort((a, b) => a.path.localeCompare(b.path))
+    if (contentBound && options.persistCapture !== false) {
+      const files = [...assembled.capturedFiles]
       const baseline: CaptureBaseline = {
-        schema: 'trace-capture/1',
+        schema: 'trace-capture/2',
         snapshotId: assembled.snapshot.snapshotId,
         workspaceId: root,
         configKey,
@@ -869,6 +914,8 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
         scanned: scan.scanned,
         truncated: false,
         partialFiles: 0,
+        parseErrors: 0,
+        walkErrors: 0,
         capturedBytes: assembled.capture.bytes,
         facts: Object.fromEntries(scan.entries),
       }
@@ -878,14 +925,14 @@ async function assemble(root: string, key: string, options: TraceAssemblyOptions
       } else {
         assembled.capture = { ...assembled.capture, persisted: false, saveError: saved.detail }
       }
-    } else {
+    } else if (!contentBound) {
       assembled.capture = {
         ...assembled.capture,
-        saveError: `捕获不完整（截断=${scan.truncated}，部分解析=${scan.partialFiles}），不能作为内容基线保存`,
+        saveError: `捕获不完整（截断=${scan.truncated}，读取/解析失败=${scan.parseErrors}，部分解析=${scan.partialFiles}，遍历失败=${scan.walkErrors}，覆盖=${captured.size}/${scan.scanned}），不能作为内容基线保存`,
       }
     }
   }
-  if (!capture && !scan.truncated && scan.walkErrors === 0) {
+  if (!capture && extraGlobals.length === 0 && !scan.truncated && scan.walkErrors === 0) {
     GRAPH_CACHE.delete(key)
     GRAPH_CACHE.set(key, { signature: scan.signature, decls: declsKey, contexts, probes, assembled })
     if (GRAPH_CACHE.size > 4) GRAPH_CACHE.delete(GRAPH_CACHE.keys().next().value!)
@@ -917,7 +964,7 @@ export function peekTraceGraph(root: string): AssembledTrace | undefined {
 export function assembleTraceGraph(root: string, options: TraceAssemblyOptions = {}): Promise<AssembledTrace> {
   options.signal?.throwIfAborted()
   root = path.resolve(root)
-  const key = JSON.stringify([root, options.declarations ? path.resolve(root, options.declarations) : null, options.compileCommands ? path.resolve(root, options.compileCommands) : null, options.capture === true ? 'capture' : 'fast'])
+  const key = JSON.stringify([root, options.declarations ? path.resolve(root, options.declarations) : null, options.compileCommands ? path.resolve(root, options.compileCommands) : null, options.capture === true ? 'capture' : 'fast', options.extraGlobals && options.extraGlobals.length > 0 ? [...options.extraGlobals].sort() : null])
   let owners = PENDING.get(key)
   if (!owners) { owners = new Map(); PENDING.set(key, owners) }
   let job = owners.get(options.workers)
@@ -1171,7 +1218,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
         unresolved: localUnresolved.slice(0, 100), issues: issues.slice(0, 100) }
       const resolutionIncomplete = localUnresolved.some(ref => ref.reason === 'unsupported_config' || ref.reason === 'ambiguous_target')
       const incomplete = truncated || parseErrors > 0 || partialFiles > 0 || walkErrors > 0 || decls.status === 'failed'
-        || compilation?.status === 'failed' || Boolean(compilation?.unsupported) || result.analysis?.complete === false || graph.resolutionLimited === true || issues.length > 0 || resolutionIncomplete
+        || compilation?.status === 'failed' || Boolean(compilation?.unsupported) || result.analysis?.complete === false || graph.resolutionLimited === true || issues.length > 0 || resolutionIncomplete || graph.unboundBridge.length > 0
       const derivedKeys = graph.namedEntries.size
       // Two lines, not eight. The scan scope, the confidence legend and the
       // candidate-edge policy are identical in every reply on a given repo, so
@@ -1194,7 +1241,7 @@ export function createTraceTool(workers?: AstWorkerPool) {
           ? [`${localUnresolved.length} 项本地未解析${externalUnresolved ? `（另有 ${externalUnresolved} 项外部包）` : ''}，${issues.length} 项文件/工程问题`]
           : []),
         ...(incomplete
-          ? [`读取/解析失败 ${parseErrors} 处，部分解析 ${partialFiles} 文件，遍历失败 ${walkErrors} 处${truncated ? '，候选截断' : ''}${result.analysis?.complete === false ? '，查询遍历受限' : ''}${resolutionIncomplete ? '，存在配置或归属限制' : ''}${compilation?.status === 'failed' || compilation?.unsupported ? '，编译元数据不全' : ''}`]
+          ? [`读取/解析失败 ${parseErrors} 处，部分解析 ${partialFiles} 文件，遍历失败 ${walkErrors} 处${truncated ? '，候选截断' : ''}${result.analysis?.complete === false ? '，查询遍历受限' : ''}${resolutionIncomplete ? '，存在配置或归属限制' : ''}${compilation?.status === 'failed' || compilation?.unsupported ? '，编译元数据不全' : ''}${graph.unboundBridge.length ? `，桥接接收者绑定未确定 ${graph.unboundBridge.length} 处` : ''}`]
           : []),
         ...(compilation ? [`编译数据库 ${compilation.status} · ${compilation.entries} 条${compilation.unsupported ? ` · ${compilation.unsupported} 条不支持` : ''}`] : []),
         ...(graph.resolutionLimited ? ['模块归属或 Java 继承成员解析达预算，推断已停止'] : []),

@@ -45,6 +45,7 @@ import {
 import { createTicket, deleteTicket, loadTicket } from './tickets.ts'
 import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
 import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
+import { applicabilityOf, listRecords, readRevision } from './verification.ts'
 import { detectLanguage, enclosingSymbol, parseFile, syntaxValid } from './ast.ts'
 import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
@@ -557,7 +558,7 @@ export function createEditTool(pool: FinderPool) {
         // not read as "this edit is forbidden".
         return failure(`snapshot ${snapshotId} rejected before writing (${before.reason}): ${before.detail}`)
       }
-      return shapeCommitted(committed, { workdir, abs, steps, ...(snapshotId !== '' ? { beforeSnapshot: snapshotId } : {}) })
+      return await shapeCommitted(committed, { workdir, abs, steps, ...(snapshotId !== '' ? { beforeSnapshot: snapshotId } : {}) })
     },
   } as const
 }
@@ -706,14 +707,14 @@ function shapeApplyResult(result: ApplyResult): Record<string, unknown> {
  * carry no audit at all: pretending to recheck untouched bytes is exactly the
  * "unrun looks like passed" failure the audit status vocabulary exists to stop.
  */
-function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket'; beforeSnapshot?: string }): Record<string, unknown> {
+async function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket'; beforeSnapshot?: string }): Promise<Record<string, unknown>> {
   const shaped = shapeApplyResult(result)
   // Reported even when nothing changed: the caller asked "was this file still
   // the one the baseline described", and that answer is independent of whether
   // the batch turned out to be a no-op.
   const evidence = context.beforeSnapshot ? { snapshotId: context.beforeSnapshot, verified: true } : undefined
   if (!result.ok || result.noChange) return evidence ? { ...shaped, beforeEvidence: evidence } : shaped
-  const audit = auditCommit({
+  const audit = await auditCommit({
     workspace: context.workdir,
     batchId: result.batchId,
     kind: context.kind ?? 'edit',
@@ -745,6 +746,7 @@ export function createHistoryTool() {
       kind: { type: 'string', enum: ['edit', 'rollback', 'external', 'project'], description: 'Batch-kind filter.' },
       content: { type: 'string', description: 'Case-insensitive literal in UTF-8 before/after snapshots; 32MB scan budget.' },
       limit: { type: 'integer', description: 'Max batches (default 20, max 100).' },
+      checks: { type: 'boolean', description: 'Attach the archived verification records and their CURRENT applicability. A record that no longer matches its inputs is shown as stale; the recorded verdict itself never changes.' },
     },
     output: {
       schema: {
@@ -780,18 +782,41 @@ export function createHistoryTool() {
                     },
                   },
                 },
+                checks: {
+                  type: 'array',
+                  items: {
+                    type: 'object', additionalProperties: false, properties: {
+                      id: { type: 'string', required: true },
+                      recorded: { type: 'string', required: true },
+                      applicable: { type: 'boolean', required: true },
+                      effective: { type: 'string', required: true },
+                      provenance: { type: 'string', required: true },
+                      finishedAt: { type: 'string', required: true },
+                      drifted: { type: 'array', items: { type: 'string' } },
+                      detail: { type: 'string' },
+                    },
+                  },
+                },
               },
             },
           },
+          checksNote: { type: 'string' },
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: Array<{ node: string; diff: string; truncated: boolean }> }>; note?: string }) => {
+      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: Array<{ node: string; diff: string; truncated: boolean }>; checks?: Array<{ id: string; recorded: string; applicable: boolean; effective: string; provenance: string; finishedAt: string; drifted?: string[]; detail?: string }> }>; note?: string; checksNote?: string }) => {
         if (value.items.length === 0) return text('no ledger entries matched')
         const lines = value.items.map((b) => {
           const head = `#${b.batch} ${b.ts} ${b.kind} by ${b.actor.slice(0, 12)}… — ${b.reason}\n    ${b.files.join(', ')}`
-          if (!b.diffs?.length) return head
-          return [head, ...b.diffs.map((d) => `${d.node}${d.truncated ? ' [truncated]' : ''}\n${d.diff}`)].join('\n')
+          // A recorded verdict and its present applicability are printed as two
+          // separate facts. Collapsing them into one word would let an old pass
+          // read as current.
+          const checks = (b.checks ?? []).map((c) => {
+            const drift = c.drifted?.length ? ` — drifted: ${c.drifted.join(', ')}` : ''
+            return `    [check ${c.id}] recorded ${c.recorded} (${c.provenance}, ${c.finishedAt}); now: ${c.effective}${c.applicable ? '' : ' (not applicable)'}${drift}${c.detail ? ` — ${c.detail}` : ''}`
+          })
+          const body = b.diffs?.length ? b.diffs.map((d) => `${d.node}${d.truncated ? ' [truncated]' : ''}\n${d.diff}`) : []
+          return [head, ...checks, ...body].join('\n')
         })
         if (value.note) lines.push(`[${value.note}]`)
         return text(lines.join('\n'))
@@ -800,6 +825,26 @@ export function createHistoryTool() {
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const store = storeFor(canonicalWorkspace(workdirOf(exec)))
+      const wantChecks = args.checks === true
+      const checksFor = (batchId: number) => {
+        if (!wantChecks) return undefined
+        return listRecords(store, { batchIds: [batchId], limit: 50 }).records.map(record => {
+          const now = applicabilityOf(record, store.root)
+          return {
+            id: record.id.slice(0, 8), recorded: now.verdict.status, applicable: now.applicable,
+            effective: now.effective, provenance: record.provenance,
+            finishedAt: record.finishedAt.replace('T', ' ').slice(0, 19),
+            ...(now.drifted.length === 0 ? {} : { drifted: now.drifted }),
+            ...(now.reason === 'evidence_schema' ? { detail: 'older evidence format; run a fresh check' } : now.verdict.reason === undefined ? {} : { detail: now.verdict.reason }),
+          }
+        })
+      }
+      const revision = wantChecks ? readRevision(store) : undefined
+      const checksNote = wantChecks
+        ? revision!.records === 0
+          ? 'no verification records archived for this workspace yet'
+          : `verification revision ${revision!.revision} over ${revision!.records} record(s); "recorded" is history, "now" is recomputed against the current files`
+        : undefined
       // Diff mode, absorbed from the former ff_diff: one batch (or one node of
       // it) resolved from the same ledger this tool already searches, with the
       // immutable snapshots attached to the batch entry. Listing filters do
@@ -836,7 +881,9 @@ export function createHistoryTool() {
                 after: node.after,
                 ...snapshotDiff(snapshot(store, node.before), snapshot(store, node.after), node.file),
               })),
+              ...(wantChecks ? { checks: checksFor(b.id) ?? [] } : {}),
             }],
+            ...(checksNote === undefined ? {} : { checksNote }),
           }
         } catch (cause) { return failure(causeMessage(cause)) }
       }
@@ -865,7 +912,9 @@ export function createHistoryTool() {
           actor: b.actor,
           reason: b.reason,
           files: b.nodes.map((n) => `${n.file} (${n.op}, ${n.bytes}B)`),
+          ...(wantChecks ? { checks: checksFor(b.id) ?? [] } : {}),
         })),
+        ...(checksNote === undefined ? {} : { checksNote }),
       }
     },
   } as const

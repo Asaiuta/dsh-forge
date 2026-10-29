@@ -152,6 +152,9 @@ export function selectBridgeFacts(entry: TraceFileFacts, globals: readonly strin
   const facts = entry.kind === 'js' ? entry : entry.facts
   if (!facts) return entry
   const effective = new Set([...globals, ...facts.bridgeAliases.map(alias => alias.name)])
-  const bridge = facts.bridge.filter(ref => effective.has(ref.object))
+  const bridge = facts.bridge.filter(ref => {
+    if (ref.receiver?.local) return false
+    return effective.has(ref.object) || (ref.receiver !== undefined && effective.has(ref.receiver.object))
+  })
   return entry.kind === 'js' ? { ...entry, bridge } : { ...entry, facts: { ...facts, bridge } }
 }

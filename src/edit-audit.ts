@@ -33,8 +33,11 @@
 
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { scriptFacts } from './facts.ts'
 import { peekTraceGraph } from './tools-trace.ts'
+import { extractTraceFileFromBytes, selectBridgeFacts } from './trace-facts.ts'
+import { scriptFacts } from './facts.ts'
+import { bridgeModel, diffBridges, type CheckResult } from './bridge-check.ts'
+import type { TraceFileFacts } from './facts.ts'
 import { TRACE_SCAN_EXTENSIONS } from './trace-capabilities.ts'
 import path from 'node:path'
 import type { TraceGraph } from './linkgraph.ts'
@@ -46,7 +49,7 @@ export type AuditStatus = 'partial' | 'not_run' | 'stale'
 
 /** Why the audit ended where it did. Values follow docs/forge-plan-m0-m1.md
  *  M0.2; `detail` carries the specific sub-case a reader needs. */
-export type AuditReason = 'legacy_heuristic' | 'no_baseline' | 'not_applicable' | 'audit_error' | 'stale'
+export type AuditReason = 'ast_diff' | 'legacy_heuristic' | 'no_baseline' | 'not_applicable' | 'audit_error' | 'stale'
 
 export interface AuditCoverage {
   /** Files whose post-write content this audit was asked about. */
@@ -101,61 +104,9 @@ export interface EditAudit {
   verdict: string
 }
 
-/** Identifiers that appear in `after` but not in `before`… reversed here: the
- *  ones the batch stopped mentioning are what can strand a call site. */
-function removedIdentifiers(before: string, after: string): Set<string> {
-  const names = (text: string): Set<string> => new Set(text.match(/[A-Za-z_$][\w$]*/g) ?? [])
-  const kept = names(after)
-  const gone = new Set<string>()
-  for (const name of names(before)) if (!kept.has(name)) gone.add(name)
-  return gone
-}
 
-/** Whole-word mention, so `pinToggle` never counts as `togglePin`. */
-function mentions(text: string, name: string): boolean {
-  return new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(text)
-}
 
-/**
- * The members the shipped text still provides, or `undefined` when that cannot
- * be decided from text alone.
- *
- * The snapshot's key list is pre-edit, so it cannot answer this. Re-parsing the
- * file would (the AST extractor is right there), but that costs a WASM parse on
- * every edit that might have audit value — and this function is on the write
- * path. Instead: a member counts as present when the shipped text still names
- * it as a key of some object literal. That is exactly the question being asked
- * ("will a consumer's `.member` resolve"), and it degrades to `undefined` only
- * when the file stopped looking like an object literal at all, where the batch's
- * own removal evidence is the better signal anyway.
- *
- * @returns the surviving member names, or `undefined` for "cannot tell".
- */
-function liveMembers(shipped: string, candidates: readonly string[]): Set<string> | undefined {
-  // A bridge rebuilt via a computed name or a spread is beyond textual reading;
-  // say so instead of guessing.
-  if (/\{\s*\.\.\./.test(shipped)) return undefined
-  const live = new Set<string>()
-  for (const name of candidates) {
-    // Key position: `name:` at the start of an object-literal line, or the
-    // shorthand form where the key and the function share one name.
-    const key = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    if (new RegExp(`(^|[\\s,{])${key}\\s*[:,}]`, 'm').test(shipped)) live.add(name)
-  }
-  return live
-}
 
-/** Where the members of `object` are referenced from, per member name. */
-function memberSites(graph: TraceGraph, object: string): Map<string, string[]> {
-  const byMember = new Map<string, string[]>()
-  for (const ref of graph.bridgeByObject.get(object) ?? []) {
-    const site = `${ref.path}:${ref.line}`
-    const bucket = byMember.get(ref.name)
-    if (bucket) bucket.push(site)
-    else byMember.set(ref.name, [site])
-  }
-  return byMember
-}
 
 function summarize(sites: readonly string[]): { sites: number; files: number; sample: string[] } {
   const unique = [...new Set(sites)].sort()
@@ -194,6 +145,37 @@ export function notApplicableAudit(requested: readonly string[], detail: string)
 const AUDIT_RANK: Record<AuditStatus, number> = { partial: 0, stale: 1, not_run: 2 }
 
 /**
+ * Diff the cached before-facts against a freshly extracted edited file.
+ *
+ * Only the edited file is re-extracted. That is sound because this batch wrote
+ * exactly that file: every other file's facts in the cached graph still describe
+ * the bytes that are on disk. Building a full graph here would be the one thing
+ * the write path may not do.
+ *
+ * The before side also keeps its provider globals visible to the after side, so
+ * a renamed or removed global does not silently take its consumers with it.
+ */
+function diffBridgeModels(workdir: string, files: ReadonlyMap<string, TraceFileFacts>, rel: string, after: TraceFileFacts): { result: CheckResult } {
+  // Facts arriving from the assembled graph are already filtered to the bridge
+  // globals (`selectBridgeFacts`), but a fresh extract is not: it names every
+  // member access in the file, `ipcRenderer.invoke` included. Feeding that in
+  // unfiltered made the model look like it had consumers of a global nobody
+  // provides, which the diff then reported as `unknown_binding` — a limitation
+  // invented by the audit's own plumbing. Same filter, same set, both sides.
+  const globals = new Set<string>()
+  for (const facts of [...files.values(), after]) {
+    const own = scriptFacts(facts)
+    for (const expose of own?.exposes ?? []) globals.add(expose.name)
+    for (const alias of own?.bridgeAliases ?? []) globals.add(alias.name)
+  }
+  const before = bridgeModel({ workspace: workdir, files })
+  const updated = new Map(files)
+  updated.set(rel, selectBridgeFacts(after, [...globals]))
+  const next = bridgeModel({ workspace: workdir, files: updated })
+  return { result: diffBridges({ workspace: workdir, before, after: next, changed: [rel] }) }
+}
+
+/**
  * The single post-commit audit entry every construction tool calls.
  *
  * The plan requires one exit rather than one per tool: an identical byte change
@@ -202,7 +184,7 @@ const AUDIT_RANK: Record<AuditStatus, number> = { partial: 0, stale: 1, not_run:
  * locks — a slow graph read must never hold construction back — which is safe
  * because the post-write hash is carried in and re-checked here.
  */
-export function auditCommit(input: {
+export async function auditCommit(input: {
   /** Workspace root the batch ran in. */
   workspace: string
   /** Ledger batch id, for callers that want to correlate advice with history. */
@@ -218,7 +200,7 @@ export function auditCommit(input: {
   syntaxWarning?: boolean
   /** ff_file action, for the not-applicable message. */
   operation?: string
-}): EditAudit {
+}): Promise<EditAudit> {
   if (input.changed.length === 0) {
     return notApplicableAudit([], 'the batch changed no file, so there is nothing to recheck')
   }
@@ -230,7 +212,7 @@ export function auditCommit(input: {
       `${input.operation ?? 'file'} changes files without a bridge-surface rule; no consumer recheck was run for this operation`)
   }
   const steps = input.steps ?? []
-  const audits = input.changed.map(item => auditEdit(input.workspace, item.rel, steps, item.abs, { hash: input.hash, syntaxWarning: input.syntaxWarning }))
+  const audits = await Promise.all(input.changed.map(item => auditEdit(input.workspace, item.rel, steps, item.abs, { hash: input.hash, syntaxWarning: input.syntaxWarning })))
   const audit = audits.reduce((worst, next) => (AUDIT_RANK[next.status] < AUDIT_RANK[worst.status] ? next : worst))
   if (audits.length === 1) return audit
   // Multi-file edits merge: state, rows and coverage union, prose concatenated.
@@ -262,7 +244,7 @@ export function auditCommit(input: {
  * @returns a result for every branch; `status`/`reason` say whether anything
  *   was actually checked. Callers must not treat `not_run` as a clean bill.
  */
-export function auditEdit(workdir: string, rel: string, steps: readonly EditStep[], abs: string, expect?: { hash?: string; syntaxWarning?: boolean }): EditAudit {
+export async function auditEdit(workdir: string, rel: string, steps: readonly EditStep[], abs: string, expect?: { hash?: string; syntaxWarning?: boolean }): Promise<EditAudit> {
   // Flipped once analysis begins, so an exception can still say whether any
   // work was done (`partial`) or none was (`not_run`).
   let started = false
@@ -291,7 +273,10 @@ export function auditEdit(workdir: string, rel: string, steps: readonly EditStep
         ...(assembled.walkErrors > 0 ? [{ reason: 'walk_errors', count: assembled.walkErrors }] : []),
         ...(assembled.partialFiles > 0 ? [{ reason: 'partial_parse', count: assembled.partialFiles }] : []),
         ...(expect?.syntaxWarning ? [{ reason: 'shipped_text_syntax_warning' }] : []),
-        { reason: 'name_match_heuristic' },
+        // The diff resolves only *statically visible* sites. A dynamic member
+        // access or a runtime-built API object stays outside it, so a clean
+        // result is evidence, not proof of absence.
+        { reason: 'static_references_only' },
       ],
     })
     const ext = path.extname(rel).toLowerCase()
@@ -342,87 +327,110 @@ export function auditEdit(workdir: string, rel: string, steps: readonly EditStep
       }
     }
 
-    // What the batch stopped naming. A delete step's `find` is all removal.
-    const gone = new Set<string>()
-    for (const step of steps) {
-      const before = step.find ?? ''
-      const after = step.replaceWith ?? ''
-      for (const name of removedIdentifiers(before, after)) gone.add(name)
-    }
-    if (gone.size === 0) {
+    // The AST diff (M1.2). The cached graph still describes every *other* file
+    // correctly — this batch changed the callee, not its callers — so only the
+    // edited file needs re-extracting. That is one parse, not a graph build, and
+    // it replaces a text match that could neither prove a finding nor avoid a
+    // false one: a name left in a comment used to hide a real miss, and a
+    // same-named local object used to invent one.
+    const after = await extractTraceFileFromBytes(abs, readFileSync(abs))
+    if (!after.value) {
       return outcome('not_run', 'not_applicable', {
-        detail: 'the batch removed no identifier, so no call site can have been stranded',
+        detail: `the edited file could not be re-extracted (${after.diagnostics?.[0]?.reason ?? 'no facts'}); the audit has nothing to compare`,
         baseline,
         coverage: coverage(1),
       })
     }
-
-    const exposes = scriptFacts(entry)?.exposes ?? []
-    if (exposes.length === 0) {
-      return outcome('not_run', 'not_applicable', {
-        detail: 'the cached file facts expose no bridge surface; the bridge audit does not apply',
-        baseline,
-        coverage: coverage(1),
-      })
-    }
-
-    const rows: AuditRow[] = []
-    const globals: EditAudit['globals'] = []
-    /** Every stranded site, for the verdict's distinct-file count. */
-    const allSites: string[] = []
-    for (const expose of exposes) {
-      const sites = memberSites(graph, expose.name)
-      // The global itself left the surface: every member breaks at once. This is
-      // the half-rename where the preload moved and the consumers did not.
-      if (!mentions(shipped, expose.name)) {
-        const all = [...sites.values()].flat()
-        if (all.length) {
-          globals.push({ object: expose.name, ...summarize(all) })
-          allSites.push(...all)
-        }
+    const diff = diffBridgeModels(workdir, graph.files, rel, after.value)
+    const flagged = diff.result.findings.filter(finding => finding.attribution !== 'existing')
+    // Only this batch's own damage is reported. A consumer that was already
+    // broken before the write is not a finding about this write.
+    // Object → member → sites. Two levels keep the key unambiguous: a member
+    // name may contain any character, so packing both into one string would
+    // need an escaping rule that is itself a bug waiting to happen.
+    const rowSites = new Map<string, Map<string, string[]>>()
+    const globalSites = new Map<string, string[]>()
+    for (const finding of flagged) {
+      const site = `${finding.consumer.file}:${finding.consumer.line}`
+      if (finding.kind === 'expose_global_missing') {
+        const bucket = globalSites.get(finding.expected.object)
+        if (bucket) bucket.push(site)
+        else globalSites.set(finding.expected.object, [site])
         continue
       }
-      // The global survived. The question is which of the members its consumers
-      // already call no longer exist — asked of the shipped text, never of the
-      // snapshot, which predates this write. Iterating the sites (not the
-      // batch's removed names) is what makes rename-back and rename-forward
-      // symmetrical: both are "a member the callers use is gone".
-      for (const [member, at] of sites) {
-        if (!mentions(shipped, member)) {
-          rows.push({ object: expose.name, member, ...summarize(at) })
-          allSites.push(...at)
-        }
-      }
+      let byMember = rowSites.get(finding.expected.object)
+      if (!byMember) { byMember = new Map(); rowSites.set(finding.expected.object, byMember) }
+      const bucket = byMember.get(finding.expected.member)
+      if (bucket) bucket.push(site)
+      else byMember.set(finding.expected.member, [site])
     }
-
-    // A completed heuristic run is `partial`, findings or not: it cannot prove
-    // that a dynamic call is absent, only that no visible name survives.
+    const settledRows: AuditRow[] = [...rowSites].flatMap(([object, byMember]) =>
+      [...byMember].map(([member, sites]) => ({ object, member, ...summarize(sites) })))
+    const settledGlobals: EditAudit['globals'] = [...globalSites].map(([object, sites]) => ({ object, ...summarize(sites) }))
     const common = { baseline, coverage: coverage(1) }
-    if (rows.length === 0 && globals.length === 0) {
-      const checked = exposes.flatMap((expose) => [...memberSites(graph, expose.name).keys()]).length
-      return outcome('partial', 'legacy_heuristic', {
+    // Nothing to recheck only when the changed file carries no bridge surface on
+    // either side: a value change in a file that exposes nothing cannot strand a
+    // call, and saying "checked, clean" about it would be a check that did not
+    // happen. A file that *does* carry surface and simply broke nothing is
+    // reported as a completed diff instead.
+    const beforeFacts = scriptFacts(entry)
+    const afterFacts = scriptFacts(after.value)
+    const surface = (facts: typeof beforeFacts): boolean =>
+      facts !== null && (facts.exposes.length > 0 || facts.bridge.length > 0 || facts.ipc.length > 0)
+    if (!surface(beforeFacts) && !surface(afterFacts)) {
+      return outcome('not_run', 'not_applicable', {
+        detail: 'the changed file carries no bridge surface (no expose, member use or IPC endpoint) on either side of the write',
         ...common,
-        verdict: `checked ${checked} consumed member name(s) against the shipped text — no statically visible consumer still references a removed name; dynamic calls and aliases remain unknown`
-          + (expect?.syntaxWarning ? '; the batch also left a syntax warning, so this text check is weaker than usual' : ''),
       })
     }
-
-    // Count the real sites, not the printed samples: "9 call sites" that only
-    // ever saw three of them would be the kind of number a reader catches.
-    const uniqueSites = [...new Set(allSites)]
-    const fileCount = new Set(uniqueSites.map((site) => site.slice(0, site.lastIndexOf(':')))).size
+    if (settledRows.length === 0 && settledGlobals.length === 0) {
+      // "Nothing found" is only allowed to sound clean when the diff could
+      // actually decide. An unbound provider (two files exposing one global, a
+      // dynamic name, a consumer the model could not resolve) means the search
+      // space had a hole — and a hole is exactly where the miss would be.
+      //
+      // `no_spans` is different in kind: without spans two calls on one line
+      // merge into one site, which blurs *how many* places broke but cannot hide
+      // *whether* a member is provided. So it is reported in coverage and left
+      // out of this list — downgrading to "undecidable" over a merged count
+      // would trade a small inaccuracy for a large one.
+      const BLOCKING = new Set(['ambiguous_provider', 'unknown_binding', 'dynamic_member'])
+      const blocked = diff.result.limitations.filter(item => BLOCKING.has(item.code))
+      const base = `checked ${diff.result.coverage.providers} exposed surface(s) against ${diff.result.coverage.consumers} statically visible consumer site(s)`
+      if (blocked.length > 0) {
+        const codes = [...new Set(blocked.map(item => item.code))].join(', ')
+        return outcome('partial', 'ast_diff', {
+          ...common,
+          coverage: {
+            ...coverage(1),
+            resultComplete: false,
+            limitations: [...coverage(1).limitations, ...blocked.map(item => ({ reason: item.code, ...(item.file ? { file: item.file } : {}) }))],
+          },
+          verdict: `${base}, but ${blocked.length} limitation(s) (${codes}) left part of the surface undecidable — `
+            + 'no finding was produced, which is not the same as a clean result',
+        })
+      }
+      return outcome('partial', 'ast_diff', {
+        ...common,
+        verdict: `${base} — no statically visible consumer still references a member this batch removed`
+          + (expect?.syntaxWarning ? '; the batch also left a syntax warning' : ''),
+      })
+    }
+    const uniqueSites = [...new Set([...settledRows, ...settledGlobals].flatMap(row => row.sample))]
     const names = [
-      ...globals.map((row) => `\`${row.object}\``),
-      ...rows.map((row) => `\`${row.object}.${row.member}\``),
+      ...settledGlobals.map(row => `\`${row.object}\``),
+      ...settledRows.map(row => `\`${row.object}.${row.member}\``),
     ]
-    // Deliberately not "these calls fail": a name in a comment or an unrelated
-    // object looks identical to this heuristic. The consumer list is the claim.
+    const totalSites = [...settledRows, ...settledGlobals].reduce((sum, row) => sum + row.sites, 0)
+    const fileCount = new Set([...settledRows, ...settledGlobals].flatMap(row => row.sample.map(site => site.slice(0, site.lastIndexOf(':'))))).size
+    // Still not "these calls fail": the diff resolves static references only.
+    // What it can now say is which sites exist in the AST, not in a text search.
     const verdict = `statically visible consumers still reference ${names.join(', ')}: `
-      + `${uniqueSites.length} site(s) across ${fileCount} file(s) — recheck them and update the callers, `
-      + 'or restore the name; this is a text match, not a resolved reference'
+      + `${totalSites} site(s) across ${fileCount} file(s) — recheck them and update the callers, `
+      + 'or restore the name; resolved from the AST, not from a text match'
+      + (uniqueSites.length < totalSites ? ` (samples: ${uniqueSites.slice(0, 3).join(', ')})` : '')
 
-    return outcome('partial', 'legacy_heuristic', { ...common, rows, globals, verdict })
-  } catch (cause) {
+    return outcome('partial', 'ast_diff', { ...common, rows: settledRows, globals: settledGlobals, verdict })  } catch (cause) {
     // Advice must never cost a write, and must never hide its own failure.
     return outcome(started ? 'partial' : 'not_run', 'audit_error', {
       detail: `audit raised: ${cause instanceof Error ? cause.message : String(cause)}`,

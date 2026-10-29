@@ -16,12 +16,9 @@
  * model-polish layer (stage 2) is planned to sit on top of these skeletons
  * and to fall back to them; nothing in this module may depend on it.
  *
- * Freshness contract: an anchor `{ batches, lastId, files }` — ledger record
- * count, last batch id, and a digest of the structure card's covered files'
- * (size, mtimeMs). Any append moves lastId; an external edit to a covered
- * file moves the digest without touching the ledger. The anchor never reads
- * blob content, so checking it is O(1) against the ledger's cached view plus
- * one statSync per covered file.
+ * Freshness includes source contents, the verification revision and freshly
+ * recomputed applicability. These are checked before either cache-return path;
+ * size/mtime never decides whether an archived pass still applies.
  *
  * No in-process cache: everything is derived from disk and the ledger view is
  * cached one level down (ledger.ts). A missing reset hook is therefore honest
@@ -35,8 +32,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } fr
 import path from 'node:path'
 import { dataDir, withFileLock, type ToolFailure } from './core.ts'
 import { atomicWrite, readLedgerTail, storeFor, type LedgerBatch, type StorePaths } from './ledger.ts'
-import { detectLanguage, outlineView, parseFile } from './ast.ts'
+import { detectLanguage, outlineView, parseFile, MAX_AST_FILE_BYTES } from './ast.ts'
+import { readBoundedFile } from './fs-paths.ts'
 import type { PolishFacts } from './distill.ts'
+import { applicabilityOf, listRecords, readRevision } from './verification.ts'
 
 // ---------------------------------------------------------------------------
 // Card set
@@ -68,6 +67,16 @@ export interface CardAnchor {
   batches: number
   lastId: number
   files: string
+  /**
+   * Committed verification revision.
+   *
+   * Part of the anchor because a check can be archived without any code batch:
+   * new evidence moves this and nothing else, and the cards must refresh to show
+   * it.
+   */
+  verification: number
+  /** Digest of current applicability, rechecked before serving cached cards. */
+  applicability: string
 }
 
 export interface CardInfo {
@@ -229,7 +238,7 @@ function frontmatter(card: CardName, anchor: CardAnchor, span: string): string {
     '---',
     `card: ${card}`,
     `title: ${CARD_TITLES[card]}`,
-    `anchor: batches=${anchor.batches} lastId=${anchor.lastId} files=${anchor.files}`,
+    anchorLine(anchor),
     `span: ${span}`,
     '---',
     '',
@@ -240,7 +249,7 @@ function frontmatter(card: CardName, anchor: CardAnchor, span: string): string {
 // Card builders
 // ---------------------------------------------------------------------------
 
-function overviewCard(batches: readonly LedgerBatch[], agg: LedgerAggregate, anchor: CardAnchor): string {
+function overviewCard(batches: readonly LedgerBatch[], agg: LedgerAggregate, anchor: CardAnchor, evidence: EvidenceSummary): string {
   const span = `${day(agg.firstTs)}..${day(agg.lastTs)}`
   return [
     frontmatter('overview', anchor, span),
@@ -258,7 +267,92 @@ function overviewCard(batches: readonly LedgerBatch[], agg: LedgerAggregate, anc
     '',
     ...batches.slice(-5).reverse().map((batch) => `- #${batch.id} ${day(batch.ts)} ${batch.kind} — ${clip(batch.reason)}`),
     '',
+    ...verificationSection(evidence),
   ].join('\n')
+}
+
+
+/** One archived verdict as a card row, with its applicability recomputed now. */
+interface EvidenceRow {
+  id: string
+  batch: number
+  recorded: string
+  effective: string
+  provenance: string
+  finishedAt: string
+  drifted: string[]
+  reason?: string
+}
+
+interface EvidenceSummary {
+  /** Committed record count — the anchor's verification input. */
+  records: number
+  revision: number
+  digest: string
+  rows: EvidenceRow[]
+  /** Records whose files could not be read or parsed. */
+  unreadable: number
+}
+
+/**
+ * Read the archived evidence and re-derive its applicability.
+ *
+ * Recomputed before the anchor comparison: cached cards cannot certify current
+ * applicability using the record count or file timestamps.
+ */
+function verificationSummary(store: StorePaths): EvidenceSummary {
+  const listed = listRecords(store)
+  const revision = readRevision(store)
+  const current = listed.records.map(record => applicabilityOf(record, store.root))
+  const rows: EvidenceRow[] = current.map((now) => {
+    const record = now.record
+    return {
+      id: record.id.slice(0, 8),
+      batch: record.batchIds[0] ?? 0,
+      recorded: now.verdict.status,
+      effective: now.effective,
+      provenance: record.provenance,
+      finishedAt: record.finishedAt.replace('T', ' ').slice(0, 16),
+      drifted: now.drifted,
+      ...(now.reason === 'evidence_schema' ? { reason: 'older evidence format; run a fresh check' } : now.verdict.reason === undefined ? {} : { reason: now.verdict.reason }),
+    }
+  })
+  const digest = createHash('sha256').update(JSON.stringify([
+    current.map(now => [now.record.id, now.applicable, now.effective, now.drifted, now.reason]), listed.unreadable,
+  ])).digest('hex').slice(0, 16)
+  return { records: listed.records.length, revision: revision.revision, digest, rows, unreadable: listed.unreadable }
+}
+
+/**
+ * The verification section of the overview card.
+ *
+ * Two columns, never one: `recorded` is history and cannot change, `now` is the
+ * applicability against the tree as it stands. A reader who saw only one word
+ * would be unable to tell a live pass from a stale one, which is the whole
+ * failure mode M1.5 names.
+ */
+function verificationSection(evidence: EvidenceSummary): string[] {
+  const lines: string[] = ['## Verification', '']
+  if (evidence.records === 0) {
+    lines.push('- no archived verification records (revision 0); no check has been recorded for this workspace')
+    lines.push('')
+    return lines
+  }
+  lines.push(`- revision ${evidence.revision}, ${evidence.records} record(s)${evidence.unreadable > 0 ? `, ${evidence.unreadable} unreadable` : ''}`)
+  lines.push('')
+  lines.push('| record | batch | recorded | now | provenance | when | note |')
+  lines.push('|---|---|---|---|---|---|---|')
+  for (const row of evidence.rows.slice(0, 20)) {
+    const note = row.drifted.length > 0
+      ? `inputs changed: ${row.drifted.slice(0, 3).join(', ')}${row.drifted.length > 3 ? `, +${row.drifted.length - 3}` : ''}`
+      : (row.reason ?? '')
+    lines.push(`| ${row.id} | #${row.batch} | ${row.recorded} | ${row.effective} | ${row.provenance} | ${row.finishedAt} | ${clip(note)} |`)
+  }
+  if (evidence.rows.length > 20) lines.push('', `(${evidence.rows.length - 20} more record(s) — use ffhistory checks=true.)`)
+  lines.push('')
+  lines.push('`recorded` is the historical verdict and never changes; `now` is recomputed from the current file contents.')
+  lines.push('')
+  return lines
 }
 
 function opsLabel(row: FileActivity): string {
@@ -362,15 +456,14 @@ function structureCandidates(root: string, batches: readonly LedgerBatch[]): { f
   return { files, missing, unsupported }
 }
 
-/** The anchor's file digest: size+mtime of every covered file. An external
- *  edit to a covered file moves the anchor without a ledger append. */
+/** Bounded content digest of the structure card's covered files. */
 function digestFiles(files: readonly StructureFile[]): string {
   if (files.length === 0) return 'none'
   const hash = createHash('sha256')
   for (const file of [...files].sort((a, b) => cmp(a.rel, b.rel))) {
     try {
-      const stat = statSync(file.abs)
-      hash.update(`${file.rel}:${stat.size}:${stat.mtimeMs}\n`)
+      const content = createHash('sha256').update(readBoundedFile(file.abs, MAX_AST_FILE_BYTES)).digest('hex')
+      hash.update(`${file.rel}:${content}\n`)
     } catch {
       hash.update(`${file.rel}:gone\n`)
     }
@@ -428,29 +521,30 @@ export interface BuiltCards {
   cards: BuiltCard[]
 }
 
-/** The anchor is O(ledger view) + one statSync per covered file — never a
- *  parse. buildCards recomputes it over the same inputs, so the checked
- *  anchor and the rebuilt anchor cannot disagree. */
-function anchorFor(batches: readonly LedgerBatch[], picked: { files: StructureFile[] }): CardAnchor {
+/** Content reads and applicability checks are required; no AST parse. */
+function anchorFor(batches: readonly LedgerBatch[], picked: { files: StructureFile[] }, evidence: EvidenceSummary): CardAnchor {
   return {
     batches: batches.length,
     lastId: batches[batches.length - 1]?.id ?? 0,
     files: digestFiles(picked.files),
+    verification: evidence.revision,
+    applicability: evidence.digest,
   }
 }
 
 /** Pure ledger-to-cards compilation. Same ledger (and same covered-file
- *  stat signatures) → byte-identical cards; the determinism floor pins this. */
+ *  contents and verification evidence) → byte-identical cards. */
 export async function buildCards(store: StorePaths): Promise<BuiltCards | ToolFailure> {
   const batches = readLedgerTail(store, Number.MAX_SAFE_INTEGER)
   if (batches.length === 0) return failure('no construction ledger batches for this workspace')
   const agg = aggregateBatches(batches)
   const picked = structureCandidates(store.root, batches)
-  const anchor = anchorFor(batches, picked)
+  const evidence = verificationSummary(store)
+  const anchor = anchorFor(batches, picked, evidence)
   return {
     anchor,
     cards: [
-      { name: 'overview', title: CARD_TITLES.overview, batches: anchor.batches, md: overviewCard(batches, agg, anchor) },
+      { name: 'overview', title: CARD_TITLES.overview, batches: anchor.batches, md: overviewCard(batches, agg, anchor, evidence) },
       { name: 'hotspot', title: CARD_TITLES.hotspot, batches: anchor.batches, md: hotspotCard(agg, anchor) },
       { name: 'timeline', title: CARD_TITLES.timeline, batches: anchor.batches, md: timelineCard(batches, agg, anchor) },
       { name: 'structure', title: CARD_TITLES.structure, batches: anchor.batches, md: await structureCard(store.root, picked, anchor) },
@@ -465,7 +559,8 @@ function readCardsState(dir: string): CardsStateFile | null {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as CardsStateFile
     if (parsed?.version === 1 && parsed.anchor !== null && typeof parsed.anchor === 'object'
       && Number.isSafeInteger(parsed.anchor.batches) && Number.isSafeInteger(parsed.anchor.lastId)
-      && typeof parsed.anchor.files === 'string' && Array.isArray(parsed.cards)
+      && typeof parsed.anchor.files === 'string' && Number.isSafeInteger(parsed.anchor.verification)
+      && typeof parsed.anchor.applicability === 'string' && Array.isArray(parsed.cards)
       && parsed.cards.every((card) => typeof card?.name === 'string' && typeof card?.title === 'string'
         && Number.isSafeInteger(card?.batches) && Number.isSafeInteger(card?.bytes))) {
       return parsed
@@ -478,6 +573,11 @@ function readCardsState(dir: string): CardsStateFile | null {
 
 function anchorsEqual(a: CardAnchor, b: CardAnchor): boolean {
   return a.batches === b.batches && a.lastId === b.lastId && a.files === b.files
+    && a.verification === b.verification && a.applicability === b.applicability
+}
+
+function anchorLine(anchor: CardAnchor): string {
+  return `anchor: batches=${anchor.batches} lastId=${anchor.lastId} files=${anchor.files} verification=${anchor.verification} applicability=${anchor.applicability}`
 }
 
 function filesComplete(dir: string, state: CardsStateFile): boolean {
@@ -503,7 +603,7 @@ export function storePolished(dir: string, name: CardName, anchor: CardAnchor, c
     '---',
     `card: ${name}`,
     `title: ${CARD_TITLES[name]} (polished)`,
-    `anchor: batches=${anchor.batches} lastId=${anchor.lastId} files=${anchor.files}`,
+    anchorLine(anchor),
     `distilled-by: ${distilledBy}`,
     '---',
     '',
@@ -533,9 +633,9 @@ export function readPolished(dir: string, name: string, anchor: CardAnchor): str
   } catch {
     return null
   }
-  const match = /^anchor: batches=(\d+) lastId=(\d+) files=(\S+)$/m.exec(text.slice(0, 512))
+  const match = /^anchor: batches=(\d+) lastId=(\d+) files=(\S+) verification=(\d+) applicability=(\S+)$/m.exec(text.slice(0, 512))
   if (match === null) return null
-  if (!anchorsEqual({ batches: Number(match[1]), lastId: Number(match[2]), files: match[3] }, anchor)) return null
+  if (!anchorsEqual({ batches: Number(match[1]), lastId: Number(match[2]), files: match[3], verification: Number(match[4]), applicability: match[5] }, anchor)) return null
   return stripFrontmatter(text)
 }
 
@@ -756,5 +856,5 @@ function polishedNames(dir: string, anchor: CardAnchor, cards: readonly CardInfo
 function currentAnchor(store: StorePaths): CardAnchor | undefined {
   const batches = readLedgerTail(store, Number.MAX_SAFE_INTEGER)
   if (batches.length === 0) return undefined
-  return anchorFor(batches, structureCandidates(store.root, batches))
+  return anchorFor(batches, structureCandidates(store.root, batches), verificationSummary(store))
 }

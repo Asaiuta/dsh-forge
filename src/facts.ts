@@ -26,7 +26,8 @@ interface TsNode {
   readonly id: number
   readonly type: string
   readonly text: string
-  readonly startPosition: { row: number }
+  readonly startPosition: { row: number; column: number }
+  readonly endPosition: { row: number; column: number }
   readonly isNamed: boolean
   readonly children: TsNode[]
   readonly parent: TsNode | null
@@ -41,6 +42,37 @@ export interface FactRef {
   line: number
   /** Nearest enclosing named function/method, when any. */
   symbol?: string
+  /**
+   * Exact source span of the fact's node (M1.2).
+   *
+   * `line` answers "which line"; a diff needs "which site". Two calls on one
+   * line — `api.a(); api.b()` — are two sites sharing one line number, and a
+   * check that counts lines reports one and silently drops the other.
+   *
+   * Only the WASM JS extractor emits this. The native sidecar's protocol has no
+   * span field yet, so its facts have `span` absent — and a consumer must report
+   * that degradation rather than read "no span" as "one site".
+   */
+  span?: FactSpan
+}
+
+/** 1-based line, 0-based column (tree-sitter's convention, kept as-is). */
+export interface FactSpan {
+  start: { line: number; column: number }
+  end: { line: number; column: number }
+}
+
+/** Span of a node, in the fact model's coordinates. */
+export function spanOf(node: { startPosition: { row: number; column: number }; endPosition: { row: number; column: number } }): FactSpan {
+  return {
+    start: { line: node.startPosition.row + 1, column: node.startPosition.column },
+    end: { line: node.endPosition.row + 1, column: node.endPosition.column },
+  }
+}
+
+/** Stable text form of a span, for identity keys and stored records. */
+export function spanKey(span: FactSpan | undefined): string {
+  return span ? `${span.start.line}:${span.start.column}-${span.end.line}:${span.end.column}` : 'line-only'
 }
 
 export interface IpcFact extends FactRef {
@@ -56,6 +88,19 @@ export interface BridgeFact extends FactRef {
   /** Root object after window./globalThis. stripping (may be a page alias). */
   object: string
   name: string
+  /** Receiver resolved against this occurrence's lexical declarations. */
+  receiver?: BridgeReceiver
+}
+
+export interface BridgeReceiver {
+  object: string
+  viaAlias: boolean
+  uncertain: boolean
+  /** A known local value rather than a workspace global. */
+  local: boolean
+  /** Written through window/globalThis; a same-named local alias cannot bind it. */
+  qualified: boolean
+  binding?: string
 }
 
 export interface AliasFact {
@@ -63,6 +108,12 @@ export interface AliasFact {
   object: string
   line: number
   topLevel: boolean
+  /** The alias name is assigned somewhere after its declaration, so the object
+   *  it points at is not fixed. A consumer reached through it cannot be bound
+   *  to a provider with confidence (M1.2). */
+  reassigned?: boolean
+  binding?: string
+  uncertain?: boolean
 }
 
 export interface GlobalDefFact extends FactRef {
@@ -159,7 +210,7 @@ export interface NamedEntryFact {
   wrapper: string
 }
 
-export interface ExposeFact {
+export interface ExposeFact extends FactRef {
   name: string
   keys: string[]
   line: number
@@ -271,15 +322,26 @@ export function emptyFacts(): FileFacts {
 
 /** Concatenate `source` into `target`, shifting every 1-based line by `offset`. */
 export function mergeFacts(target: FileFacts, source: FileFacts, offset: number): void {
+  // A span is two positions, not one: shifting only `line` would leave the range
+  // pointing at a line the fact no longer occupies, which is worse than having no
+  // span at all — a wrong site looks like a right one.
+  const shift = <T extends FactRef>(ref: T): T => offset === 0 || !ref.span ? { ...ref, line: ref.line + offset } : {
+    ...ref,
+    line: ref.line + offset,
+    span: {
+      start: { line: ref.span.start.line + offset, column: ref.span.start.column },
+      end: { line: ref.span.end.line + offset, column: ref.span.end.column },
+    },
+  }
   if (source.modules?.length) (target.modules ??= []).push(...source.modules.map(ref => ({ ...ref, line: ref.line + offset })))
   target.requires.push(...source.requires.map(r => ({ ...r, line: r.line + offset })))
   target.imports.push(...source.imports.map(r => ({ ...r, line: r.line + offset })))
-  target.ipc.push(...source.ipc.map(f => ({ ...f, line: f.line + offset })))
-  target.bridge.push(...source.bridge.map(b => ({ ...b, line: b.line + offset })))
+  target.ipc.push(...source.ipc.map(shift))
+  target.bridge.push(...source.bridge.map(shift))
   target.bridgeAliases.push(...source.bridgeAliases.map(a => ({ ...a, line: a.line + offset })))
   target.globalsDefined.push(...source.globalsDefined.map(d => ({ ...d, line: d.line + offset })))
-  target.globalsUsed.push(...source.globalsUsed.map(u => ({ ...u, line: u.line + offset })))
-  target.exposes.push(...source.exposes.map(e => ({ ...e, line: e.line + offset })))
+  target.globalsUsed.push(...source.globalsUsed.map(shift))
+  target.exposes.push(...source.exposes.map(shift))
   target.wrappers.push(...source.wrappers.map(w => ({ ...w })))
   // Bindings shift too: their line is matched against a reference line, and an
   // inline <script> block is offset from the document start.
@@ -412,7 +474,7 @@ function truncate(text: string): string {
 
 const IPC_MAIN = /^(?:[A-Za-z_$][\w$]*\.)*ipcMain$/
 const IPC_RENDERER = /^(?:[A-Za-z_$][\w$]*\.)*ipcRenderer$/
-const REGISTER_METHODS = ['handle', 'on', 'once', 'addHandler', 'removeHandler']
+const REGISTER_METHODS = ['handle', 'handleOnce', 'on', 'once', 'addHandler', 'removeHandler']
 
 interface WrapperDef {
   side: 'register' | 'call' | 'push'
@@ -439,7 +501,8 @@ class FactNodeView implements TsNode {
   readonly isNamed = true
   private cachedText?: string
   private cachedChildren?: TsNode[]
-  private cachedStart?: { row: number }
+  private cachedStart?: { row: number; column: number }
+  private cachedEnd?: { row: number; column: number }
   private cachedParent?: TsNode | null
   private fields?: Map<string, TsNode | null>
 
@@ -451,7 +514,8 @@ class FactNodeView implements TsNode {
     this.type = raw.type
   }
   get text(): string { return this.cachedText ??= this.raw.text }
-  get startPosition(): { row: number } { return this.cachedStart ??= this.raw.startPosition }
+  get startPosition(): { row: number; column: number } { return this.cachedStart ??= this.raw.startPosition }
+  get endPosition(): { row: number; column: number } { return this.cachedEnd ??= this.raw.endPosition }
   get children(): TsNode[] {
     return this.cachedChildren ??= TERMINAL_FACT_NODES.has(this.type)
       ? []
@@ -490,6 +554,173 @@ function nodeView(root: import('web-tree-sitter').Node): TsNode {
   return wrap(root)
 }
 
+interface BridgeScope {
+  parent: BridgeScope | null
+  function: boolean
+  declarations: Map<string, BridgeDeclaration>
+}
+
+interface BridgeDeclaration {
+  name: string
+  node: TsNode
+  value: TsNode | null
+  scope: BridgeScope
+  binding: string
+  reassigned: boolean
+  assignedValues: TsNode[]
+}
+
+/** The bridge subset of lexical binding. It retains no tree in the facts: only
+ * resolved receivers and declaration spans leave this extraction. */
+class BridgeScopeIndex {
+  private readonly scopes = new Map<number, BridgeScope>()
+  private readonly functions = new Set(['function_declaration', 'generator_function_declaration', 'function_expression', 'function', 'generator_function', 'arrow_function', 'method_definition'])
+  private readonly blocks = new Set(['statement_block', 'for_statement', 'for_in_statement', 'catch_clause', 'switch_body', 'class_body'])
+
+  constructor(root: TsNode) {
+    const top: BridgeScope = { parent: null, function: true, declarations: new Map() }
+    this.index(root, top)
+    const writes = (node: TsNode): void => {
+      const target = node.type === 'assignment_expression' || node.type === 'augmented_assignment_expression'
+        ? node.childForFieldName('left') : node.type === 'update_expression' ? node.childForFieldName('argument') : null
+      if (target) for (const name of this.names(target)) {
+        const declaration = this.declaration(node, name.text)
+        if (declaration) {
+          declaration.reassigned = true
+          const value = node.childForFieldName('right')
+          if (value) declaration.assignedValues.push(value)
+        }
+      }
+      for (const child of node.children) writes(child)
+    }
+    writes(root)
+  }
+
+  private names(pattern: TsNode): TsNode[] {
+    if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') return [pattern]
+    if (pattern.type === 'pair_pattern') {
+      const value = pattern.childForFieldName('value')
+      return value ? this.names(value) : []
+    }
+    if (pattern.type === 'assignment_pattern' || pattern.type === 'object_assignment_pattern') {
+      const left = pattern.childForFieldName('left')
+      return left ? this.names(left) : []
+    }
+    if (pattern.type === 'required_parameter' || pattern.type === 'optional_parameter') {
+      const value = pattern.childForFieldName('pattern') ?? pattern.childForFieldName('name')
+      return value ? this.names(value) : []
+    }
+    if (['object_pattern', 'array_pattern', 'rest_pattern', 'formal_parameters'].includes(pattern.type)) return pattern.children.flatMap(child => this.names(child))
+    return []
+  }
+
+  private add(scope: BridgeScope, name: TsNode, node: TsNode, value: TsNode | null): void {
+    const previous = scope.declarations.get(name.text)
+    if (previous) { previous.reassigned = true; return }
+    scope.declarations.set(name.text, {
+      name: name.text, node, value, scope, binding: spanKey(spanOf(name)), reassigned: false, assignedValues: [],
+    })
+  }
+
+  private index(node: TsNode, parent: BridgeScope): void {
+    let scope = parent
+    const functionNode = this.functions.has(node.type)
+    const name = node.childForFieldName('name')
+    if (['function_declaration', 'generator_function_declaration', 'class_declaration'].includes(node.type) && name?.type === 'identifier') this.add(parent, name, node, null)
+    if (functionNode || this.blocks.has(node.type)) scope = { parent, function: functionNode, declarations: new Map() }
+    this.scopes.set(node.id, scope)
+    if (functionNode) {
+      const params = node.childForFieldName('parameters') ?? node.childForFieldName('parameter')
+      if (params) for (const param of this.names(params)) this.add(scope, param, param, null)
+      if (name?.type === 'identifier' && ['function_expression', 'function', 'generator_function'].includes(node.type)) this.add(scope, name, node, null)
+    }
+    if (node.type === 'catch_clause') {
+      const param = node.childForFieldName('parameter')
+      if (param) for (const bound of this.names(param)) this.add(scope, bound, param, null)
+    }
+    if (node.type === 'variable_declarator') {
+      const pattern = node.childForFieldName('name')
+      const value = node.childForFieldName('value')
+      let owner = scope
+      if (node.parent?.type === 'variable_declaration') while (!owner.function && owner.parent) owner = owner.parent
+      if (pattern) for (const bound of this.names(pattern)) this.add(owner, bound, node, pattern.type === 'identifier' ? value : null)
+    }
+    if (node.type === 'import_specifier') {
+      const local = node.childForFieldName('alias') ?? node.childForFieldName('name')
+      if (local?.type === 'identifier') this.add(scope, local, node, null)
+    } else if (node.type === 'identifier' && (node.parent?.type === 'import_clause' || node.parent?.type === 'namespace_import')) this.add(scope, node, node, null)
+    for (const child of node.children) this.index(child, scope)
+  }
+
+  declaration(node: TsNode, name: string): BridgeDeclaration | null {
+    for (let scope = this.scopes.get(node.id); scope; scope = scope.parent ?? undefined) {
+      const declaration = scope.declarations.get(name)
+      if (declaration) return declaration
+    }
+    return null
+  }
+
+  receiver(node: TsNode, visited = new Set<BridgeDeclaration>()): BridgeReceiver {
+    const plain = (object: string, local = false, uncertain = false): BridgeReceiver => ({ object, local, uncertain, viaAlias: false, qualified: false })
+    // Creating a value does not give that value the identity of a reference in
+    // its fields or body. The ordinary walker records those inner uses itself.
+    if (FUNCTION_NODES.has(node.type) || node.type === 'object' || node.type === 'array' || node.type === 'class') return plain(node.text, true)
+    if (node.type === 'parenthesized_expression' && node.children[0]) return this.receiver(node.children[0], visited)
+    if (node.type === 'member_expression') {
+      const base = node.childForFieldName('object')
+      const member = propertyName(node)
+      if (base?.type === 'identifier' && (base.text === 'window' || base.text === 'globalThis') && member) {
+        return { ...plain(member, false, this.declaration(base, base.text) !== null), qualified: true }
+      }
+    }
+    if (node.type === 'identifier') {
+      const declaration = this.declaration(node, node.text)
+      if (!declaration) return plain(node.text)
+      if (visited.has(declaration)) return plain(node.text, true)
+      if (visited.size >= 8) return { ...plain(node.text, false, true), viaAlias: true, binding: declaration.binding }
+      const seen = new Set(visited); seen.add(declaration)
+      let value = declaration.value ? this.receiver(declaration.value, seen) : plain(node.text, true)
+      // Parameters and ordinary locals shadow bridge names with certainty.
+      // A write that actually mentions a bridge keeps that origin visible,
+      // including variables whose initializer was an ordinary local value.
+      if (!value.qualified && !value.viaAlias) for (const assigned of declaration.assignedValues) {
+        const candidate = this.receiver(assigned, new Set(seen))
+        if (candidate.qualified || candidate.viaAlias) { value = { ...candidate, uncertain: true }; break }
+      }
+      // A bare identifier initializer is an alias only when its declaration
+      // resolves to a known bridge root, not when it is an arbitrary global.
+      const bridge = value.qualified || value.viaAlias
+      return {
+        ...value, object: bridge ? value.object : node.text, qualified: false,
+        local: !bridge, viaAlias: bridge, binding: declaration.binding,
+        uncertain: bridge && (value.uncertain || declaration.reassigned),
+      }
+    }
+    // Conditional/fallback/call expressions can mention a bridge while returning
+    // something else. Keep the evidence visible, but never pick one branch.
+    for (const child of node.children) {
+      const candidate = this.receiver(child, new Set(visited))
+      if (candidate.qualified || candidate.viaAlias) return { ...candidate, uncertain: true, viaAlias: true, qualified: false }
+    }
+    return plain(node.text, true)
+  }
+
+  alias(name: string, value: TsNode): AliasFact | null {
+    const declaration = this.declaration(value, name)
+    if (!declaration) return null
+    const identifier = declaration.node.childForFieldName('name')
+    const resolved = identifier?.type === 'identifier'
+      ? this.receiver(identifier) : this.receiver(declaration.value ?? value, new Set([declaration]))
+    if (!resolved.qualified && !resolved.viaAlias) return null
+    return {
+      name, object: resolved.object, line: declaration.node.startPosition.row + 1,
+      topLevel: declaration.scope.parent === null, binding: declaration.binding,
+      ...(declaration.reassigned ? { reassigned: true } : {}),
+      ...(resolved.uncertain ? { uncertain: true } : {}),
+    }
+  }
+}
+
 class FactsCollector {
   readonly out: FileFacts = emptyFacts()
   private hasIpcSyntax = false
@@ -502,9 +733,11 @@ class FactsCollector {
   private readonly paramCalls: Array<{ fact: IpcFact; wrapper: string }> = []
   private readonly wrapperCallSites = new Map<string, number>()
   private readonly usedSeen = new Set<string>()
+  private bridgeScopes!: BridgeScopeIndex
 
   collect(tree: TsTree, bridgeGlobals: ReadonlySet<string> | null): FileFacts {
     const root = nodeView(tree.rootNode)
+    this.bridgeScopes = new BridgeScopeIndex(root)
     // Every direct IPC shape recognized by classifyCallee contains one of
     // these exact names. Absence safely skips IPC work in ordinary modules;
     // comments/strings may cause extra work but cannot suppress a fact.
@@ -744,18 +977,9 @@ class FactsCollector {
   }
 
   private recordBridgeAlias(name: string, value: TsNode, line: number, topLevel: boolean): void {
-    const first = /(?:window|globalThis)\.([A-Za-z_$][\w$]*)/.exec(value.text)
-    const object = first?.[1]
-    if (object && ['binary_expression', 'member_expression', 'await_expression', 'parenthesized_expression', 'identifier'].includes(value.type)) {
-      if (this.out.bridgeAliases.some(alias => alias.name === name && alias.line === line && alias.object === object)) return
-      this.out.bridgeAliases.push({ name, object, line, topLevel })
-    } else if (value.type === 'identifier') {
-      const inherited = this.out.bridgeAliases.find(alias => alias.name === value.text && alias.line !== line)?.object
-      if (inherited) {
-        if (this.out.bridgeAliases.some(alias => alias.name === name && alias.line === line && alias.object === inherited)) return
-        this.out.bridgeAliases.push({ name, object: inherited, line, topLevel })
-        return
-      }
+    const alias = this.bridgeScopes.alias(name, value)
+    if (alias && !this.out.bridgeAliases.some(existing => existing.binding === alias.binding)) this.out.bridgeAliases.push(alias)
+    if (value.type === 'identifier') {
       const shape = this.constShapes.get(value.text)
       if (shape) this.constShapes.set(name, shape)
     }
@@ -949,6 +1173,7 @@ class FactsCollector {
             name,
             keys: shape?.keys ?? [],
             line: node.startPosition.row + 1,
+            span: spanOf(node),
             ...(literal === null ? { dynamic: true } : {}),
             ...(known ? { keySource: table?.type === 'identifier' ? 'identifier' : 'literal' } : {}),
             ...(shape && !shape.complete ? { partial: true } : {}),
@@ -1001,15 +1226,17 @@ class FactsCollector {
         const key = `${name}:${node.startPosition.row}`
         if (!this.usedSeen.has(key)) {
           this.usedSeen.add(key)
-          this.out.globalsUsed.push({ name, line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined })
+          this.out.globalsUsed.push({ name, line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined, span: spanOf(node) })
         }
       }
       return
     }
     const base = stripWindowPrefix(obj)
-    if ((bridge === null || bridge.has(base)) && /^[\w$]+$/.test(base)) {
+    const receiverNode = node.childForFieldName('object')
+    const receiver = receiverNode ? this.bridgeScopes.receiver(receiverNode) : undefined
+    if ((bridge === null || bridge.has(base) || receiver?.viaAlias) && /^[\w$]+$/.test(base)) {
       const name = propertyName(node)
-      if (name) this.out.bridge.push({ object: base, name, line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined })
+      if (name) this.out.bridge.push({ object: base, name, line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined, span: spanOf(node), receiver })
     }
   }
 
@@ -1023,7 +1250,7 @@ class FactsCollector {
       const resolved = this.resolveChannel(argsOf(node)[0])
       if (resolved) {
         this.wrapperCallSites.set(callee.text, (this.wrapperCallSites.get(callee.text) ?? 0) + 1)
-        this.out.ipc.push({ side: def.side, method: def.method, channel: resolved.value, via: 'wrapper', line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined })
+        this.out.ipc.push({ side: def.side, method: def.method, channel: resolved.value, via: 'wrapper', line: node.startPosition.row + 1, symbol: ctx.owner ?? undefined, span: spanOf(node) })
       }
       return
     }
@@ -1058,6 +1285,7 @@ class FactsCollector {
       via: resolved ? resolved.via : 'dynamic',
       line: node.startPosition.row + 1,
       symbol: ctx.owner ?? undefined,
+      span: spanOf(node),
     }
     if (!resolved) {
       fact.expr = args[0] ? truncate(args[0].text) : '…'

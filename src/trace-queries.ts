@@ -65,6 +65,12 @@ function bridgeFlag(g: TraceGraph, ref: BridgeItem, api: PreloadApi): string {
   return ref.object === COMPAT_GLOBAL ? ` · 兼容层（可见角色：${api.roles.join('/')}）` : ''
 }
 
+function unboundBridgeText(refs: readonly BridgeItem[]): string {
+  return refs.length > 0
+    ? `### 绑定未确定的桥接站点（${refs.length}）\n${capped(refs.map(ref => `- ${loc(ref)} · \`${ref.object}.${ref.name}\` · 接收者未确定，需复查`), 20)}`
+    : ''
+}
+
 function suggest(keys: Iterable<string>, q: string, limit = 10): string[] {
   const lq = String(q).toLowerCase()
   return [...keys].filter((k) => k.toLowerCase().includes(lq)).slice(0, limit)
@@ -148,6 +154,7 @@ export function traceIpc(g: TraceGraph, query: string): { found: boolean; text: 
     capped(pushes.map((p) => `- ${loc(p)} · ${p.method}（${p.via}）`)),
     warnings.length ? `### 检查\n${warnings.map((w) => `- ${w}`).join('\n')}` : '',
     g.dynamic.length ? `- 全局另有 ${g.dynamic.length} 处动态通道参数无法静态解析（unresolved），不计入上表。` : '',
+    unboundBridgeText(g.unboundBridge.filter(ref => apis.some(api => api.name === ref.name))),
   ].filter(Boolean).join('\n')
   return { found: true, text }
 }
@@ -385,6 +392,7 @@ export function traceFile(g: TraceGraph, rel: string, edgeMode: EdgeMode = 'all'
       ? `### 外部包装调用（${deferred.length}）\n${capped(deferred.map((c) => `- ${c.local}('${c.channel}') · L${c.line}${c.symbol ? ` · in ${c.symbol}` : ''} · 是否 IPC 取决于 ${c.spec}`), 20)}`
       : '',
     section('preload 桥接调用', bridge.length, capped(bridge)),
+    unboundBridgeText(g.unboundBridge.filter(ref => ref.path === rel)),
     section('全局', globals.length + (f.kind === 'js' ? f.globalsUsed.length : 0), [
       ...(globals.length ? [capped(globals.map((d) => `- 定义 \`${d.name}\` · ${d.how} · L${d.line}`), 20)] : []),
       ...(f.kind === 'js' && f.globalsUsed.length ? [capped(f.globalsUsed.map((u) => `- 使用 \`window.${u.name}\` · L${u.line}`), 20)] : []),
