@@ -46,8 +46,8 @@ async function main() {
     tools: { register(def) { definitions.push(def) } }, commands: { register(def) { assert.equal(def.name, 'forge-status') } } })) {
     assert.equal(typeof disposable === 'function' || disposable === undefined || disposable === null, true)
   }
-  assert.equal(definitions.length, 9)
-  assert.deepEqual(new Set(definitions.map(d => d.name)), new Set(['ffgrep','fffind','ffedit','ffhistory','ffrollback','ff_file','ff_read','fftrace','ff_cards']))
+  assert.equal(definitions.length, 10)
+  assert.deepEqual(new Set(definitions.map(d => d.name)), new Set(['ffgrep','fffind','ffedit','ffhistory','ffrollback','ff_file','ff_read','fftrace','ffcheck','ff_cards']))
   ok('plugin mounts every tool through the installed SDK')
   async function call(name, args) {
     const def = definitions.find(d => d.name === name)

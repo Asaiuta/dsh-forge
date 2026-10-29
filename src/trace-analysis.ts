@@ -50,13 +50,13 @@ interface QueryGraph {
 // Assembled graphs are immutable during queries; a new assembly gets its own
 // index. Weak ownership avoids keeping evicted workspaces alive.
 const INDEX_CACHE = new WeakMap<TraceGraph, Map<EdgeMode, QueryGraph>>()
-function queryGraph(graph: TraceGraph, edgeMode: EdgeMode): QueryGraph {
-  const cached = INDEX_CACHE.get(graph)?.get(edgeMode)
+function queryGraph(graph: TraceGraph, edgeMode: EdgeMode, edgeCap: number = EDGE_CAP): QueryGraph {
+  const cached = edgeCap === EDGE_CAP ? INDEX_CACHE.get(graph)?.get(edgeMode) : undefined
   if (cached) return cached
   const forward = new Map<string, DependencyStep[]>(), reverse = new Map<string, DependencyStep[]>()
   let count = 0, complete = true
   const add = (step: DependencyStep): boolean => {
-    if (++count > EDGE_CAP) { complete = false; return false }
+    if (++count > edgeCap) { complete = false; return false }
     const outgoing = forward.get(step.from) ?? []
     if (!forward.has(step.from)) forward.set(step.from, outgoing)
     outgoing.push(step)
@@ -80,9 +80,13 @@ function queryGraph(graph: TraceGraph, edgeMode: EdgeMode): QueryGraph {
     }
   }
   const result = { forward, reverse, complete }
-  let modes = INDEX_CACHE.get(graph)
-  if (!modes) INDEX_CACHE.set(graph, modes = new Map())
-  modes.set(edgeMode, result)
+  // Only the default budget may populate the cache: a test-sized cap produces a
+  // partial index, and caching it would make later full queries look truncated.
+  if (edgeCap === EDGE_CAP) {
+    let modes = INDEX_CACHE.get(graph)
+    if (!modes) INDEX_CACHE.set(graph, modes = new Map())
+    modes.set(edgeMode, result)
+  }
   return result
 }
 
@@ -103,24 +107,76 @@ function knownFile(g: TraceGraph, file: string | null): string | null {
 }
 const row = (edge: DependencyStep): string => `- \`${edge.from}:${edge.line}\` → \`${edge.to}\` · ${edge.kind} · ${edge.evidence.confidence}/${edge.evidence.basis}${edge.evidence.config ? ' · ' + edge.evidence.config : ''}${edge.imports?.length ? ` · 导入 {${edge.imports.slice(0, 6).join(', ')}${edge.imports.length > 6 ? ` 等 ${edge.imports.length} 个` : ''}}` : ''}`
 
-export function traceImpact(graph: TraceGraph, value: string, edgeMode: EdgeMode = 'all'): AnalysisResult {
+/** A completed traversal: everything the budget allowed, uncapped.
+ *
+ *  Kept separate from {@link DependencyAnalysis} because two different things
+ *  are being bounded there: how much of the *graph* was walked (`complete`) and
+ *  how many rows fit in one reply (`ROW_CAP`). Paging needs the first to decide
+ *  what it may claim and the full row list to keep pages consistent; a renderer
+ *  needs the second. Collapsing them is how "100 of 250 referrers" becomes
+ *  "250 referrers, 100 shown" with the missing 150 unreachable. */
+export interface ImpactWalk {
+  source: string
+  /** Referrer → distance from source. */
+  depths: Map<string, number>
+  /** Every referrer, distance order. */
+  files: Array<{ path: string; depth: number }>
+  /** One parent edge per referrer, in discovery order. */
+  edges: DependencyStep[]
+  pages: string[]
+  /** The walk finished inside NODE_CAP/EDGE_CAP. */
+  complete: boolean
+}
+
+/** Traversal budgets. Overridable only so tests can prove what an incomplete
+ *  walk is allowed to claim without building 20 000 files; production always
+ *  uses the defaults. */
+export interface TraversalCaps { nodes?: number; edges?: number }
+
+export function walkImpact(graph: TraceGraph, value: string, edgeMode: EdgeMode = 'all', caps: TraversalCaps = {}): ImpactWalk | null {
   const source = knownFile(graph, normalizeTraceFile(graph.root, value))
-  if (!source) return { found: false, text: `## Trace impact:${value}\n- 未找到已分析的文件或被源码引用的资源。` }
-  const index = queryGraph(graph, edgeMode)
+  if (!source) return null
+  const nodeCap = caps.nodes ?? NODE_CAP
+  const index = queryGraph(graph, edgeMode, caps.edges ?? EDGE_CAP)
   const queue = [source], depths = new Map([[source, 0]]), edges: DependencyStep[] = []
+  // The evidence row answers "which exports of this file does the importer use",
+  // so when one importer reaches the source through two equally short edges, the
+  // one that names specific bindings is the better answer: `import { a, b }`
+  // says more than a namespace `require` (`*m`) from the same file.
+  const slot = new Map<string, number>()
+  const named = (edge: DependencyStep): number => (edge.imports ?? []).filter(name => !name.startsWith('*')).length
   let complete = index.complete
   outer: for (let next = 0; next < queue.length; next++) {
     const current = queue[next]
     for (const edge of index.reverse.get(current) ?? []) {
-      if (depths.has(edge.from)) continue
-      if (depths.size >= NODE_CAP) { complete = false; break outer }
-      depths.set(edge.from, depths.get(current)! + 1)
-      queue.push(edge.from)
-      edges.push(edge)
+      if (!depths.has(edge.from)) {
+        if (depths.size >= nodeCap) { complete = false; break outer }
+        depths.set(edge.from, depths.get(current)! + 1)
+        queue.push(edge.from)
+        slot.set(edge.from, edges.length)
+        edges.push(edge)
+        continue
+      }
+      // Same importer, same target already recorded: upgrade only.
+      if (edge.to !== current) continue
+      const at = slot.get(edge.from)
+      if (at !== undefined && named(edge) > named(edges[at])) edges[at] = edge
     }
   }
-  const files = queue.slice(1).map(file => ({ path: file, depth: depths.get(file)! }))
-  const pages = queue.filter(file => graph.pages.has(file))
+  return {
+    source,
+    depths,
+    files: queue.slice(1).map(file => ({ path: file, depth: depths.get(file)! })),
+    edges,
+    pages: queue.filter(file => graph.pages.has(file)),
+    complete,
+  }
+}
+
+export function traceImpact(graph: TraceGraph, value: string, edgeMode: EdgeMode = 'all'): AnalysisResult {
+  const walk = walkImpact(graph, value, edgeMode)
+  if (!walk) return { found: false, text: `## Trace impact:${value}\n- 未找到已分析的文件或被源码引用的资源。` }
+  const { source, depths, files, edges, pages, complete } = walk
   const analysis: DependencyAnalysis = {
     kind: 'impact', edgeMode, source, complete, visitedFiles: depths.size, totalFiles: files.length, totalPages: pages.length,
     truncated: !complete || files.length > ROW_CAP || pages.length > ROW_CAP,

@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-packages-'))
 const previousWorkers = process.env.DSH_FORGE_AST_WORKERS, pool = new AstWorkerPool()
@@ -83,7 +84,7 @@ try {
   fs.unlinkSync(path.join(root, 'other/duplicate.d.ts')); fs.unlinkSync(path.join(root, 'other/Helper.java'))
   const stable = await assembleTraceGraph(root)
   resetTraceFactsCache(); process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { workers: pool }), stable)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { workers: pool }), stable, 'worker vs sequential package resolution')
   const result = await createTraceTool(pool).execute({ target: 'path:consumer.ts -> types/virtual.d.ts' }, exec)
   assert.equal(result.found, true); assert.equal(result.analysis.distance, 1)
   ok('Sequential and worker package graphs match, including path-query evidence')

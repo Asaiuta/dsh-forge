@@ -59,11 +59,11 @@ const plugin = ctx.plugin(apply)
 // Services were provided before mount; activation should be immediate.
 await new Promise((resolve) => setImmediate(resolve))
 
-assert.equal(registeredTools.length, 9, `expected 9 tools, got ${registeredTools.length}`)
+assert.equal(registeredTools.length, 10, `expected 10 tools, got ${registeredTools.length}`)
 assert.equal(registeredCommands.length, 1, 'expected 1 command')
 assert.deepEqual(
   registeredTools.map((d) => d.name),
-  ['ffgrep', 'fffind', 'ffedit', 'ffhistory', 'ffrollback', 'ff_file', 'ff_read', 'fftrace', 'ff_cards'],
+  ['ffgrep', 'fffind', 'ffedit', 'ffhistory', 'ffrollback', 'ff_file', 'ff_read', 'fftrace', 'ffcheck', 'ff_cards'],
   'tool registration order changed',
 )
 assert.equal(registeredCommands[0].name, 'forge-status')

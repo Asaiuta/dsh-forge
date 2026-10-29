@@ -263,8 +263,10 @@ const GOOD_DRAFT = '# Overview\n\nThe workspace has 2 batches so far, all on `sr
   // stale anchor is reported, not repaired
   const now = Date.now() + 9000
   utimesSync(calcPath, new Date(now), new Date(now))
+  assert.equal(cardsStatusFor(work).fresh, true, 'a timestamp change alone preserves the content anchor')
+  writeFileSync(calcPath, readFileSync(calcPath, 'utf8') + '\n// external content edit\n')
   const stale = cardsStatusFor(work)
-  assert.equal(stale.fresh, false, 'an externally touched file marks the anchor stale in the status view')
+  assert.equal(stale.fresh, false, 'an external content edit marks the anchor stale in the status view')
   assert.equal(existsSync(readsFileSafe(stale.dir)), true, 'reads.json still sits beside the cards')
   ok('status query reports staleness without repairing it')
 }

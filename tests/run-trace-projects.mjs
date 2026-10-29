@@ -9,6 +9,7 @@ import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../li
 import { AstWorkerPool } from '../lib/ast-pool.js'
 import { apply } from '../lib/index.js'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-projects-'))
 const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-projects-outside-'))
@@ -209,7 +210,12 @@ try {
   assert.equal((await run('path:packages/app/main.ts -> packages/tool/index.ts', { edgeMode: 'certain' })).found, true)
   assert.equal((await run('impact:packages/tool/esm.js')).analysis.totalFiles, 1)
   assert.equal((await run('impact:packages/tool/esm.js', { edgeMode: 'certain' })).analysis.totalFiles, 0)
-  assert.match((await run('file:packages/app/choice.ts', { edgeMode: 'certain' })).text, /依赖（0）/)
+  // Certain mode drops the conditional-export edge, so the file has no deps.
+  // An all-zero set of sections collapses into the "无：" line, so assert it is
+  // reported as absent rather than as a heading with a zero count.
+  const noneCertain = await run('file:packages/app/choice.ts', { edgeMode: 'certain' })
+  assert.match(noneCertain.text, /^- 无：.*依赖/m)
+  assert.doesNotMatch(noneCertain.text, /### 依赖 \/ 被依赖（[1-9]/)
   assert.ok((await run('file:root.ts', { edgeMode: 'maybe' })).error)
   assert.ok((await run('ipc:anything', { edgeMode: 'certain' })).error)
   ok('conditional exports remain candidates and all/certain queries keep independent traversal indexes and file lists')
@@ -323,14 +329,14 @@ try {
   resetTraceFactsCache()
   const sequential = await assembleTraceGraph(root)
   resetTraceFactsCache(); process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { workers: pool }), sequential)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { workers: pool }), sequential, 'worker vs sequential project graph')
   ok('worker and sequential facts preserve the same project graph, evidence and diagnostics')
 
   const definitions = [], disposers = []
   for (const dispose of apply({ fs: { resolve: async file => ({ targetKey: file, displayPath: file }), processPath: target => target.targetKey, processPathFromHostPath: file => file },
     tools: { register: definition => { definitions.push(definition) } }, commands: { register() {} } }, { prewarm: false })) if (typeof dispose === 'function') disposers.push(dispose)
   try {
-    assert.equal(definitions.length, 9)
+    assert.equal(definitions.length, 10)
     const definition = definitions.find(tool => tool.name === 'fftrace'), runtime = Object.create(ToolRuntime.prototype)
     runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
     for (const args of [{ target: 'file:diagnostics.js' }, { target: 'path:app/src/main.ts -> alternate/lib/core.ts', edgeMode: 'certain' }]) {

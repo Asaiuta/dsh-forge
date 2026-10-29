@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-languages-'))
 const previousWorkers = process.env.DSH_FORGE_AST_WORKERS
@@ -207,7 +208,7 @@ try {
 
   resetTraceFactsCache()
   process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { workers: pool }), removed)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { workers: pool }), removed, 'worker vs sequential language facts')
   const result = await createTraceTool(pool).execute({ target: 'file:src/lib.rs' }, exec)
   assert.equal(result.found, true)
   assert.equal(result.incomplete, false)

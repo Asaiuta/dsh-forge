@@ -93,6 +93,7 @@ if (targets.length === 0) {
     guses: [...a.graph.guses.entries()].flatMap(([n, xs]) => xs.map((x) => `${n} ${x.path}:${x.line}`)).sort(),
     bridgeRefs: [...a.graph.bridgeRefs.entries()].flatMap(([n, xs]) => xs.map((x) => `${n} ${x.path}:${x.line}`)).sort(),
     unknownBridge: a.graph.unknownBridge.map((b) => `${b.name} ${b.path}:${b.line}`).sort(),
+    unboundBridge: a.graph.unboundBridge.map((b) => `${b.object}.${b.name} ${b.path}:${b.line}`).sort(),
     membership: [...a.graph.membership.entries()].map(([f, ps]) => `${f}=>${[...ps.keys()].sort().join(',')}`).sort(),
     pages: [...a.graph.pages.entries()].map(([p, ss]) => `${p}=>${ss.map((s) => `${s.index}:${s.rel ?? 'inline'}`).join(',')}`).sort(),
   })
@@ -146,6 +147,10 @@ if (targets.length === 0) {
     }
     for (const items of g.bridgeRefs.values()) for (const b of items) assert.ok(g.files.has(b.path), `${root}: bridge ref path scanned: ${b.path}`)
     for (const b of g.unknownBridge) assert.ok(g.files.has(b.path), `${root}: unknown bridge path scanned: ${b.path}`)
+    for (const b of g.unboundBridge) {
+      assert.ok(g.files.has(b.path), `${root}: unbound bridge path scanned: ${b.path}`)
+      assert.equal(b.receiver?.uncertain, true, `${root}: an unbound site carries uncertainty`)
+    }
 
     // Per-class observability.
     const count = (m) => [...m.values()].flat().length
@@ -162,6 +167,7 @@ if (targets.length === 0) {
       ['global.uses', count(g.guses)],
       ['bridge.refs', count(g.bridgeRefs)],
       ['bridge.unknown', g.unknownBridge.length],
+      ['bridge.unbound', g.unboundBridge.length],
       ['pages', g.pages.size],
       ['membership', g.membership.size],
     ]

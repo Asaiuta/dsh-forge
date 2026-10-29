@@ -30,6 +30,7 @@ import { findSymbol, parseFile } from './ast.ts'
 import { findDefinitions, outlineOf } from './tools-symbol.ts'
 import type { AstWorkerPool } from './ast-pool.ts'
 import { clampInt, globToRegExp, parseLineRange, workdirOf, type ForgeExec, type ToolFailure } from './core.ts'
+import { canonicalize, rangeForLines, rangeForSlice, type SourceRange } from './source-evidence.ts'
 
 const MAX_FILES_DEFAULT = 20
 const MAX_FILES_HARD = 100
@@ -246,6 +247,12 @@ interface ReadBlock {
    * reports `totalLines` for the same reason.
    */
   totalLines?: number
+  /** Where `text` actually sits in canonical text: 0-based UTF-16 positions,
+   *  half-open. Computed from the emitted characters, so a byte-capped or
+   *  budget-trimmed block reports what it shows, not what was planned. */
+  displayRange?: SourceRange
+  /** For a symbol read: the definition's own span, without `context` lines. */
+  symbolRange?: SourceRange
 }
 interface SkippedFile { file: string; reason: string }
 
@@ -312,25 +319,39 @@ function readPlain(abs: string, display: string, range: { start: number; end: nu
     return { file: display, reason: `unreadable: ${cause instanceof Error ? cause.message : String(cause)}` }
   }
   if (looksBinary(raw)) return { file: display, reason: 'binary file — use the built-in read/attachment path' }
-  const lines = normalizeText(raw).split('\n')
+  // Same conversion the edit path uses. A Latin-1 or UTF-16 file must fail the
+  // same way here as it would when written, instead of rendering replacement
+  // characters whose positions mean nothing.
+  let canonical: string
+  try {
+    canonical = canonicalize(raw).text
+  } catch (cause) {
+    return { file: display, reason: cause instanceof Error ? cause.message : String(cause) }
+  }
+  const lines = canonical.split('\n')
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
   const start = range === null ? 1 : Math.max(1, range.start)
   const end = range === null ? lines.length : Math.min(lines.length, range.end)
   if (range !== null && (range.start > lines.length)) return { file: display, reason: `line range L${range.start}-${range.end} is past EOF (${lines.length} lines)` }
   const slice = lines.slice(start - 1, end)
-  let out = slice.join('\n')
-  let truncated = false
-  if (out.length > PER_FILE_BYTE_CAP) {
-    out = out.slice(0, PER_FILE_BYTE_CAP)
+  const capped = range === null && end - start + 1 > PER_FILE_LINE_CAP
+  // Both caps cut the emitted text, so the label and the range come from what is
+  // actually handed over. Deriving either from the request was how a truncated
+  // block advertised lines it never showed.
+  let text = capped ? slice.slice(0, PER_FILE_LINE_CAP).join('\n') : slice.join('\n')
+  let truncated = capped
+  if (text.length > PER_FILE_BYTE_CAP) {
+    text = text.slice(0, PER_FILE_BYTE_CAP)
     truncated = true
   }
-  const capped = range === null && end - start + 1 > PER_FILE_LINE_CAP
+  const shownLines = text === '' ? 1 : text.split('\n').length
   return {
     file: display,
-    lines: `L${start}-${capped ? start + PER_FILE_LINE_CAP - 1 : end}`,
-    text: capped ? slice.slice(0, PER_FILE_LINE_CAP).join('\n') : out,
+    lines: `L${start}-${start + shownLines - 1}`,
+    text,
     totalLines: lines.length,
-    ...(truncated || capped ? { truncated: true } : {}),
+    displayRange: rangeForSlice(canonical, start, text.length),
+    ...(truncated ? { truncated: true } : {}),
   }
 }
 
@@ -506,6 +527,22 @@ export function createReadTool(workers?: AstWorkerPool, nativeName?: string) {
                 kind: { type: 'string' },
                 occurrence: { type: 'integer' },
                 totalLines: { type: 'integer' },
+                displayRange: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    start: { type: 'object', additionalProperties: false, properties: { line: { type: 'integer', required: true }, character: { type: 'integer', required: true } } },
+                    end: { type: 'object', additionalProperties: false, properties: { line: { type: 'integer', required: true }, character: { type: 'integer', required: true } } },
+                  },
+                },
+                symbolRange: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    start: { type: 'object', additionalProperties: false, properties: { line: { type: 'integer', required: true }, character: { type: 'integer', required: true } } },
+                    end: { type: 'object', additionalProperties: false, properties: { line: { type: 'integer', required: true }, character: { type: 'integer', required: true } } },
+                  },
+                },
               },
             },
           },
@@ -660,6 +697,11 @@ export function createReadTool(workers?: AstWorkerPool, nativeName?: string) {
             lines: `L${start}-${sym.endLine}`,
             kind: sym.kind, occurrence: pick.occurrence,
             text: blockText,
+            // The body block now spans `context` lines too, so its own label
+            // (the symbol span) and the range of the emitted text are different
+            // facts and are reported separately.
+            displayRange: rangeForSlice(file.text, from + 1, blockText.length),
+            symbolRange: rangeForLines(file.text, sym.startLine, sym.endLine),
           }, budget)
           if (fittedSymbol === null) { skipped.push({ file: display, reason: budgetReason(budget) }); continue }
           budget -= fittedSymbol.text.length

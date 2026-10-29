@@ -52,6 +52,8 @@
 
 AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python（含 PYI）、Rust、Go、C、C++、Java、C#、Lua。
 
+后续规划见[能力补齐与工具闭环路线图](docs/forge-capability-roadmap-2026-10-28.md)与[实施手册](docs/forge-plan-m0-m1.md)：M0（证据契约与能力边界——能力矩阵、审计状态、快照身份、分页、被动状态）已落地，M1 及之后尚未实施。
+
 ---
 
 ## 安装

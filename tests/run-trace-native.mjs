@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { extractTraceFile } from '../lib/trace-facts.js'
 import { assembleTraceGraph, createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-native-'))
 const previous = process.env.DSH_FORGE_AST_WORKERS, pool = new AstWorkerPool()
@@ -133,7 +134,7 @@ try {
   const changed = await assembleTraceGraph(root)
   assert.notEqual(changed.graph, before.graph); assert.equal(changed.graph.ffi.get('shared').length, 9)
   resetTraceFactsCache(); process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { workers: pool }), changed)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { workers: pool }), changed, 'worker vs sequential binary metadata')
   ok('Binary content edits invalidate the graph; sequential and worker metadata agree')
 } finally {
   await pool.dispose()

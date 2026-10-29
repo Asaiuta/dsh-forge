@@ -16,6 +16,8 @@ const JS_FILE = /\.(?:[cm]?jsx?)$/
 
 export interface JsProject {
   signature: string
+  /** Content identities of the metadata bytes actually consumed by this load. */
+  inputHashes: ReadonlyMap<string, string | null>
   resolve: JsResolver
   issues: TraceDiagnostic[]
   configs: number
@@ -27,6 +29,7 @@ export const projectMetadata = (name: string): boolean => name === 'package.json
 
 export function loadJsProject(root: string, files: readonly string[], signal?: AbortSignal, knownFiles: ReadonlySet<string> = new Set(), jsRefs: ReadonlyMap<string, ReadonlyArray<JsReference>> = new Map()): JsProject {
   const issues: TraceDiagnostic[] = [], reads = new Map<string, string | null>(), stamps: unknown[] = [], probes = new Map<string, string | null>()
+  const inputHashes = new Map<string, string | null>()
   let bytes = 0, canonicalRoot: string | null = null
   try { canonicalRoot = realpathSync(root) } catch { /* scanFacts reports inaccessible roots */ }
   const identity = (file: string): string | null => { try { return canonicalTarget(path.resolve(root, file)) } catch { return null } }
@@ -39,10 +42,12 @@ export function loadJsProject(root: string, files: readonly string[], signal?: A
       if (!target || !canonicalRoot || !within(canonicalRoot, target)) throw new Error('工程元数据路径超出扫描根或无法确认身份。')
       const data = readBoundedFile(path.resolve(root, file), Math.min(256 * 1024, 8 * 1024 * 1024 - bytes))
       bytes += data.length
-      stamps.push([file, target, createHash('sha256').update(data).digest('hex')])
+      const hash = createHash('sha256').update(data).digest('hex')
+      stamps.push([file, target, hash])
+      inputHashes.set(file, hash)
       const text = data.toString('utf8'); reads.set(file, text); return text
     } catch (cause) {
-      reads.set(file, null); stamps.push([file, target, 'failed'])
+      reads.set(file, null); stamps.push([file, target, 'failed']); inputHashes.set(file, null)
       issues.push({ path: file, reason: 'metadata_read', message: cause instanceof Error ? cause.message : String(cause) })
       return null
     }
@@ -166,6 +171,6 @@ export function loadJsProject(root: string, files: readonly string[], signal?: A
       : configuredTargets(owners, spec, check) ?? packagesIndex.resolve(from, spec, packageMode, check)
     return blocked ? unresolved('outside_root', '目标通过目录或文件链接指向扫描根外，已停止推断。') : result
   }
-  return { signature: JSON.stringify([canonicalRoot, stamps, [...memberConfigs.entries()].map(([file, list]) => [file, list.map(config => config.file)]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0), closureLimited]), resolve, issues, configs: configs.length, workspacePackages: packagesIndex.workspacePackages,
+  return { signature: JSON.stringify([canonicalRoot, stamps, [...memberConfigs.entries()].map(([file, list]) => [file, list.map(config => config.file)]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0), closureLimited]), inputHashes, resolve, issues, configs: configs.length, workspacePackages: packagesIndex.workspacePackages,
     valid: () => [...probes].every(([file, expected]) => identity(file) === expected) }
 }

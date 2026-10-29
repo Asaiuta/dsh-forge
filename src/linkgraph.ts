@@ -95,6 +95,8 @@ export interface ElectronIndex {
   /** Alias-resolved bridge references per file (HTML entries carry inline scripts). */
   bridgeByFile: Map<string, BridgeItem[]>
   unknownBridge: BridgeItem[]
+  /** Visible sites whose lexical or page-level receiver is not determined. */
+  unboundBridge: BridgeItem[]
   gdefs: Map<string, DefItem[]>
   guses: Map<string, UseItem[]>
   decls: PreloadDecls
@@ -282,18 +284,27 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
       continue
     }
     if (f.kind !== 'js' && f.kind !== 'html' && f.kind !== 'component') continue
-    // Imported names per specifier: the question "who uses which of my exports"
-    // is answerable without re-reading every dependent.
+    // Imported names per statement, not per module: a file may import from one
+    // module more than once (`import type {A} from './m'` on line 9, `import {b}
+    // from './m'` on line 10), and an edge that reported the module's whole name
+    // set would claim each statement imported the other's names.
+    //
+    // The native sidecar is an optional prebuilt binary, so bindings may arrive
+    // without a line (an older build). Match by line when the data supports it
+    // and fall back to the module-wide set otherwise: showing names at module
+    // granularity is the old behaviour, showing none would be a regression.
     const bindings = scriptFacts(f)?.bindings ?? []
-    const importedNames = (spec: string): string[] | undefined => {
-      const names = bindings.filter(binding => binding.spec === spec)
+    const importedNames = (spec: string, line: number): string[] | undefined => {
+      const sameSpec = bindings.filter(binding => binding.spec === spec)
+      const onLine = sameSpec.filter(binding => binding.line === line)
+      const names = (onLine.length ? onLine : sameSpec.some(binding => binding.line !== undefined) ? [] : sameSpec)
         .map(binding => binding.imported ?? '*' + binding.local)
       return names.length ? [...new Set(names)] : undefined
     }
     for (const { mode, ref, syntax } of jsReferences(f)) {
       const edgeKind = ref.dynamic ? 'dynamic_import' : mode
       const esImport = mode === 'import' && !ref.dynamic && !ref.unresolved
-      const imports = ref.unresolved ? undefined : importedNames(ref.spec)
+      const imports = ref.unresolved ? undefined : importedNames(ref.spec, ref.line)
       // An expression such as `import(/regex/.source)` is retained as an
       // unresolved fact for diagnostics, but its source text must never be
       // interpreted as a file path merely because a matching file exists.
@@ -442,6 +453,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
   const bridgeByObject = new Map<string, BridgeItem[]>()
   const bridgeByFile = new Map<string, BridgeItem[]>()
   const unknownBridge: BridgeItem[] = []
+  const unboundBridge: BridgeItem[] = []
   const gdefs = new Map<string, DefItem[]>()
   const guses = new Map<string, UseItem[]>()
   const namedEntries = new Map<string, NamedItem[]>()
@@ -464,7 +476,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
     if (!targets.every(result => result.status === 'resolved' && result.targets.length === 1 && result.targets[0].to === to && result.targets[0].evidence.confidence === 'certain')) return null
     return moduleWrappers.get(normalizeTarget(to))?.get(imported) ?? null
   }
-  const pageAlias = new Map<string, Array<{ object: string; path: string }>>()
+  const pageAlias = new Map<string, Array<{ object: string; path: string; uncertain: boolean }>>()
   for (const [rel, f] of entries) {
     const js = scriptFacts(f)
     if (!js) continue
@@ -473,40 +485,29 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
     const classicCtx = f.kind === 'js' ? classic.has(rel) : true
     for (const alias of js.bridgeAliases) {
       if (alias.topLevel && classicCtx) {
-        push(pageAlias, alias.name, { object: alias.object, path: rel })
+        push(pageAlias, alias.name, { object: alias.object, path: rel, uncertain: alias.reassigned === true || alias.uncertain === true })
       }
     }
   }
   const pagesOfRel = (rel: string): Set<string> => new Set([...(pages.has(rel) ? [rel] : []), ...(membership.get(rel)?.keys() ?? [])])
-  // Function-local aliases never leave their file: `const api = window.chartAPI`
-  // inside a renderer IIFE still decides what `api.listCharts` refers to.
-  const localAlias = new Map<string, Map<string, string>>()
-  for (const [rel, f] of entries) {
-    const js = scriptFacts(f)
-    if (!js?.bridgeAliases.length) continue
-    const map = new Map<string, string>()
-    for (const alias of js.bridgeAliases) if (!map.has(alias.name)) map.set(alias.name, alias.object)
-    localAlias.set(rel, map)
-  }
-  const resolveLocalObject = (file: string, object: string): string | null => {
-    const map = localAlias.get(file)
-    if (!map) return null
-    let current = object
-    for (let hop = 0; hop < 4; hop++) {
-      const next = map.get(current)
-      if (next === undefined) return current !== object && rootGlobals.has(current) ? current : null
-      current = next
-    }
-    return rootGlobals.has(current) ? current : null
-  }
   const resolveAliasRef = (fromRel: string, raw: BridgeFact): BridgeItem | null => {
-    // A local declaration shadows any same-named global (`const api =
-    // window.chartAPI` wins over a preload that exposes a global called `api`),
-    // and so does a classic-script alias adopted by the same page.
-    const local = resolveLocalObject(fromRel, raw.object)
-    if (local) return { ...raw, path: fromRel, alias: raw.object, object: local }
+    // Use the formal checker's occurrence binding, not a file-wide alias map.
+    const unbound = (): BridgeItem => ({ ...raw, path: fromRel, receiver: {
+      object: raw.object, local: false, qualified: false, viaAlias: false, ...raw.receiver, uncertain: true,
+    } })
+    if (raw.receiver) {
+      if (raw.receiver.local) return null
+      if (raw.receiver.uncertain) return unbound()
+      if (raw.receiver.qualified || raw.receiver.viaAlias) {
+        return rootGlobals.has(raw.receiver.object)
+          ? { ...raw, path: fromRel, object: raw.receiver.object, ...(raw.receiver.viaAlias ? { alias: raw.object } : {}) }
+          : null
+      }
+    } else if (scriptFacts(entries.get(fromRel)!)?.bridgeAliases.some(alias => alias.name === raw.object)) return unbound()
     const mine = pagesOfRel(fromRel)
-    const def = (pageAlias.get(raw.object) ?? []).find((d) => d.path === fromRel || [...pagesOfRel(d.path)].some((p) => mine.has(p)))
+    const defs = (pageAlias.get(raw.object) ?? []).filter((d) => d.path === fromRel || [...pagesOfRel(d.path)].some((p) => mine.has(p)))
+    if (defs.length > 1 || defs.some(def => def.uncertain)) return unbound()
+    const def = defs[0]
     if (def) return { ...raw, path: fromRel, alias: raw.object, object: def.object }
     return rootGlobals.has(raw.object) ? { ...raw, path: fromRel } : null
   }
@@ -545,6 +546,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
     for (const raw of js.bridge) {
       const resolved = resolveAliasRef(rel, raw)
       if (!resolved) continue
+      if (resolved.receiver?.uncertain) { unboundBridge.push(resolved); continue }
       push(bridgeByObject, resolved.object, resolved)
       push(bridgeByFile, rel, resolved)
       if (apisByName.has(resolved.name)) push(bridgeRefs, resolved.name, resolved)
@@ -561,7 +563,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
 
   return {
     registers, pushes, directCalls, dynamic, apisByName, apisByChannel, namedEntries, roleGlobals, roleByGlobal,
-    bridgeRefs, bridgeByObject, bridgeByFile, unknownBridge, gdefs, guses, decls,
+    bridgeRefs, bridgeByObject, bridgeByFile, unknownBridge, unboundBridge, gdefs, guses, decls,
   }
 }
 

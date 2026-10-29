@@ -8,6 +8,7 @@ import { traceImpact, tracePath } from '../lib/linkgraph.js'
 import { AstWorkerPool } from '../lib/ast-pool.js'
 import { apply } from '../lib/index.js'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
+import { sameGraphExceptSnapshot } from './lib/snapshot-compare.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-analysis-'))
 const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-trace-outside-'))
@@ -313,7 +314,7 @@ try {
   assert.ok(edges(explicitGraph).some(([to, line]) => line === 2 && to === `${quotedDir}/shared.h`))
   resetTraceFactsCache()
   process.env.DSH_FORGE_AST_WORKERS = '2'
-  assert.deepEqual(await assembleTraceGraph(root, { compileCommands: 'build/custom.json', workers: pool }), explicitGraph)
+  sameGraphExceptSnapshot(await assembleTraceGraph(root, { compileCommands: 'build/custom.json', workers: pool }), explicitGraph, 'worker vs sequential compilation graph')
   ok('explicit database authorization, native command quoting and worker/sequential behavior preserve separate cache ownership')
 
   const definitions = [], disposers = []

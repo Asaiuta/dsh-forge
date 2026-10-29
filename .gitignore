@@ -48,3 +48,9 @@ tests/.findroot-fixture/
 # Adoption experiments: prompt sets, per-session tool-call attribution and sample
 # counts. Internal measurement notes, not project documentation.
 /docs/p0-adoption-*
+
+# Local Python bytecode from tools/ scripts.
+__pycache__/
+
+# Local validation evidence; excluded from Trace's workspace source walk.
+/.dsh/validation/

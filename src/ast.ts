@@ -761,12 +761,23 @@ interface FactsCacheEntry {
 const factsCache = new Map<string, FactsCacheEntry>()
 
 export async function fileFacts(absPath: string, bridgeGlobals: readonly string[] | null): Promise<{ error?: string; value?: FactsParse }> {
+  const input = readAstText(absPath)
+  if ('error' in input) return input
+  return fileFactsFromText(absPath, input.text, bridgeGlobals)
+}
+
+/**
+ * Same extraction, from text the caller already holds.
+ *
+ * The capture path (M1.1) reads a file once as a Buffer so it can hash exactly
+ * what it parsed. Letting `fileFacts` read again would give it a second chance
+ * to see different bytes — the hash would then certify content that was never
+ * parsed, which is the one thing a "content-bound" baseline may not do.
+ */
+export async function fileFactsFromText(absPath: string, text: string, bridgeGlobals: readonly string[] | null): Promise<{ error?: string; value?: FactsParse }> {
   const lang = detectLanguage(absPath)
   if (!lang) return { error: `unsupported language for ${path.basename(absPath)}` }
   const st = statSafe(absPath)
-  const input = readAstText(absPath)
-  if ('error' in input) return input
-  const text = input.text
   const hash = createHash('sha256').update(text).digest('hex')
   const bridgeKey = JSON.stringify(bridgeGlobals)
   const cached = factsCache.get(absPath)

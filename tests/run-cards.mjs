@@ -144,8 +144,10 @@ editBatch(store, 'docs 注释补齐', 'sess_b', 'README.md', 'update', '# readme
   await ensureCards(work)
   const now = Date.now() + 5000
   utimesSync(calcPath, new Date(now), new Date(now))
+  assert.equal((await ensureCards(work)).regenerated.length, 0, 'unchanged content keeps its identity despite a timestamp change')
+  writeFileSync(calcPath, readFileSync(calcPath, 'utf8') + '\n// external content edit\n')
   const result = await ensureCards(work)
-  assert.equal(result.regenerated.length, 4, 'an mtime move on a covered file must invalidate the anchor')
+  assert.equal(result.regenerated.length, 4, 'changed content on a covered file must invalidate the anchor')
   const state = JSON.parse(readFileSync(path.join(dataRoot, 'cards', path.basename(store.dir), 'state.json'), 'utf8'))
   assert.notEqual(state.anchor.files, freshState.anchor.files, 'the file digest moved')
   ok('external file edit moves the file digest and rebuilds without a ledger append')
@@ -179,6 +181,81 @@ editBatch(store, 'docs 注释补齐', 'sess_b', 'README.md', 'update', '# readme
   const refreshed = await tool.execute({ refresh: true }, exec)
   assert.equal(refreshed.cards.length, 4)
   ok('refresh passes through to a full rebuild')
+}
+
+// --- verification evidence on the overview card ---------------------------------
+
+{
+  const { appendRecord, newRecordId, VERIFICATION_SCHEMA } = await import(new URL('../lib/verification.js', import.meta.url).href)
+  const { createHash } = await import('node:crypto')
+  const hashOf = (file) => createHash('sha256').update(readFileSync(file)).digest('hex')
+
+  const evidenceStore = storeFor(work)
+  const beforeAnchor = (await ensureCards(work)).anchor
+  assert.equal(beforeAnchor.verification, 0, 'a workspace with no records anchors at zero')
+
+  // One archived pass covering calc.ts as it is right now.
+  await appendRecord(evidenceStore, work, {
+    schema: VERIFICATION_SCHEMA,
+    id: newRecordId(),
+    workspaceId: 'ws',
+    batchIds: [1],
+    afterHashes: [{ file: 'src/calc.ts', hash: hashOf(calcPath) }],
+    checks: [{ id: 'bridge', kind: 'bridge', status: 'passed', coverage: { files: 1 }, findings: [] }],
+    requiredChecks: ['bridge'],
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    provenance: 'internal-static',
+  })
+
+  // A new check with NO new ledger batch must still move the cards.
+  const afterEvidence = await ensureCards(work)
+  assert.equal(afterEvidence.anchor.verification, 1)
+  assert.equal(afterEvidence.anchor.lastId, beforeAnchor.lastId, 'no code batch was appended')
+  assert.ok(afterEvidence.regenerated.includes('overview'), 'the overview must refresh for new evidence alone')
+
+  const overview = readFileSync(path.join(afterEvidence.dir, 'overview.md'), 'utf8')
+  assert.match(overview, /## Verification/)
+  assert.match(overview, /revision 1, 1 record\(s\)/)
+  assert.match(overview, /\| record \| batch \| recorded \| now \| provenance \| when \| note \|/)
+  assert.match(overview, /\| [0-9a-f]{8} \| #1 \| passed \| passed \| internal-static \|/)
+  assert.match(overview, /`recorded` is the historical verdict and never changes/)
+  ok('a new check with no new code batch refreshes the overview and shows recorded vs now')
+
+  // Same record, different content: recorded stays passed, now becomes stale.
+  writeFileSync(calcPath, calcSource.replace('a + b', 'a + b + 0'))
+  const stale = await ensureCards(work)
+  const staleCard = readFileSync(path.join(stale.dir, 'overview.md'), 'utf8')
+  assert.match(staleCard, /\| [0-9a-f]{8} \| #1 \| passed \| stale \| internal-static \|/)
+  assert.match(staleCard, /inputs changed: src\/calc\.ts/)
+  ok('a changed input turns the current column stale while the recorded column stays passed')
+}
+{
+  const { appendRecord, newRecordId, VERIFICATION_SCHEMA } = await import(new URL('../lib/verification.js', import.meta.url).href)
+  const evidenceStore = storeFor(work)
+  // An external claim of a pass must not appear as an automatic pass.
+  await appendRecord(evidenceStore, work, {
+    schema: VERIFICATION_SCHEMA,
+    id: newRecordId(),
+    workspaceId: 'ws',
+    batchIds: [1],
+    afterHashes: [],
+    checks: [{ id: 'tests', kind: 'tests', status: 'passed', coverage: { files: 0 }, findings: [] }],
+    requiredChecks: ['tests'],
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    provenance: 'external-report',
+  })
+  const built = await ensureCards(work)
+  const card = readFileSync(path.join(built.dir, 'overview.md'), 'utf8')
+  assert.match(card, /external-report/, 'an external report is labelled as such')
+  // The claim is listed, and the recorded column shows what it actually
+  // demonstrated: nothing. A report is not a check.
+  const externalRow = card.split('\n').find((line) => line.includes('external-report'))
+  assert.ok(externalRow !== undefined)
+  assert.match(externalRow, /\| not_run \|/, 'an external claim is recorded as not_run in the recorded column')
+  assert.ok(!/\| tests-passed \|/.test(card))
+  ok('an externally supplied pass is shown as external-report and recorded not_run')
 }
 
 // --- signal + workspace resolution ---------------------------------------------

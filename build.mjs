@@ -26,7 +26,7 @@ const result = await build({
   // without standing up the native finder. `src/overlay.ts` is an entry for the
   // same reason: its TTL and matching rules have to be testable without a
   // finder, and they are the part that can silently disagree with the engine.
-  entryPoints: ['src/index.ts', 'src/core.ts', 'src/tools.ts', 'src/absence.ts', 'src/overlay.ts', 'src/delegate.ts', 'src/tools-symbol.ts', 'src/ast.ts', 'src/edit-engine.ts', 'src/ledger.ts', 'src/tickets.ts', 'src/tools-edit.ts', 'src/history.ts', 'src/tools-files.ts', 'src/tools-read.ts', 'src/facts.ts', 'src/trace-facts.ts', 'src/decls.ts', 'src/linkgraph.ts', 'src/tools-trace.ts', 'src/tools-cards.ts', 'src/cards.ts', 'src/distill.ts', 'src/ast-worker.ts', 'src/ast-pool.ts', 'src/indexer-client.ts', 'src/config.ts', 'src/registration.ts', 'src/guidance.ts'],
+  entryPoints: ['src/index.ts', 'src/core.ts', 'src/tools.ts', 'src/absence.ts', 'src/overlay.ts', 'src/delegate.ts', 'src/tools-symbol.ts', 'src/ast.ts', 'src/edit-engine.ts', 'src/ledger.ts', 'src/tickets.ts', 'src/tools-edit.ts', 'src/history.ts', 'src/tools-files.ts', 'src/tools-read.ts', 'src/facts.ts', 'src/trace-facts.ts', 'src/decls.ts', 'src/linkgraph.ts', 'src/tools-trace.ts', 'src/edit-audit.ts', 'src/tools-cards.ts', 'src/cards.ts', 'src/distill.ts', 'src/ast-worker.ts', 'src/ast-pool.ts', 'src/indexer-client.ts', 'src/config.ts', 'src/registration.ts', 'src/guidance.ts', 'src/trace-capabilities.ts', 'src/source-evidence.ts', 'src/trace-snapshot.ts', 'src/trace-rows.ts', 'src/trace-capture.ts', 'src/bridge-check.ts', 'src/bridge-scan.ts', 'src/tools-check.ts', 'src/check-host.ts', 'src/check-plan.ts', 'src/verification.ts', 'src/tap.ts', 'src/types-check.ts'],
   outdir: 'lib',
   bundle: true,
   splitting: true,
