@@ -54,3 +54,16 @@ __pycache__/
 
 # Local validation evidence; excluded from Trace's workspace source walk.
 /.dsh/validation/
+
+# Run logs and result dumps from that same local chain. The suites read the
+# validation subtree above; these are output only.
+/.dsh/*.log
+/.dsh/*.json
+
+# One-off probe kept while measuring sidecar latency. Same rule as
+# /.tmp-analysis/: it sits inside the indexed tree, so never commit it.
+/.probe-sidecar.mjs
+
+# Design-context notes written by the assistant's UI tooling. Reusable content
+# belongs in docs/, not in this file.
+/.impeccable.md
