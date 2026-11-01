@@ -47,7 +47,7 @@ import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
 import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
 import { applicabilityOf, listRecords, readRevision } from './verification.ts'
 import { detectLanguage, enclosingSymbol, findSymbol, normalizeText, parseFile, symbolSpan, syntaxValid } from './ast.ts'
-import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
+import { AUDIT_REASONS, AUDIT_STATUSES, auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { runStaticCheck, type CheckSelector } from './check-static.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
 
@@ -480,11 +480,11 @@ export function createEditTool(pool: FinderPool) {
             type: 'object',
             additionalProperties: false,
             properties: {
-              status: { type: 'string', required: true, enum: ['partial', 'not_run', 'stale'] },
+              status: { type: 'string', required: true, enum: AUDIT_STATUSES },
               reason: {
                 type: 'string',
                 required: true,
-                enum: ['legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale'],
+                enum: AUDIT_REASONS,
               },
               detail: { type: 'string' },
               verdict: { type: 'string' },

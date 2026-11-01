@@ -23,10 +23,11 @@
  *      "checked, nothing found" cannot collapse into one another. Only found
  *      findings need prose; the no-findings branches get one short line.
  *
- * This is still a *heuristic* channel: it asks whether a removed identifier
- * still appears in other files. That is why a completed run is `partial`
- * (`legacy_heuristic`), never `passed` — M1.2's AST diff is what may later earn
- * a stronger status.
+ * The AST diff (`ast_diff`) is the primary channel: it resolves the exposed
+ * surface, the members this batch stopped providing, and the consumer sites
+ * that still reference them. It is still `partial`, because static references
+ * are not proof that a call runs or fails. The older text-name search survives
+ * as `legacy_heuristic`, used only where a diff has nothing to compare.
  *
  * @module dsh-forge/edit-audit
  */
@@ -44,12 +45,19 @@ import type { TraceGraph } from './linkgraph.ts'
 import type { EditStep } from './edit-engine.ts'
 
 /** Result status, shared vocabulary with the C2 check contract. The audit has
- *  no `passed`: a text heuristic cannot prove the absence of a broken call. */
-export type AuditStatus = 'partial' | 'not_run' | 'stale'
+ *  no `passed`: a text heuristic cannot prove the absence of a broken call.
+ *
+ *  Exported as a value because the tool output schemas enumerate it: the host
+ *  rejects a reply whose status is outside the declared enum, so the two must
+ *  read from one list. */
+export const AUDIT_STATUSES = ['partial', 'not_run', 'stale'] as const
+export type AuditStatus = (typeof AUDIT_STATUSES)[number]
 
 /** Why the audit ended where it did. Values follow docs/forge-plan-m0-m1.md
- *  M0.2; `detail` carries the specific sub-case a reader needs. */
-export type AuditReason = 'ast_diff' | 'legacy_heuristic' | 'no_baseline' | 'not_applicable' | 'audit_error' | 'stale'
+ *  M0.2; `detail` carries the specific sub-case a reader needs. Also a runtime
+ *  list, for the same reason as {@link AUDIT_STATUSES}. */
+export const AUDIT_REASONS = ['ast_diff', 'legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale'] as const
+export type AuditReason = (typeof AUDIT_REASONS)[number]
 
 export interface AuditCoverage {
   /** Files whose post-write content this audit was asked about. */

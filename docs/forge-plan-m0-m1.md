@@ -54,6 +54,7 @@
 
 1. 将 `auditEdit()` 改为总是返回结构化审计结果；保留 findings 的展示，但增加 C2 状态、reason、coverage、基线身份。
 2. 当前名称出现检查仍只能生成 `partial/legacy_heuristic`；找不到缓存返回 `not_run/no_baseline`，不适用返回 `not_run/not_applicable`，异常返回 `partial/audit_error` 或尚未开始时 `not_run/audit_error`。
+   - M1.2 落地后：AST diff 决定时返回 `partial/ast_diff`，`legacy_heuristic` 只作无 AST 比较的回退。输出 schema 的 `status`/`reason` 枚举由 `AUDIT_STATUSES`/`AUDIT_REASONS` 单一来源生成——宿主按 schema 校验值，手抄列表与模块不一致会把整条回复换成 `returned invalid output`，写入已落盘却对调用方不可见。
 3. 删除“调用现在一定失败”式结论；即时输出用“静态可见消费者仍引用已移除成员，需复查”。无发现可以短渲染，但结构化结果必须可区别未检查。
 4. 更新输出 schema/render，禁止通过异常 catch 静默抹掉状态；审计失败不改变已经完成的写入结果。
 

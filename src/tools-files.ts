@@ -4,7 +4,7 @@ import path from 'node:path'
 import { canonicalTarget, canonicalWorkspace, within } from './fs-paths.ts'
 import { observedRead, parseLineRange, type ForgeExec, workdirOf, withFileLock, withFileLocks, withNativeWrite } from './core.ts'
 import { commitFiles, detectEncoding, encodeText, prepareWorkspace, putBlob, readKnownState, recordExternalState, storeFor, type FileChange, type LedgerNode } from './ledger.ts'
-import { auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
+import { AUDIT_REASONS, AUDIT_STATUSES, auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
 import { findSymbol, parseFile, normalizeText, symbolSpan, syntaxValid, detectLanguage } from './ast.ts'
 import { applyEditSteps } from './edit-engine.ts'
@@ -158,8 +158,8 @@ export function createFileTool() {
         type: 'object',
         additionalProperties: false,
         properties: {
-          status: { type: 'string', required: true, enum: ['partial', 'not_run', 'stale'] },
-          reason: { type: 'string', required: true, enum: ['legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale'] },
+          status: { type: 'string', required: true, enum: AUDIT_STATUSES },
+          reason: { type: 'string', required: true, enum: AUDIT_REASONS },
           detail: { type: 'string' },
           verdict: { type: 'string' },
           coverage: { type: 'object', additionalProperties: true },

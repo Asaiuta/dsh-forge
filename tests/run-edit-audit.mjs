@@ -558,5 +558,24 @@ const assertNoFalsePass = (audit, label) => {
   } finally { ws.close() }
 }
 
+// The host validates a tool's value against the schema the tool declares, so a
+// reason the schema never learned does not degrade the reply — it replaces it
+// with "returned invalid output", and the caller cannot even see that the write
+// landed. The declared enum is therefore part of the audit contract, not
+// documentation of it: every value the module can emit has to be in it.
+{
+  const expectedReasons = ['ast_diff', 'legacy_heuristic', 'no_baseline', 'not_applicable', 'audit_error', 'stale']
+  const expectedStatuses = ['partial', 'not_run', 'stale']
+  const { AUDIT_REASONS, AUDIT_STATUSES } = await import('../lib/edit-audit.js')
+  assert.deepEqual([...AUDIT_REASONS].sort(), expectedReasons.sort(), 'the runtime reason set is the contract')
+  assert.deepEqual([...AUDIT_STATUSES].sort(), expectedStatuses.sort(), 'the runtime status set is the contract')
+  for (const [name, tool] of [['ff_edit', createEditTool({ peekMain: () => undefined })], ['ff_file', createFileTool()]]) {
+    const audit = tool.output.schema.properties.audit
+    assert.deepEqual([...audit.properties.reason.enum].sort(), [...AUDIT_REASONS].sort(), `${name} declares every reason it can emit`)
+    assert.deepEqual([...audit.properties.status.enum].sort(), [...AUDIT_STATUSES].sort(), `${name} declares every status it can emit`)
+  }
+  ok('the declared audit enums cover every value the audit can emit')
+}
+
 console.log(`\n${passed} post-edit audit groups passed`)
 try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmpdir cleanup fallback */ }
