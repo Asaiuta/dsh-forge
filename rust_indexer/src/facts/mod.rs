@@ -6,16 +6,51 @@
 //! Line contract: 1-based rows on BOM-stripped, LF-normalized text. String
 //! truncation counts UTF-16 code units, matching JavaScript `slice`.
 
+mod bridge;
 mod ffi;
 mod java;
 mod js;
 mod modules;
 mod native;
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tree_sitter::{Language, Node};
+
+/// A fact coordinate (`FactSpan` in src/facts.ts): 1-based rows, byte columns.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct Pos { pub line: u64, pub column: usize }
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct Span { pub start: Pos, pub end: Pos }
+
+pub(crate) fn span_of(node: Node, src: &[u8], ascii: bool) -> Span {
+    let (start, end) = (node.start_position(), node.end_position());
+    let column = |byte: usize, offset: usize| if ascii { offset } else { column_utf16(src, byte, offset) };
+    Span {
+        start: Pos { line: start.row as u64 + 1, column: column(node.start_byte(), start.column) },
+        end: Pos { line: end.row as u64 + 1, column: column(node.end_byte(), end.column) },
+    }
+}
+
+/// Web-tree-sitter reports `startPosition.column` in UTF-16 code units (the
+/// engine is fed a UTF-16 string); tree-sitter reports bytes. Span columns are
+/// recipe-visible — `spanKey` is the alias identity — so both paths must count
+/// the same way.
+///
+/// `Point.column` is already the byte offset inside the line, so the line start
+/// is `byte - column`. Scanning back to a newline instead would re-read a whole
+/// minified line per node: 45 GB of scans on one 654 KB bundle.
+pub(crate) fn column_utf16(src: &[u8], byte: usize, column: usize) -> usize {
+    let byte = byte.min(src.len());
+    let start = byte.saturating_sub(column);
+    match std::str::from_utf8(&src[start..byte]) {
+        Ok(prefix) => prefix.encode_utf16().count(),
+        Err(_) => column,
+    }
+}
 
 /// Languages whose Trace facts this module produces.
 pub fn supports_module_facts(lang: &str) -> bool {

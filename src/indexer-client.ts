@@ -149,7 +149,7 @@ function request(method: string, params: Record<string, unknown> = {}, options: 
       options.signal?.removeEventListener('abort', abort)
       pending.delete(id)
       if (cause !== undefined) reject(cause)
-      else resolve(value)
+      else resolve(replyTransform === null ? value : replyTransform(method, value))
     }
     const abort = () => finish(options.signal?.reason ?? new Error('indexer request aborted'))
     const timer = setTimeout(() => finish(new Error('indexer request timed out')), timeoutMs)
@@ -179,6 +179,18 @@ function request(method: string, params: Record<string, unknown> = {}, options: 
  * clean machine. Installing a transport is therefore the only way to pin it.
  */
 let transport: ((method: string, params: Record<string, unknown>) => Promise<unknown>) | null = null
+
+/** Test hook: rewrite a reply before any caller sees it, to model an older
+ *  binary's protocol. Runs on the real transport, unlike {@link transport}. */
+let replyTransform: ((method: string, reply: unknown) => unknown) | null = null
+
+/** Test hook: install or clear {@link replyTransform}. */
+export function setIndexerReplyTransformForTest(
+  fn: ((method: string, reply: unknown) => unknown) | null,
+): void {
+  replyTransform = fn
+  readyPromise = null
+}
 
 /** Test hook: answer protocol calls in-process instead of over stdio. */
 export function setIndexerTransportForTest(
@@ -367,10 +379,32 @@ export async function indexerTraceFacts(paths: string[], signal?: AbortSignal): 
     const results = reply.results
     if (!Array.isArray(results) || results.length !== files.length) return out
     results.forEach((item: Partial<TraceFileOutcome> & { error?: string }, offset) => {
-      if (item && !item.error && item.value && item.parseErrors === 0) out[start + offset] = item as TraceFileOutcome
+      if (item && !item.error && item.value && item.parseErrors === 0) {
+        restoreOwnerKeys(item.value)
+        out[start + offset] = item as TraceFileOutcome
+      }
     })
   }
   return out
+}
+
+/** Fact arrays whose `symbol` is an owner that may be absent. */
+const OWNER_ARRAYS = ['bridge', 'ipc', 'globalsDefined', 'globalsUsed', 'namedEntries', 'deferredCalls'] as const
+
+/**
+ * Rust omits an absent `symbol` (`skip_serializing_if`); the WASM extractor
+ * writes the key with an `undefined` value. The two are equal as JSON but not as
+ * live objects, and callers compare graphs object-to-object. Restoring the key
+ * is one `in` check per fact — 15 k checks on the largest bundle.
+ */
+function restoreOwnerKeys(value: object): void {
+  for (const field of OWNER_ARRAYS) {
+    const list = (value as Record<string, unknown>)[field]
+    if (!Array.isArray(list)) continue
+    for (const entry of list as Array<Record<string, unknown>>) {
+      if (entry && typeof entry === 'object' && !('symbol' in entry)) entry.symbol = undefined
+    }
+  }
 }
 
 /** One identity stamp per path, the same three fields `fs.statSync` reports.
@@ -481,6 +515,41 @@ export async function indexerCollectCandidates(
   if (!files || !projectFiles || !pythonFiles || !cargoFiles || !goFiles) return null
   if (typeof reply.truncated !== 'boolean' || typeof reply.walkErrors !== 'number') return null
   return { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated: reply.truncated, walkErrors: reply.walkErrors }
+}
+
+/** Native search is enabled by default and can be disabled independently. */
+export function indexerSearchWanted(): boolean {
+  const raw = process.env.DSH_FORGE_SEARCH_NATIVE?.trim().toLowerCase()
+  return raw !== '0' && raw !== 'false' && raw !== 'off'
+}
+
+export async function indexerGlobSearch(root: string, cwd: string, pattern: string, options: RequestOptions = {}): Promise<string[] | null> {
+  if (!indexerSearchWanted()) return null
+  try {
+    const reply = await request('globSearch', { root, cwd, pattern }, options) as { paths?: unknown; complete?: unknown }
+    return reply.complete === true && Array.isArray(reply.paths) && reply.paths.every(path => typeof path === 'string') ? reply.paths as string[] : null
+  } catch {
+    options.signal?.throwIfAborted()
+    return null
+  }
+}
+
+export interface NativeGrepMatch { path: string; lineNumber: number; line: string }
+
+export async function indexerGrepSearch(root: string, cwd: string, pattern: string, include?: string, options: RequestOptions = {}): Promise<NativeGrepMatch[] | null> {
+  if (!indexerSearchWanted()) return null
+  try {
+    const reply = await request('grepSearch', { root, cwd, pattern, ...(include === undefined ? {} : { include }) }, options) as { matches?: unknown; complete?: unknown }
+    if (reply.complete !== true || !Array.isArray(reply.matches)) return null
+    if (!reply.matches.every(item => item && typeof item === 'object'
+      && typeof (item as Record<string, unknown>).path === 'string'
+      && typeof (item as Record<string, unknown>).lineNumber === 'number'
+      && typeof (item as Record<string, unknown>).line === 'string')) return null
+    return reply.matches as NativeGrepMatch[]
+  } catch {
+    options.signal?.throwIfAborted()
+    return null
+  }
 }
 
 /** Inline script facts through the sidecar (partial parses included, as for

@@ -8,6 +8,9 @@ license = "MIT"
 
 # Grammar versions pin the tree-sitter ABI (15): upgrade core + grammars together.
 [dependencies]
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = { version = "0.1", features = ["simd-accel"] }
 ignore = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

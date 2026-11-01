@@ -22,6 +22,7 @@ mod collect;
 mod facts;
 mod find;
 mod lang;
+mod search;
 mod symbol;
 
 use collect::Collector;
@@ -855,6 +856,25 @@ fn main() {
                     "goFiles": walked.go, "truncated": walked.truncated,
                     "walkErrors": walked.walk_errors
                 })
+            }
+            "globSearch" => {
+                let root = req.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let pattern = req.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                match search::glob(root, cwd, pattern) {
+                    Ok(paths) => serde_json::json!({ "id": id, "ok": true, "complete": true, "paths": paths }),
+                    Err(error) => serde_json::json!({ "id": id, "ok": false, "error": error }),
+                }
+            }
+            "grepSearch" => {
+                let root = req.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let pattern = req.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                let include = req.get("include").and_then(|v| v.as_str());
+                match search::grep(root, cwd, pattern, include) {
+                    Ok(matches) => serde_json::json!({ "id": id, "ok": true, "complete": true, "matches": matches }),
+                    Err(error) => serde_json::json!({ "id": id, "ok": false, "error": error }),
+                }
             }
             "ping" => serde_json::json!({ "id": id, "ok": true }),
             "resetCache" => {

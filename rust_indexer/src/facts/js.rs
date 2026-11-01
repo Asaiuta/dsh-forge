@@ -7,7 +7,8 @@
 //! The TS walk runs over a node view whose `children` are the named children,
 //! except for leaf-like kinds (TERMINAL) that report none; `kids` mirrors that.
 
-use super::{children as named, field, is_js_space, line, nodes, slice_utf16, text};
+use super::bridge::{BridgeScopes, Receiver};
+use super::{children as named, field, is_js_space, line, nodes, slice_utf16, span_of, text, Span};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -82,22 +83,57 @@ struct Ipc {
     expr: Option<String>,
     via: &'static str,
     line: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol: Option<String>,
-}
-
-#[derive(Serialize)]
-struct Bridge {
-    object: String,
-    name: String,
-    line: u64,
+    span: Span,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Alias { name: String, object: String, line: u64, top_level: bool }
+struct Bridge {
+    object: String,
+    name: String,
+    line: u64,
+    span: Span,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver: Option<ReceiverOut>,
+}
+
+/// `BridgeReceiver` in src/facts.ts.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceiverOut {
+    object: String,
+    via_alias: bool,
+    uncertain: bool,
+    local: bool,
+    qualified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding: Option<String>,
+}
+
+impl From<Receiver> for ReceiverOut {
+    fn from(value: Receiver) -> Self {
+        ReceiverOut { object: value.object, via_alias: value.via_alias, uncertain: value.uncertain,
+            local: value.local, qualified: value.qualified, binding: value.binding }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Alias {
+    name: String,
+    object: String,
+    line: u64,
+    top_level: bool,
+    binding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reassigned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncertain: Option<bool>,
+}
 
 #[derive(Serialize)]
 struct GlobalDef {
@@ -112,6 +148,7 @@ struct GlobalDef {
 struct GlobalUse {
     name: String,
     line: u64,
+    span: Span,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol: Option<String>,
 }
@@ -122,6 +159,7 @@ struct Expose {
     name: String,
     keys: Vec<String>,
     line: u64,
+    span: Span,
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,9 +254,12 @@ impl<V> OrderedMap<V> {
 }
 
 /// Extract facts; `None` means the tree is too deep for the native walk.
-pub fn js_facts(root: Node, src: &[u8]) -> Option<FileFacts> {
+pub fn js_facts<'t>(root: Node<'t>, src: &'t [u8]) -> Option<FileFacts> {
+    // Built once, before the fact walk: every bridge site resolves its receiver
+    // against these scopes, and the WASM path's supplement step becomes a no-op.
+    let bridge = BridgeScopes::new(root, src);
     let mut c = Collector {
-        src, out: FileFacts::default(), has_ipc: false, consts: OrderedMap::default(), const_shapes: HashMap::new(),
+        src, bridge, out: FileFacts::default(), has_ipc: false, consts: OrderedMap::default(), const_shapes: HashMap::new(),
         wrappers: OrderedMap::default(), wrapper_methods: HashMap::new(), bindings: OrderedMap::default(), local_exports: Vec::new(),
         param_calls: Vec::new(), wrapper_call_sites: HashMap::new(), used_seen: HashSet::new(), too_deep: false,
     };
@@ -229,6 +270,7 @@ pub fn js_facts(root: Node, src: &[u8]) -> Option<FileFacts> {
 
 struct Collector<'a> {
     src: &'a [u8],
+    bridge: BridgeScopes<'a>,
     out: FileFacts,
     has_ipc: bool,
     consts: OrderedMap<String>,
@@ -321,27 +363,9 @@ fn starts_with_word(t: &str, word: &str) -> bool {
     t.trim_start_matches(is_js_space).strip_prefix(word).is_some_and(|rest| !rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
-/// `/(?:window|globalThis)\.([A-Za-z_$][\w$]*)/` — first match anywhere.
-fn first_global_member(t: &str) -> Option<String> {
-    let mut best: Option<(usize, String)> = None;
-    for prefix in ["window.", "globalThis."] {
-        let mut from = 0;
-        while let Some(found) = t[from..].find(prefix) {
-            let at = from + found;
-            if best.as_ref().is_some_and(|(b, _)| *b <= at) { break; }
-            let rest = &t[at + prefix.len()..];
-            if rest.chars().next().is_some_and(ident_start) {
-                best = Some((at, rest.chars().take_while(|c| ident_char(*c)).collect()));
-                break;
-            }
-            from = at + 1;
-        }
-    }
-    best.map(|(_, name)| name)
-}
-
 impl<'a> Collector<'a> {
     fn t(&self, node: Node) -> &'a str { text(node, self.src) }
+
 
     /// Value of a string-literal-ish node.
     fn literal(&self, node: Option<Node>) -> Option<String> {
@@ -609,22 +633,20 @@ impl<'a> Collector<'a> {
         }
     }
 
-    fn record_bridge_alias(&mut self, name: String, value: Node, ln: u64, top_level: bool) {
-        // The kind gate comes first: scanning every declarator's full value text
-        // (nested function bodies in bundles) would be quadratic.
-        let aliasable = matches!(value.kind(), "binary_expression" | "member_expression" | "await_expression" | "parenthesized_expression" | "identifier");
-        let object = if aliasable { first_global_member(self.t(value)) } else { None };
-        if let Some(object) = object {
-            if self.out.bridge_aliases.iter().any(|a| a.name == name && a.line == ln && a.object == object) { return; }
-            self.out.bridge_aliases.push(Alias { name, object, line: ln, top_level });
-        } else if value.kind() == "identifier" {
-            let source = self.t(value);
-            let inherited = self.out.bridge_aliases.iter().find(|a| a.name == source && a.line != ln).map(|a| a.object.clone());
-            if let Some(inherited) = inherited {
-                if self.out.bridge_aliases.iter().any(|a| a.name == name && a.line == ln && a.object == inherited) { return; }
-                self.out.bridge_aliases.push(Alias { name, object: inherited, line: ln, top_level });
-                return;
+    fn record_bridge_alias(&mut self, name: String, value: Node, _ln: u64, _top_level: bool) {
+        if let Some(alias) = self.bridge.alias(&name, value) {
+            // One alias per declaration: the binding is the declaration's span.
+            if !self.out.bridge_aliases.iter().any(|existing| existing.binding == alias.binding) {
+                self.out.bridge_aliases.push(Alias {
+                    name: alias.name, object: alias.object, line: alias.line, top_level: alias.top_level,
+                    binding: alias.binding,
+                    reassigned: alias.reassigned.then_some(true),
+                    uncertain: alias.uncertain.then_some(true),
+                });
             }
+        }
+        if value.kind() == "identifier" {
+            let source = self.t(value);
             if let Some(shape) = self.const_shapes.get(source).cloned() { self.const_shapes.insert(name, shape); }
         }
     }
@@ -780,7 +802,7 @@ impl<'a> Collector<'a> {
         // newer grammars have meta_property. Keep the WASM fact (never a bridge
         // global downstream, but byte parity keeps the two paths interchangeable).
         if node.kind() == "meta_property" && self.t(node) == "import.meta" {
-            self.out.bridge.push(Bridge { object: "import".into(), name: "meta".into(), line: ln, symbol: ctx.owner.clone() });
+            self.out.bridge.push(Bridge { object: "import".into(), name: "meta".into(), line: ln, span: span_of(node, self.src, self.bridge.ascii()), symbol: ctx.owner.clone(), receiver: Some(ReceiverOut::from(Receiver::plain_local("import".into()))) });
         }
 
         // `name: <wrapper>('channel')` — the preload API key → channel pair.
@@ -813,6 +835,7 @@ impl<'a> Collector<'a> {
                             name,
                             keys: shape.as_ref().map(|s| s.keys.clone()).unwrap_or_default(),
                             line: ln,
+                            span: span_of(node, self.src, self.bridge.ascii()),
                             dynamic: literal.is_none().then_some(true),
                             key_source: known.then(|| if table.is_some_and(|t| t.kind() == "identifier") { "identifier" } else { "literal" }),
                             partial: shape.as_ref().is_some_and(|s| !s.complete).then_some(true),
@@ -863,7 +886,7 @@ impl<'a> Collector<'a> {
             if let Some(name) = self.property_name(node).filter(|n| !n.is_empty()) {
                 let key = format!("{name}:{}", node.start_position().row);
                 if self.used_seen.insert(key) {
-                    self.out.globals_used.push(GlobalUse { name: name.to_string(), line: line(node), symbol: ctx.owner.clone() });
+                    self.out.globals_used.push(GlobalUse { name: name.to_string(), line: line(node), span: span_of(node, self.src, self.bridge.ascii()), symbol: ctx.owner.clone() });
                 }
             }
             return;
@@ -871,7 +894,13 @@ impl<'a> Collector<'a> {
         let base = obj.strip_prefix("window.").or_else(|| obj.strip_prefix("globalThis.")).unwrap_or(obj);
         if !base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
             if let Some(name) = self.property_name(node).filter(|n| !n.is_empty()) {
-                self.out.bridge.push(Bridge { object: base.to_string(), name: name.to_string(), line: line(node), symbol: ctx.owner.clone() });
+                // The receiver is what the WASM path resolves lexically; without
+                // it Trace re-parses this file to recover the binding.
+                let receiver = field(node, "object").map(|object| ReceiverOut::from(self.bridge.receiver(object)));
+                self.out.bridge.push(Bridge {
+                    object: base.to_string(), name: name.to_string(), line: line(node), span: span_of(node, self.src, self.bridge.ascii()),
+                    symbol: ctx.owner.clone(), receiver,
+                });
             }
         }
     }
@@ -885,7 +914,7 @@ impl<'a> Collector<'a> {
             if let Some(def) = self.wrappers.get(name).copied() {
                 if let Some((channel, _)) = self.resolve_channel(args_of(node).first().copied()) {
                     *self.wrapper_call_sites.entry(name.to_string()).or_insert(0) += 1;
-                    self.out.ipc.push(Ipc { side: def.side, method: self.wrapper_methods[name].clone(), channel: Some(channel), expr: None, via: "wrapper", line: ln, symbol: ctx.owner.clone() });
+                    self.out.ipc.push(Ipc { side: def.side, method: self.wrapper_methods[name].clone(), channel: Some(channel), expr: None, via: "wrapper", line: ln, span: span_of(node, self.src, self.bridge.ascii()), symbol: ctx.owner.clone() });
                 }
                 return;
             }
@@ -905,7 +934,7 @@ impl<'a> Collector<'a> {
             channel: resolved.as_ref().map(|(v, _)| v.clone()),
             expr: None,
             via: resolved.as_ref().map_or("dynamic", |(_, via)| via),
-            line: ln, symbol: ctx.owner.clone(),
+            line: ln, span: span_of(node, self.src, self.bridge.ascii()), symbol: ctx.owner.clone(),
         };
         if resolved.is_none() {
             fact.expr = Some(args.first().map_or_else(|| "…".to_string(), |a| truncate(self.t(*a))));
