@@ -10,7 +10,6 @@ import assert from 'node:assert/strict'
 import { writeFileSync, rmSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
-import { createGrepTool } from '../lib/tools.js'
 import { createReadTool } from '../lib/tools-read.js'
 import { outlineView, definitionsView } from './lib/read-views.mjs'
 import { symbolReader } from './lib/symbol-read.mjs'
@@ -23,7 +22,6 @@ const exec = { agent: { session: { header: { cwd: FIXTURE_DIR } } } }
 const outline = outlineView(createReadTool())
 const findSymbolTool = definitionsView(createReadTool())
 const readSymbol = symbolReader(createReadTool)
-const grep = createGrepTool(pool)
 
 let floors = 0
 function floor(label, detail) {
@@ -185,35 +183,20 @@ async function main() {
   // Floor 6: degradation and filters.
   {
     const md = await outline.execute({ path: 'docs/guide.md' }, exec)
-    assert.match(md.error, /ffgrep/)
+    assert.match(md.error, /ff_grep/)
     const missing = await readSymbol.execute({ path: 'src/store.js', symbol: 'definitelyNotHere' }, exec)
     assert.match(missing.error, /not found/)
     const kindFiltered = await findSymbolTool.execute({ name: 'Blob', kind: 'method' }, exec)
     assert.ok(!kindFiltered.error && kindFiltered.items.length > 0)
     assert.ok(kindFiltered.items.every((i) => i.kind === 'method'))
-    floor('degrade-and-filter', 'unsupported ext → ffgrep pointer; missing symbol → clean error; kind filter exact')
+    floor('degrade-and-filter', 'unsupported ext → ff_grep pointer; missing symbol → clean error; kind filter exact')
   }
 
-  // Floor 7: weld correctness — annotations carry enclosing ranges that
-  // contain the hit, and the fixture ground truth matches exactly.
-  {
-    const r = await grep.execute({ pattern: 'putBlob', enclosing: true }, exec)
-    assert.ok(!r.error)
-    assert.ok(r.items.length >= 3, 'definition + call site + prose present')
-    let annotated = 0
-    for (const item of r.items) {
-      if (!item.in) continue
-      annotated++
-      assert.ok(item.in.startLine <= item.line && item.line <= item.in.endLine,
-        `${item.file}:${item.line} inside ${item.in.name}`)
-    }
-    assert.ok(annotated >= 2, `weld annotated ≥2 hits, got ${annotated}`)
-    const storeHit = r.items.find((i) => i.file === 'src/store.js' && i.line === 7)
-    assert.equal(storeHit.in.name, 'Store.putBlob')
-    const loginHit = r.items.find((i) => i.file === 'src/login.js')
-    assert.equal(loginHit.in.name, 'submit')
-    floor('weld-correctness', `${annotated} hits annotated, ground-truth enclosing symbols exact`)
-  }
+  // The former floor 7 (weld correctness) is gone with the specialist surface:
+  // ff_grep no longer attaches enclosing symbols, so `in.startLine` cannot be
+  // checked against anything. The replacement chain — definition lookup, then
+  // `occurrence`, then an exact symbol read — is floored in run-ast.mjs, where
+  // it is measured against the AST itself rather than through a grep annotation.
 
   // Floor 8: determinism.
   {

@@ -73,7 +73,7 @@ function checkFileBeforeEvidence(snapshotId: string, workspace: string, action: 
     const evidence = resolveBeforeEvidence(workspace, snapshotId, file)
     if (evidence.ok) {
       if (action === 'create' && file === source) {
-        throw new Error(`snapshot ${snapshotId} covers ${path.basename(source)}, so this is an overwrite, not a create — use action=create with overwrite=true on an uncaptured path, or ffedit with the snapshot`)
+        throw new Error(`snapshot ${snapshotId} covers ${path.basename(source)}, so this is an overwrite, not a create — use action=create with overwrite=true on an uncaptured path, or ff_edit with the snapshot`)
       }
       continue
     }
@@ -82,28 +82,74 @@ function checkFileBeforeEvidence(snapshotId: string, workspace: string, action: 
   }
 }
 
+/** Offline replay migration only; canonical tools never accept the old keys. */
+export function normalizeLegacyFileArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const { symbol, body, ...canonical } = args
+  if (symbol !== undefined) {
+    if (canonical.sourceSymbol !== undefined) throw new Error('symbol conflicts with sourceSymbol')
+    canonical.sourceSymbol = symbol
+  }
+  if (body !== undefined) {
+    if (typeof body !== 'boolean') throw new Error('body must be boolean')
+    if (canonical.includeLeadingComment !== undefined) throw new Error('body conflicts with includeLeadingComment')
+    canonical.includeLeadingComment = !body
+  }
+  return canonical
+}
+
+const FILE_FIELDS: Record<string, readonly string[]> = {
+  create: ['content', 'overwrite'], remove: [], move: ['destination', 'overwrite'],
+  copy_code: ['destination', 'sourceSymbol', 'includeLeadingComment', 'fromLines', 'after', 'before', 'afterSymbol', 'beforeSymbol', 'indent'],
+  move_code: ['destination', 'sourceSymbol', 'includeLeadingComment', 'fromLines', 'after', 'before', 'afterSymbol', 'beforeSymbol', 'indent'],
+}
+
+function validateFileArgs(args: Record<string, unknown>): void {
+  const action = required(args, 'action')
+  const fields = FILE_FIELDS[action]
+  if (!fields) throw new Error(`unknown file action: ${action}; symbol editing belongs to ff_edit`)
+  const allowed = new Set(['action', 'path', 'reason', 'snapshotId', ...fields])
+  for (const key of Object.keys(args)) {
+    if (!allowed.has(key)) throw new Error(`${key} is not allowed for action=${action}`)
+    if (args[key] === undefined) continue
+    if (['overwrite', 'includeLeadingComment'].includes(key)) {
+      if (typeof args[key] !== 'boolean') throw new Error(`${key} must be boolean`)
+    } else if (['after', 'before'].includes(key)) {
+      if (!Number.isSafeInteger(args[key])) throw new Error(`${key} must be an integer`)
+    } else if (typeof args[key] !== 'string') throw new Error(`${key} must be a string`)
+    else if (key !== 'content' && !String(args[key]).trim()) throw new Error(`${key} must not be empty`)
+  }
+  required(args, 'path'); required(args, 'reason')
+  if (action === 'create' && typeof args.content !== 'string') throw new Error('content is required for create')
+  if (action === 'move' || action.endsWith('_code')) required(args, 'destination')
+  if (action.endsWith('_code')) {
+    if (['sourceSymbol', 'fromLines'].filter(key => args[key] !== undefined).length !== 1) throw new Error('provide exactly one of sourceSymbol or fromLines')
+    if (args.includeLeadingComment !== undefined && args.sourceSymbol === undefined) throw new Error('includeLeadingComment requires sourceSymbol')
+    if (['after', 'before', 'afterSymbol', 'beforeSymbol'].filter(key => args[key] !== undefined).length !== 1) throw new Error('provide exactly one destination anchor')
+    if (args.indent !== undefined && args.indent !== 'auto' && args.indent !== 'none') throw new Error('indent must be auto or none')
+  }
+}
+
+
 export function createFileTool() {
   return {
     name: 'ff_file',
-    description: 'Create/remove/move files, transfer code, or edit one symbol in an atomic batch recoverable with ffrollback. Paths stay inside the workspace; parents must exist. Read before writing. ' +
-      'Transfers need symbol OR fromLines plus exactly one destination anchor. edit_symbol uses an exact symbol span; shared declarations and list-member deletion/move require ffedit.',
+    description: 'Create/remove/move files or transfer exact symbols/line ranges in an atomic recoverable batch. Paths stay inside the workspace; parents must exist. Read before writing. Every action strictly rejects unrelated parameters. Symbol editing belongs to ff_edit.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code', 'edit_symbol'], description: 'Operation; only the fields it needs are used.' },
+      action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code'], description: 'File operation. Unrelated fields are rejected.' },
       path: { type: 'string', required: true, description: 'File path, absolute or workspace-relative; source for move/transfers.' },
       destination: { type: 'string', description: 'Required for move/transfers.' },
-      content: { type: 'string', description: 'Required for create/edit_symbol except delete: literal UTF-8 text.' },
+      content: { type: 'string', description: 'Required for create: literal UTF-8 text.' },
       overwrite: { type: 'boolean', description: 'create/move: allow overwriting the destination. Default false.' },
-      symbol: { type: 'string', description: 'Required for edit_symbol; transfer alternative to fromLines. Unique name from ff_read view=outline.' },
-      body: { type: 'boolean', description: 'Symbol span: drop leading comment, keep signature. Default false.' },
-      fromLines: { type: 'string', description: 'Transfer source range ("L10-20"); alternative to symbol.' },
+      sourceSymbol: { type: 'string', description: 'Transfer source: exact name or qualified name; exclusive with fromLines.' },
+      includeLeadingComment: { type: 'boolean', description: 'Symbol transfer: include the leading comment. Default true; requires sourceSymbol.' },
+      fromLines: { type: 'string', description: 'Transfer source range (L10-20); exclusive with sourceSymbol.' },
       after: { type: 'integer', description: 'Transfer: insert after the original destination line; 0 = file start.' },
       before: { type: 'integer', description: 'Transfer: insert before the original destination line, 1-based.' },
       afterSymbol: { type: 'string', description: 'Transfer: insert after this unique destination symbol.' },
       beforeSymbol: { type: 'string', description: 'Transfer: insert before this unique symbol and its leading comment.' },
       indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfer: auto (default) fits space indentation; none preserves it.' },
-      edit: { type: 'string', enum: ['replace', 'delete', 'insert_before', 'insert_after'], description: 'Required for edit_symbol: operation on the selected span.' },
       reason: { type: 'string', required: true, description: 'Why this change; recorded in history.' },
-      snapshotId: { type: 'string', description: 'Optional: a content-bound baseline from fftrace capture=true. The files this operation reads must be covered with unchanged bytes; a mismatch refuses the batch. A create is expected to be absent from the baseline (a file that does not exist has no before state). Omit for an ordinary operation.' },
+      snapshotId: { type: 'string', description: 'Optional: a content-bound baseline from ff_trace capture=true. The files this operation reads must be covered with unchanged bytes; a mismatch refuses the batch. A create is expected to be absent from the baseline (a file that does not exist has no before state). Omit for an ordinary operation.' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: {
       batch: { type: 'integer', required: true }, files: { type: 'array', items: { type: 'string' }, required: true },
@@ -130,6 +176,7 @@ export function createFileTool() {
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {
+        validateFileArgs(args)
         const workspace = canonicalWorkspace(workdirOf(exec))
         const store = storeFor(workspace), action = required(args, 'action'), reason = required(args, 'reason')
         const requestedSource = path.resolve(workspace, required(args, 'path'))
@@ -147,7 +194,7 @@ export function createFileTool() {
         const committed = await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
           await prepareWorkspace(store, exec)
           exec?.signal?.throwIfAborted()
-          // Checked inside the locks, for the same reason ffedit checks inside
+          // Checked inside the locks, for the same reason ff_edit checks inside
           // its own: the gap between a hash and a write is exactly what a
           // baseline exists to close.
           if (snapshotId !== '') checkFileBeforeEvidence(snapshotId, workspace, action, source, destination)
@@ -173,30 +220,6 @@ export function createFileTool() {
               changes = [{ file: source, before: original, after: null }, { file: destination!, before: previous, after: original }]
               break
             }
-            case 'edit_symbol': {
-              if (!original) throw new Error('source not found')
-              const symbol = required(args, 'symbol'), operation = required(args, 'edit')
-              const parsed = await parseFile(source)
-              if (!parsed.value || parsed.value.partial) throw new Error(parsed.error ?? 'symbol edit requires a syntax-valid original parse')
-              const raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(original)
-              if (raw.includes('\0') || normalizeText(raw) !== parsed.value.text) throw new Error('source changed during symbol planning or is binary')
-              const matches = findSymbol(parsed.value.symbols, symbol, true)
-              if (matches.length !== 1) throw new Error(`symbol must be unique (${matches.length} matches); use a qualified name`)
-              if (matches[0].sharedDeclaration) throw new Error('symbol shares a declaration with other names; use ffedit with an explicit target for the whole declaration')
-              if (operation === 'delete' && matches[0].listMember) throw new Error('symbol is a list member requiring separator handling; use ffedit with an explicit target including its separator')
-              if (operation !== 'delete' && typeof args.content !== 'string') throw new Error('content is required for symbol edit')
-              const span = symbolSpan(parsed.value, matches[0], args.body === true)
-              const content = operation === 'delete' ? '' : typeof args.content === 'string' ? normalizeText(args.content) : ''
-              const text = parsed.value.text
-              const result = operation === 'replace' || operation === 'delete' ? text.slice(0, span.start) + content + text.slice(span.end)
-                : operation === 'insert_before' ? text.slice(0, span.start) + content + text.slice(span.start)
-                : operation === 'insert_after' ? text.slice(0, span.end) + content + text.slice(span.end)
-                : undefined
-              if (result === undefined) throw new Error('invalid symbol edit operation')
-              if (!await syntaxValid(result, parsed.value.lang)) throw new Error('symbol edit would produce invalid syntax; use ffedit with an explicit target for the containing declaration')
-              changes = [{ file: source, before: original, after: Buffer.from(encodeText(result, detectEncoding(raw))) }]
-              break
-            }
             case 'copy_code':
             case 'move_code': {
               if (!original) throw new Error('source not found')
@@ -207,7 +230,7 @@ export function createFileTool() {
               let span: { start: number; end: number }
               let sourceLang: ReturnType<typeof detectLanguage> = null
               if (args.fromLines !== undefined) {
-                if (args.symbol !== undefined) throw new Error('provide either symbol or fromLines, not both')
+                if (args.sourceSymbol !== undefined) throw new Error('provide either sourceSymbol or fromLines, not both')
                 const range = parseLineRange(String(args.fromLines))
                 if (!range) throw new Error(`fromLines must look like "L10-20" or "L10", got: ${args.fromLines}`)
                 if (range.end > sourceLines.length) throw new Error(`fromLines L${range.start}-${range.end} is past EOF (${sourceLines.length} lines)`)
@@ -217,15 +240,15 @@ export function createFileTool() {
                 }
                 sourceLang = detectLanguage(source)
               } else {
-                const symbol = required(args, 'symbol')
+                const symbol = required(args, 'sourceSymbol')
                 const parsed = await parseFile(source)
                 if (!parsed.value || parsed.value.partial) throw new Error(parsed.error ?? 'code transfer requires a syntax-valid original parse')
                 if (sourceTextNormalized !== parsed.value.text) throw new Error('source changed during symbol planning; retry')
-                const matches = findSymbol(parsed.value.symbols, symbol, false)
+                const matches = findSymbol(parsed.value.symbols, symbol, true)
                 if (matches.length !== 1) throw new Error(`source symbol must be unique (${matches.length} matches); use a qualified name`)
-                if (matches[0].sharedDeclaration) throw new Error('symbol shares a declaration with other names; use ffedit with an explicit target for the whole declaration')
-                if (action === 'move_code' && matches[0].listMember) throw new Error('symbol is a list member requiring separator handling; use ffedit with an explicit target including its separator')
-                span = symbolSpan(parsed.value, matches[0], args.body === true)
+                if (matches[0].sharedDeclaration) throw new Error('symbol shares a declaration with other names; use ff_edit with an explicit target for the whole declaration')
+                if (action === 'move_code' && matches[0].listMember) throw new Error('symbol is a list member requiring separator handling; use ff_edit with an explicit target including its separator')
+                span = symbolSpan(parsed.value, matches[0], args.includeLeadingComment === false)
                 sourceLang = parsed.value.lang
               }
               const lineStart = sourceTextNormalized.lastIndexOf('\n', span.start - 1) + 1
@@ -251,13 +274,21 @@ export function createFileTool() {
                 const parsedDst = await parseFile(destination!)
                 if (!parsedDst.value || parsedDst.value.partial) throw new Error(parsedDst.error ?? 'symbol anchor requires a syntax-valid destination parse')
                 const query = String(args.afterSymbol ?? args.beforeSymbol)
-                const matches = findSymbol(parsedDst.value.symbols, query, false)
+                const matches = findSymbol(parsedDst.value.symbols, query, true)
                 if (matches.length === 0) throw new Error(`anchor symbol "${query}" not found in destination`)
                 if (matches.length > 1) {
                   throw new Error(`anchor symbol "${query}" is ambiguous in destination (${matches.length} definitions): ` +
                     matches.slice(0, 5).map((m) => `${m.qualifiedName} L${m.startLine}`).join(', ') + ' — use a qualified name or after=<line>')
                 }
                 const sym = matches[0]
+                if (parsedDst.value.text !== normalized) throw new Error('destination changed during symbol anchor planning; retry')
+                const anchorSpan = symbolSpan(parsedDst.value, sym)
+                const anchorLineStart = normalized.lastIndexOf('\n', anchorSpan.start - 1) + 1
+                const newlineAfterAnchor = normalized.indexOf('\n', anchorSpan.end)
+                const anchorLineEnd = newlineAfterAnchor < 0 ? normalized.length : newlineAfterAnchor
+                if (normalized.slice(anchorLineStart, anchorSpan.start).trim() || normalized.slice(anchorSpan.end, anchorLineEnd).trim()) {
+                  throw new Error(`inline symbol anchor ${sym.qualifiedName} cannot be represented by a whole-line insertion; use ff_edit with an exact symbol span`)
+                }
                 if (args.beforeSymbol !== undefined) {
                   afterLine = (sym.commentStartLine ?? sym.startLine) - 1
                   anchorNotes.push(`insert before ${sym.qualifiedName} at L${afterLine + 1} (incl. its leading comment)`)

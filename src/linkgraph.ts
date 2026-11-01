@@ -253,11 +253,11 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
   const edgeSeen = new Set<string>()
   let resolutionLimited = false
   const resolveSource = sourceResolver({ entries, isFile, includeResolver, ...projects, onLimit: () => { resolutionLimited = true } })
-  const virtual = new Map<string, string[]>()
+  const virtual = new Map<string, Set<string>>()
   for (const [file, entry] of entries) for (const module of scriptFacts(entry)?.ambientModules ?? []) {
-    const files = virtual.get(module.name) ?? []
-    if (!files.includes(file)) files.push(file)
-    virtual.set(module.name, files)
+    let files = virtual.get(module.name)
+    if (!files) virtual.set(module.name, files = new Set())
+    files.add(file)
   }
   for (const [rel, f] of entries) {
     if (f.kind === 'source') {
@@ -293,12 +293,23 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
     // without a line (an older build). Match by line when the data supports it
     // and fall back to the module-wide set otherwise: showing names at module
     // granularity is the old behaviour, showing none would be a regression.
-    const bindings = scriptFacts(f)?.bindings ?? []
+    const bindings = new Map<string, { all: string[]; byLine: Map<number, string[]>; hasLines: boolean }>()
+    for (const binding of scriptFacts(f)?.bindings ?? []) {
+      let group = bindings.get(binding.spec)
+      if (!group) bindings.set(binding.spec, group = { all: [], byLine: new Map(), hasLines: false })
+      const name = binding.imported ?? '*' + binding.local
+      group.all.push(name)
+      if (binding.line !== undefined) {
+        group.hasLines = true
+        const names = group.byLine.get(binding.line) ?? []
+        names.push(name)
+        group.byLine.set(binding.line, names)
+      }
+    }
     const importedNames = (spec: string, line: number): string[] | undefined => {
-      const sameSpec = bindings.filter(binding => binding.spec === spec)
-      const onLine = sameSpec.filter(binding => binding.line === line)
-      const names = (onLine.length ? onLine : sameSpec.some(binding => binding.line !== undefined) ? [] : sameSpec)
-        .map(binding => binding.imported ?? '*' + binding.local)
+      const group = bindings.get(spec)
+      if (!group) return undefined
+      const names = group.byLine.get(line) ?? (group.hasLines ? [] : group.all)
       return names.length ? [...new Set(names)] : undefined
     }
     for (const { mode, ref, syntax } of jsReferences(f)) {
@@ -310,7 +321,7 @@ function buildModuleGraph({ entries, isFile, normalizeTarget, jsResolver }: Buil
       // interpreted as a file path merely because a matching file exists.
       const declared = virtual.get(ref.spec)
       const resolution = ref.unresolved ? { status: 'unresolved' as const, reason: 'non_literal' as const }
-        : declared ? declared.length === 1 ? { status: 'resolved' as const, targets: [{ to: declared[0], evidence: { confidence: 'candidate' as const, basis: 'ambient_module' } }] }
+        : declared ? declared.size === 1 ? { status: 'resolved' as const, targets: [{ to: declared.values().next().value!, evidence: { confidence: 'candidate' as const, basis: 'ambient_module' } }] }
           : { status: 'unresolved' as const, reason: 'ambiguous_target' as const, detail: '多个文件声明同名 ambient module。' }
         : jsResolver(rel, ref.spec, ref.dynamic ? 'dynamic_import' : mode, isFile, syntax)
       if (esImport) {
@@ -405,11 +416,9 @@ function buildPageGraph({ entries, isFile, normalizeTarget }: BuildContext, { re
         classic.get(script.rel)!.add(rel)
       }
       const queue = [script.rel]
-      const seen = new Set<string>()
+      const seen = new Set([script.rel])
       for (let next = 0; next < queue.length; next++) {
         const current = queue[next]
-        if (seen.has(current)) continue
-        seen.add(current)
         if (current !== rel) {
           // Inline bodies would re-add the page as its own member — noise.
           if (!membership.has(current)) membership.set(current, new Map())
@@ -427,7 +436,11 @@ function buildPageGraph({ entries, isFile, normalizeTarget }: BuildContext, { re
             // to individual scripts, even when several tags share one line.
             ? (inlineDeps.get(rel)?.get(script.index) ?? [])
             : (resolvedDeps.get(current) ?? [])
-          for (const edge of edges) queue.push(edge.to)
+          for (const edge of edges) {
+            if (seen.has(edge.to)) continue
+            seen.add(edge.to)
+            queue.push(edge.to)
+          }
         }
       }
     }
@@ -489,7 +502,21 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
       }
     }
   }
-  const pagesOfRel = (rel: string): Set<string> => new Set([...(pages.has(rel) ? [rel] : []), ...(membership.get(rel)?.keys() ?? [])])
+  const pageCache = new Map<string, Set<string>>()
+  const pagesOfRel = (rel: string): Set<string> => {
+    let result = pageCache.get(rel)
+    if (result) return result
+    result = new Set(membership.get(rel)?.keys())
+    if (pages.has(rel)) result.add(rel)
+    pageCache.set(rel, result)
+    return result
+  }
+  const sharesPage = (left: string, right: Set<string>): boolean => {
+    const pagesForLeft = pagesOfRel(left)
+    const [small, large] = pagesForLeft.size < right.size ? [pagesForLeft, right] : [right, pagesForLeft]
+    for (const page of small) if (large.has(page)) return true
+    return false
+  }
   const resolveAliasRef = (fromRel: string, raw: BridgeFact): BridgeItem | null => {
     // Use the formal checker's occurrence binding, not a file-wide alias map.
     const unbound = (): BridgeItem => ({ ...raw, path: fromRel, receiver: {
@@ -505,7 +532,7 @@ function buildElectronIndex({ entries, isFile, normalizeTarget, jsResolver }: Bu
       }
     } else if (scriptFacts(entries.get(fromRel)!)?.bridgeAliases.some(alias => alias.name === raw.object)) return unbound()
     const mine = pagesOfRel(fromRel)
-    const defs = (pageAlias.get(raw.object) ?? []).filter((d) => d.path === fromRel || [...pagesOfRel(d.path)].some((p) => mine.has(p)))
+    const defs = (pageAlias.get(raw.object) ?? []).filter((d) => d.path === fromRel || sharesPage(d.path, mine))
     if (defs.length > 1 || defs.some(def => def.uncertain)) return unbound()
     const def = defs[0]
     if (def) return { ...raw, path: fromRel, alias: raw.object, object: def.object }

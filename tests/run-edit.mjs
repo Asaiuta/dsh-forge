@@ -12,13 +12,13 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { applyEditSteps } from '../lib/edit-engine.js'
-import { getBlob, putBlob, readKnownState, readLedgerTail, storeFor, workspaceForFile, detectEncoding, encodeText, looksBinary } from '../lib/ledger.js'
-import { createTicket, loadTicket } from '../lib/tickets.js'
-import { createEditTool, createHistoryTool, createRollbackTool } from '../lib/tools-edit.js'
-import { createReadTool } from '../lib/tools-read.js'
+import { applyEditSteps } from '../src/edit-engine.ts'
+import { getBlob, putBlob, readKnownState, readLedgerTail, storeFor, workspaceForFile, detectEncoding, encodeText, looksBinary } from '../src/ledger.ts'
+import { createTicket, loadTicket } from '../src/tickets.ts'
+import { createEditTool, createHistoryTool, createRollbackTool } from '../src/tools-edit.ts'
+import { createReadTool } from '../src/tools-read.ts'
 import { symbolReader } from './lib/symbol-read.mjs'
-import { FinderPool } from '../lib/core.js'
+import { FinderPool } from '../src/core.ts'
 
 process.env.DSH_FORGE_DATA_DIR = mkdtempSync(path.join(tmpdir(), 'forge-edit-data-'))
 const WORK = mkdtempSync(path.join(tmpdir(), 'forge-edit-work-'))
@@ -216,7 +216,7 @@ async function main() {
 
   // --- ffedit: reason gate + create + full governance flow ---------------------
   {
-    const r = await edit.execute({ path: 'new.ts', steps: [{ op: 'insert', after: 0, text: 'export const x = 1' }], mode: 'atomic' }, exec)
+    const r = await edit.execute({ path: 'new.ts', steps: [{ op: 'insert', after: 0, text: 'export const x = 1' }] }, exec)
     assert.ok(r.error && /reason is required/.test(r.error) && /"reason"/.test(r.error), 'missing reason rejected with copyable shape')
     ok('ffedit: reason mandatory with copy-paste error format')
   }
@@ -370,14 +370,14 @@ async function main() {
     const batches = readLedgerTail(storeFor(WORK))
     const storeBatch = batches.find((b) => b.nodes.some((n) => n.file === 'store.js' && n.op === 'update'))
     const before = readFile('store.js')
-    const plan = await rollback.execute({ batch: String(storeBatch.id), reason: 'revert: wrong direction' }, exec)
+    const plan = await rollback.execute({ batch: storeBatch.id, reason: 'revert: wrong direction' }, exec)
     assert.equal(plan.status, 'plan', 'dryRun is the default')
-    const applied = await rollback.execute({ batch: String(storeBatch.id), dryRun: false, reason: 'revert: wrong direction' }, exec)
+    const applied = await rollback.execute({ batch: storeBatch.id, dryRun: false, reason: 'revert: wrong direction' }, exec)
     assert.equal(applied.status, 'applied')
     assert.equal(readFile('store.js'), 'class Store {\n  put() {}\n  get() {}\n}\n', 'restored pre-batch content')
     assert.notEqual(before, readFile('store.js'), 'content actually changed')
     // redo by rolling back the rollback batch
-    const redo = await rollback.execute({ batch: 'last', dryRun: false, reason: 'redo: direction was right after all' }, exec)
+    const redo = await rollback.execute({ latest: true, dryRun: false, reason: 'redo: direction was right after all' }, exec)
     assert.equal(redo.status, 'applied')
     assert.match(readFile('store.js'), /put\(v\)/, 'rollback-of-rollback is a redo')
     ok('ffrollback: restore + redo chain, dryRun default')
@@ -388,7 +388,7 @@ async function main() {
     const batches = readLedgerTail(storeFor(WORK))
     const createBatch = batches.find((b) => b.id === r.batch)
     assert.ok(createBatch, 'create batch found')
-    const back = await rollback.execute({ batch: String(createBatch.id), dryRun: false, reason: 'cleanup temp' }, exec)
+    const back = await rollback.execute({ batch: createBatch.id, dryRun: false, reason: 'cleanup temp' }, exec)
     assert.equal(back.status, 'applied')
     assert.ok(!existsSync(file('temp-created.ts')), 'created file removed by rollback')
     ok('ffrollback: creation rollback deletes the created file')
@@ -403,7 +403,7 @@ async function main() {
     writeFile('other.js', 'one\ntwo\n')
     await edit.execute({ path: 'other.js', steps: [{ op: 'insert', after: 0, text: '// other header' }], reason: 'add other header' }, exec)
     const combined = readLedgerTail(storeFor(WORK)).slice(-2)
-    const multi = await rollback.execute({ batch: 'last', path: 'other.js', dryRun: false, reason: 'selective revert' }, exec)
+    const multi = await rollback.execute({ latest: true, path: 'other.js', dryRun: false, reason: 'selective revert' }, exec)
     assert.equal(multi.status, 'applied')
     assert.equal(readFile('other.js'), 'one\ntwo\n', 'filtered file rolled back')
     assert.match(readFile('store.js'), /put\(v\)/, 'unfiltered file untouched by path-filtered rollback')
@@ -421,7 +421,7 @@ async function main() {
 
   // --- status command: ledger section + prune ---------------------------------------
   {
-    const { createStatusCommand } = await import('../lib/tools.js')
+    const { createStatusCommand } = await import('../lib/status.js')
     const status = createStatusCommand(pool)
     const noIdx = await status.handler({ rawInput: '' })
     assert.ok(noIdx.text.includes('施工台账') && noIdx.text.includes('歧义票据'), 'ledger section even without finders')

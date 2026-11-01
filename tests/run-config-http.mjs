@@ -16,12 +16,18 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import path from 'node:path'
 import { Readable } from 'node:stream'
+import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const { Context } = require('@deepseek-ai/cordis')
 const module = await import(new URL('../lib/http-plugin.js', import.meta.url).href)
+
+/** Repository root; the ledger probes mint their throwaway workspaces here. */
+const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 
 let passed = 0
 function ok(label) {
@@ -29,10 +35,11 @@ function ok(label) {
   console.log(`  ok ${passed} - ${label}`)
 }
 
-/** A request the handler can `for await` over, with a method on it. */
-function request(method, body) {
+/** A request the handler can `for await` over, with a method and a URL on it. */
+function request(method, body, url = '/forge-config') {
   const stream = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))])
   stream.method = method
+  stream.url = url
   return stream
 }
 
@@ -55,7 +62,7 @@ function reply() {
 
 const routes = []
 const edits = []
-let currentConfig = { registration: 'additive', takeover: [], prewarm: true }
+let currentConfig = { surface: 'retrieval' }
 let rows = [{ options: { id: 'dsh-forge', name: 'dsh-forge', config: currentConfig } }]
 
 const ctx = new Context()
@@ -78,39 +85,46 @@ ctx.provide('configEditor', {
 ctx.plugin({ name: module.name, inject: module.inject, apply: module.apply })
 await new Promise((resolve) => setImmediate(resolve))
 
-assert.equal(routes.length, 1, `expected one route, got ${routes.length}`)
-assert.equal(routes[0].path, '/forge-config')
-assert.equal(routes[0].kind, 'exact')
-ok('the route is registered on the host web server')
+// Exactly the approved settings, ledger and projects endpoints; no duplicate routes.
+assert.equal(routes.length, 3, `expected config, ledger and projects routes, got ${routes.length}`)
+assert.deepEqual(routes.map(route => route.path).sort(), ['/forge-config', '/forge-ledger', '/forge-projects'])
+const configRoute = routes.find((route) => route.path === '/forge-config')
+const ledgerRoute = routes.find((route) => route.path === '/forge-ledger')
+const projectsRoute = routes.find((route) => route.path === '/forge-projects')
+assert.ok(configRoute !== undefined && ledgerRoute !== undefined && projectsRoute !== undefined, 'all three routes must be registered')
+assert.equal(configRoute.kind, 'exact')
+assert.equal(ledgerRoute.kind, 'exact')
+assert.equal(projectsRoute.kind, 'exact')
+ok('config, ledger and projects register exactly once as exact host routes')
 
-const handler = routes[0].handler
+const handler = configRoute.handler
 
 // --- GET ------------------------------------------------------------------
 {
   const { seen, res } = reply()
   await handler(request('GET'), res)
   assert.equal(seen.status, 200, seen.body)
-  assert.deepEqual(JSON.parse(seen.body).state, { registration: 'additive', takeover: [], prewarm: true })
+  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'retrieval' })
   ok('GET answers the row’s own values')
 }
 
 // --- POST: a legal save reaches configEditor.edit --------------------------
 {
   const { seen, res } = reply()
-  await handler(request('POST', { registration: 'takeover', takeover: ['glob', 'read'], prewarm: false }), res)
+  await handler(request('POST', { surface: 'full' }), res)
   assert.equal(seen.status, 200, seen.body)
   assert.equal(edits.length, 1, 'the save must go through configEditor.edit')
-  assert.deepEqual(edits[0], { registration: 'takeover', takeover: ['glob', 'read'], prewarm: false })
-  assert.deepEqual(JSON.parse(seen.body).state, { registration: 'takeover', takeover: ['glob', 'read'], prewarm: false })
+  assert.deepEqual(edits[0], { surface: 'full' })
+  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'full' })
   ok('POST persists through the editor and echoes what it wrote')
 }
 
 // --- POST: a rejected value is the user's to fix, not a server fault -------
 {
   const { seen, res } = reply()
-  await handler(request('POST', { registration: 'takeover', takeover: [], prewarm: true }), res)
+  await handler(request('POST', { surface: 'invalid' }), res)
   assert.equal(seen.status, 400, seen.body)
-  assert.match(JSON.parse(seen.body).error, /至少/)
+  assert.match(JSON.parse(seen.body).error, /surface/)
   assert.equal(edits.length, 1, 'a refused body must not reach the editor')
   ok('an empty takeover selection is refused with 400')
 }
@@ -120,7 +134,7 @@ const handler = routes[0].handler
   const saved = rows
   rows = []
   const { seen, res } = reply()
-  await handler(request('POST', { registration: 'additive', takeover: [], prewarm: true }), res)
+  await handler(request('POST', { surface: 'retrieval' }), res)
   assert.equal(seen.status, 400, seen.body)
   assert.match(JSON.parse(seen.body).error, /dsh-forge/)
   rows = saved
@@ -137,7 +151,7 @@ const handler = routes[0].handler
     },
   })
   const { seen, res } = reply()
-  await handler(request('POST', { registration: 'additive', takeover: [], prewarm: true }), res)
+  await handler(request('POST', { surface: 'retrieval' }), res)
   assert.equal(seen.status, 500, seen.body)
   assert.match(JSON.parse(seen.body).error, /locked/)
   ctx.set('configEditor', saved)
@@ -150,6 +164,43 @@ const handler = routes[0].handler
   await handler(request('DELETE'), res)
   assert.equal(seen.status, 405)
   ok('other methods are refused with 405')
+}
+
+// --- ledger: a relative workspace is refused before any store is derived ---
+{
+  const { seen, res } = reply()
+  await ledgerRoute.handler(request('GET', undefined, '/forge-ledger?workspace=relative/dir'), res)
+  assert.equal(seen.status, 400, seen.body)
+  assert.match(JSON.parse(seen.body).error, /绝对路径/)
+  ok('the ledger route refuses a relative workspace instead of guessing one')
+}
+
+// --- ledger: a workspace with no history answers with an empty list --------
+{
+  const empty = mkdtempSync(path.join(repoRoot, '.tmp-ledger-'))
+  try {
+    const { seen, res } = reply()
+    await ledgerRoute.handler(request('GET', undefined, `/forge-ledger?workspace=${encodeURIComponent(empty)}`), res)
+    assert.equal(seen.status, 200, seen.body)
+    assert.deepEqual(JSON.parse(seen.body).batches, [])
+    ok('a workspace without history lists nothing rather than failing')
+  } finally {
+    rmSync(empty, { recursive: true, force: true })
+  }
+}
+
+// --- ledger: a batch that does not exist is a 404, not an empty page -------
+{
+  const empty = mkdtempSync(path.join(repoRoot, '.tmp-ledger-'))
+  try {
+    const { seen, res } = reply()
+    await ledgerRoute.handler(request('GET', undefined, `/forge-ledger?workspace=${encodeURIComponent(empty)}&batch=7`), res)
+    assert.equal(seen.status, 404, seen.body)
+    assert.match(JSON.parse(seen.body).error, /#7/)
+    ok('an unknown batch id is a 404 with the id in the message')
+  } finally {
+    rmSync(empty, { recursive: true, force: true })
+  }
 }
 
 console.log(`\n${passed} checks passed`)

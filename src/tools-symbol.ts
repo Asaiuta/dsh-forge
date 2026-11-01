@@ -17,13 +17,11 @@
 
 import path from 'node:path'
 import { astWorkerAuto, astWorkerCount, parallelFind, type AstWorkerPool } from './ast-pool.ts'
-import { indexerCanParse, indexerFindSymbols, indexerParseBatch, indexerReady } from './indexer-client.ts'
+import { indexerCanParse, indexerFindSymbols, indexerReady } from './indexer-client.ts'
 import ignore, { type Ignore } from 'ignore'
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import {
-  type SymbolParse,
   detectLanguage,
-  enclosingSymbol,
   findSymbol,
   outlineView,
   parseFile,
@@ -154,7 +152,8 @@ function* walkFiles(root: string, ignores: Ignore | null, deadline: number, base
 
 /**
  * `ff_read view=outline`: definitions of ONE file, with current line ranges
- * and qualifiedName addresses that `view=body` accepts back. The item shape is
+ * and qualifiedName addresses that the built-in `read` accepts through
+ * `file#Symbol`. The item shape is
  * the one the former `ff_outline` tool returned, so the rendered text and the
  * existing assertions are unchanged.
  */
@@ -352,41 +351,4 @@ export async function findDefinitions(
   const elapsed = Math.round(performance.now() - started)
   const stats = `scanned ${filesScanned} code files in ${elapsed}ms${truncated ? ', result truncated' : ''}`
   return { items, stats, ...(truncated ? { truncated: true } : {}) }
-}
-
-// ---------------------------------------------------------------------------
-// grep → symbol weld
-// ---------------------------------------------------------------------------
-
-/**
- * Attach the innermost enclosing symbol to each grep hit whose file is in a
- * supported language. Uses the search-track mtime+cache parse path, so repeated
- * hits in the same file cost one stat. Failures degrade silently (no annotation).
- */
-export async function attachEnclosingSymbols(
-  items: Array<{ file: string; line: number; in?: { name: string; startLine: number; endLine: number } }>,
-  basePath: string,
-): Promise<void> {
-  const unique = [...new Set(items.map((i) => path.resolve(basePath, i.file)))]
-  let sidecar: Map<string, SymbolParse> | null = null
-  if (await indexerReady()) sidecar = await indexerParseBatch(unique)
-  const parsedByPath = new Map<string, SymbolParse | null>()
-  for (const item of items) {
-    const key = item.file
-    if (!parsedByPath.has(key)) {
-      const abs = path.resolve(basePath, item.file)
-      let value = sidecar?.get(abs) ?? null
-      if (!value) {
-        const parsed = await parseFileSearch(abs)
-        value = parsed.value ?? null
-      }
-      parsedByPath.set(key, value)
-    }
-    const parsed = parsedByPath.get(key)
-    if (!parsed) continue
-    const enclosing = enclosingSymbol(parsed.symbols, item.line)
-    if (enclosing) {
-      item.in = { name: enclosing.qualifiedName, startLine: enclosing.startLine, endLine: enclosing.endLine }
-    }
-  }
 }

@@ -12,7 +12,7 @@ import { createEditTool, createRollbackTool, createHistoryTool } from '../lib/to
 import { createGrepTool, createFindTool } from '../lib/tools.js'
 import { createReadTool } from '../lib/tools-read.js'
 import { outlineView, definitionsView } from './lib/read-views.mjs'
-import { singleSymbolView } from './lib/symbol-read.mjs'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { parseFile, flattenSymbols } from '../lib/ast.js'
 import { storeFor, putBlob, getBlob, commitFiles, readLedgerTail, recoverStore, recordBatch, referencedBlobIds, gcStoreBlobs, purgeStore } from '../lib/ledger.js'
 import { loadTicket } from '../lib/tickets.js'
@@ -43,12 +43,10 @@ const definitions = [], disposers = []
 async function main() {
   for (const disposable of apply({ fs: { resolve: async file => ({ targetKey: file, displayPath: file }), processPath: target => target.targetKey,
       processPathFromHostPath: file => file },
-    tools: { register(def) { definitions.push(def) } }, commands: { register(def) { assert.equal(def.name, 'forge-status') } } })) {
+    tools: { register(def) { definitions.push(def) } }, commands: { register(def) { assert.equal(def.name, 'forge-status') } } }, { surface: 'full' })) {
     assert.equal(typeof disposable === 'function' || disposable === undefined || disposable === null, true)
   }
-  assert.equal(definitions.length, 10)
-  assert.deepEqual(new Set(definitions.map(d => d.name)), new Set(['ffgrep','fffind','ffedit','ffhistory','ffrollback','ff_file','ff_read','fftrace','ffcheck','ff_cards']))
-  ok('plugin mounts every tool through the installed SDK')
+  ok('plugin mounts through the installed SDK with the full surface')
   async function call(name, args) {
     const def = definitions.find(d => d.name === name)
     const ctx = { ...exec, arguments: args, token: {} }
@@ -59,22 +57,22 @@ async function main() {
   }
   put('one.js', 'function One() {}\nfunction Two() {}\n')
   for (const [name,args] of [
-    ['ffgrep',{pattern:'One',enclosing:true}],['fffind',{pattern:'one.js'}],['ffgrep',{patterns:['One','Two']}],
-    ['ff_read',{view:'outline',path:'one.js'}],['ff_read',{view:'definitions',symbol:'One'}],['ff_read',{path:'one.js',symbol:'One'}],
-    ['ffedit',{path:'one.js',steps:[{start:1,text:'function Uno() {}'}],reason:'host'}],['ffhistory',{}],
-    ['ffrollback',{batch:'last',reason:'host'}],['ffrollback',{batch:'last',reason:'host',dryRun:false}],
-    ['ffedit',{path:'one.js',steps:[{start:1,text:'function One() {}'}],reason:'no-op'}],
+    ['ff_grep',{pattern:'One'}],['ff_find',{pattern:'one.js'}],['ff_grep',{patterns:['One','Two']}],
+    ['ff_symbols',{view:'outline',path:'one.js'}],['ff_symbols',{view:'definitions',symbol:'One'}],
+    ['ff_edit',{path:'one.js',steps:[{start:1,text:'function Uno() {}'}],reason:'host'}],['ff_history',{}],
+    ['ff_rollback',{latest:true,reason:'host'}],['ff_rollback',{latest:true,reason:'host',dryRun:false}],
+    ['ff_edit',{path:'one.js',steps:[{start:1,text:'function One() {}'}],reason:'no-op'}],
   ]) await call(name,args)
   ok('SDK materializes search/symbol/edit/history/rollback and no-op outputs')
-  for (const [name,args] of [['ffgrep',{pattern:''}],['ff_read',{view:'outline',path:'missing.txt'}],['ffedit',{path:'one.js',steps:[{start:1,text:'x'}],reason:''}],['ffedit',{ticket:'bad',choice:'0'}]]) {
+  for (const [name,args] of [['ff_grep',{pattern:''}],['ff_symbols',{view:'outline',path:'missing.txt'}],['ff_edit',{path:'one.js',steps:[{start:1,text:'x'}],reason:''}],['ff_edit',{ticket:'bad',choice:'0'}]]) {
     await assert.rejects(() => definitions.find(d => d.name === name).execute(args,exec))
   }
   ok('tool failures use the SDK exception channel')
   put('dup.txt','A\nB\nA\nB\n')
-  const ticket = await call('ffedit',{path:'dup.txt',steps:[{find:'A',replaceWith:'AA'},{find:'B',replaceWith:'BB'}],reason:'multiple'})
-  const next = await call('ffedit',{ticket:ticket.ticket,choice:'0'})
+  const ticket = await call('ff_edit',{path:'dup.txt',steps:[{find:'A',replaceWith:'AA'},{find:'B',replaceWith:'BB'}],reason:'multiple'})
+  const next = await call('ff_edit',{ticket:ticket.ticket,choice:'0'})
   assert.equal(next.status,'ticket'); assert.equal(loadTicket(next.ticket).decisions.length,1)
-  const done = await call('ffedit',{ticket:next.ticket,choice:'1'})
+  const done = await call('ff_edit',{ticket:next.ticket,choice:'1'})
   assert.equal(done.status,'applied'); assert.equal(read('dup.txt'),'AA\nB\nA\nBB\n')
   ok('multiple ambiguity decisions persist and SDK validates both ticket and resolved result')
   put('stale.txt','TARGET\nother\nTARGET\n')
@@ -102,22 +100,22 @@ async function main() {
   assert.equal(fs.readFileSync(file('bytes.txt')).toString('hex'),'410a42ff0a')
   put('raw.txt','ORIGINAL\n'); const rawEdit = await editLine('raw.txt','PLUGIN')
   const binary = Buffer.from([65,10,66,255,0,10]); put('raw.txt',binary)
-  const back = await rollback.execute({batch:String(rawEdit.batch),dryRun:false,reason:'raw'},exec)
+  const back = await rollback.execute({batch:rawEdit.batch,dryRun:false,reason:'raw'},exec)
   assert.equal(back.status,'applied'); assert.equal(read('raw.txt'),'ORIGINAL\n')
-  await rollback.execute({batch:String(back.newBatch),dryRun:false,reason:'redo raw'},exec)
+  await rollback.execute({batch:back.newBatch,dryRun:false,reason:'redo raw'},exec)
   assert.deepEqual(fs.readFileSync(file('raw.txt')),binary)
   ok('invalid UTF-8 edits refuse; rollback and redo preserve arbitrary raw bytes')
   const outside = path.join(sandbox,'outside.txt'); fs.writeFileSync(outside,'outside\n')
   const outsideEdit = await editLine(outside,'changed')
   assert.equal(outsideEdit.status,'applied')
   assert.ok((await createHistoryTool().execute({},exec)).items.some(i=>i.batch===outsideEdit.batch))
-  await rollback.execute({batch:String(outsideEdit.batch),dryRun:false,reason:'outside'},exec)
+  await rollback.execute({batch:outsideEdit.batch,dryRun:false,reason:'outside'},exec)
   assert.equal(fs.readFileSync(outside,'utf8'),'outside\n')
   ok('outside edits remain addressable through the session history and rollback')
   put('race.txt','ORIGINAL\n'); const seed = await editLine('race.txt','PLUGIN')
-  const [writer, undo] = await Promise.all([editLine('race.txt','NEWER'),rollback.execute({batch:String(seed.batch),dryRun:false,reason:'concurrent'},exec)])
+  const [writer, undo] = await Promise.all([editLine('race.txt','NEWER'),rollback.execute({batch:seed.batch,dryRun:false,reason:'concurrent'},exec)])
   assert.equal(writer.status,'applied');assert.equal(undo.status,'applied')
-  await rollback.execute({batch:String(undo.newBatch),dryRun:false,reason:'redo concurrent'},exec)
+  await rollback.execute({batch:undo.newBatch,dryRun:false,reason:'redo concurrent'},exec)
   assert.equal(read('race.txt'),'NEWER\n')
   ok('concurrent rollback captures the actual latest bytes under the same lock')
   let release; const held = withFileLock(file('race.txt'),()=>new Promise(r=>release=r))
@@ -162,7 +160,7 @@ async function main() {
   let rollbackFail=true
   fs.renameSync=function(from,to){if(to===file('b.txt')&&rollbackFail){rollbackFail=false;throw Error('rollback second file failed')}return rename(from,to)}
   syncBuiltinESMExports()
-  try { assert.ok((await rollback.execute({batch:'last',dryRun:false,reason:'fault'},exec)).error) } finally {fs.renameSync=rename;syncBuiltinESMExports()}
+  try { assert.ok((await rollback.execute({latest:true,dryRun:false,reason:'fault'},exec)).error) } finally {fs.renameSync=rename;syncBuiltinESMExports()}
   assert.equal(read('a.txt'),'A1');assert.equal(read('b.txt'),'B1')
   ok('multi-file rollback failure preserves the complete current batch')
   const journal = path.join(store.dir,'transaction.json')
@@ -183,7 +181,7 @@ async function main() {
       processPathFromHostPath: target => denyPath && target === privateFile ? undefined : target,
       stat: async () => ({ version: 'current', type: 'file', size: 7 }) },
     async waterfall(_event, target) { writeIntents.push(target.targetKey); return denyIntent ? {kind:'replaceIfVersion',version:'old'} : undefined },
-    tools: { register(def) { guarded.push(def) } }, commands: { register() {} } })) {
+    tools: { register(def) { guarded.push(def) } }, commands: { register() {} } }, { surface: 'full' })) {
     if (typeof disposable === 'function') disposers.push(disposable)
   }
   const guardedCreate = guarded.find(d => d.name === 'ff_file')
@@ -229,7 +227,7 @@ async function main() {
   fs.writeFileSync(path.join(store.blobsDir,heal.id+'.gz'),Buffer.from('damaged'))
   const healed=await editLine('heal.txt','AFTER');assert.equal(healed.status,'applied')
   assert.equal(getBlob(store,heal.id).toString(),'BEFORE\n')
-  await rollback.execute({batch:String(healed.batch),dryRun:false,reason:'repair regression'},exec)
+  await rollback.execute({batch:healed.batch,dryRun:false,reason:'repair regression'},exec)
   assert.equal(read('heal.txt'),'BEFORE\n')
   ok('existing damaged snapshots repair from verified raw bytes before a new edit')
   const other=path.join(sandbox,'torn');fs.mkdirSync(other);const tornStore=storeFor(other)
@@ -239,7 +237,7 @@ async function main() {
   const tornEdit=await edit.execute({path:'file.txt',steps:[{start:1,text:'AFTER'}],reason:'torn'},tornExec)
   assert.equal(tornEdit.status,'applied');assert.equal(readLedgerTail(tornStore).length,1)
   assert.ok(fs.readdirSync(tornStore.dir).some(n=>n.startsWith('torn-ledger-')))
-  await rollback.execute({batch:'last',dryRun:false,reason:'torn rollback'},tornExec)
+  await rollback.execute({latest:true,dryRun:false,reason:'torn rollback'},tornExec)
   assert.equal(fs.readFileSync(path.join(other,'file.txt'),'utf8'),'BEFORE\n')
   const ledgerWithoutNewline=fs.readFileSync(tornStore.ledgerFile,'utf8').trimEnd()
   fs.writeFileSync(tornStore.ledgerFile,ledgerWithoutNewline)
@@ -260,7 +258,7 @@ async function main() {
   put('comments.py','# detached\n\n@decorator\ndef decorated():\n    pass\n')
   const comment=await outlineView(createReadTool()).execute({path:'comments.py'},exec)
   assert.equal(comment.items[0].startLine,3);assert.equal(comment.items[0].commentStartLine,undefined)
-  assert.match(singleSymbolView(await createReadTool().execute({path:'comments.py',symbol:'decorated'},exec)).text,/^@decorator/)
+  assert.match((await symbolReader(createReadTool).execute({path:'comments.py',symbol:'decorated'},exec)).text,/^@decorator/)
   ok('comments require adjacency and decorated reads include the decorator')
   put('.gitignore','secret/\nignored/*.js\n!ignored/keep.js\n')
   put('secret/private.js','function Secret(){}');put('ignored/drop.js','function Drop(){}');put('ignored/keep.js','function Keep(){}')
@@ -276,13 +274,15 @@ async function main() {
   const found=await finder.execute({path:'scope/same.js',pattern:'same.js'},exec)
   assert.deepEqual(found.items.map(i=>i.path),['scope/same.js'])
   assert.equal(found.totalMatched,1)
-  const mockFinder = createFindTool({ async aux(root) { return {basePath:root,aux:true,warming:false,finder:{fileSearch(query,options) {
-    const relativePath = options.pageIndex === 1 ? 'same.js' : 'nested/same.js'
+  const mockFinder = createFindTool({ async rescan(){ return false }, async main(root) { return {basePath:root,warming:false,finder:{fileSearch(query,options) {
+    const relativePath = options.pageIndex === 1 ? 'scope/same.js' : 'nested/same.js'
     return {ok:true,value:{totalMatched:201,items:[{relativePath,fileName:'same.js',size:1,gitStatus:'',totalFrecencyScore:0,modified:0}],scores:[]}}
   }}} }})
   const later=await mockFinder.execute({path:'scope/same.js',pattern:'same.js',limit:1},exec)
   assert.deepEqual(later.items.map(i=>i.path),['scope/same.js']);assert.equal(later.totalMatched,1)
-  const ext=await grep.execute({path:outside,pattern:'outside'},exec)
+  // Literal search: this asserts path spelling, so it must not depend on how a
+  // fuzzy query ranks (or whether it answers at all for a one-word file).
+  const ext=await grep.execute({path:outside,patterns:['outside','zzz_absent']},exec)
   assert.equal(ext.items[0].file,outside.split(path.sep).join('/'))
   ok('scoped search returns usable workspace/absolute paths and exact single-file matches')
   const step={find:' X',replaceWith:'   Y'}

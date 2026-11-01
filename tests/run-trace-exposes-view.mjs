@@ -87,10 +87,14 @@ try {
   assert.ok(detail.text.includes('未被使用（1）：neverUsed'), detail.text)
   assert.ok(detail.text.length > survey.text.length * 2, `detail ${detail.text.length} vs survey ${survey.text.length}`)
   // Guard the contract: detail renders the same exposes rows the pre-change
-  // build did. The slice starts at the summary line because tools-trace injects
-  // the shared preamble right after the title; pinning the preamble here would
-  // turn any future header edit into a false exposes regression.
-  const body = detail.text.slice(detail.text.indexOf('- 共 '))
+  // build did. The shared preamble is injected by tools-trace, not by the
+  // exposes renderer: it opens after the title on a negative answer and closes
+  // after the rows on a positive one, so it is cut from both ends. Pinning the
+  // preamble here would turn any future header edit into a false exposes
+  // regression.
+  const body = detail.text
+    .slice(detail.text.indexOf('- 共 '))
+    .replace(/\n\n- 范围：[\s\S]*$/, '')
   const digest = createHash('sha256').update(body).digest('hex')
   assert.equal(digest, DETAIL_DIGEST, `detail output drifted: ${digest}`)
   ok('format=detail reproduces the pre-change exposes render exactly (sha256)')
@@ -134,10 +138,24 @@ contextBridge.exposeInMainWorld('fatBridge', api)
   const bogus = await run({ target: 'exposes:', format: 'bogus' })
   assert.equal(bogus.error, 'format 仅接受 auto / summary / detail。')
   const wrongKind = await run({ target: 'file:preloads/small.js', format: 'detail' })
-  assert.equal(wrongKind.error, 'format 只影响 exposes: 查询的视图。')
+  assert.equal(wrongKind.error, 'format applies only to exposes:')
   const onSymbol = await run({ target: 'symbol:alpha', format: 'detail' })
-  assert.equal(onSymbol.error, 'format 不适用于 symbol: 查询。')
-  ok('format is validated, never silently ignored')
+  assert.match(onSymbol.error, /ff_symbols/)
+  for (const target of ['file:preloads/small.js', 'impact:preloads/small.js', 'path:preloads/small.js -> preloads/small.js', 'ipc:alpha', 'api:alpha', 'global:alpha', 'page:alpha.html', 'ffi:alpha']) {
+    const result = await run({ target, format: 'auto' })
+    assert.match(result.error, /format/, `${target} must refuse even the explicit default format`)
+  }
+  for (const target of ['exposes:', 'ipc:alpha', 'api:alpha', 'global:alpha', 'page:alpha.html', 'ffi:alpha']) {
+    for (const edgeMode of ['all', 'certain']) {
+      const result = await run({ target, edgeMode })
+      assert.match(result.error, /edgeMode/, `${target} must refuse edgeMode=${edgeMode}`)
+    }
+  }
+  for (const target of ['path:preloads/small.js -> preloads/small.js', 'ipc:alpha', 'api:alpha', 'global:alpha', 'page:alpha.html', 'ffi:alpha']) {
+    const result = await run({ target, limit: 100 })
+    assert.match(result.error, /limit/, `${target} must refuse even the explicit default limit`)
+  }
+  ok('format, edgeMode and limit reject every inapplicable target, including explicit defaults')
 } finally {
   try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* tmpdir cleanup fallback */ }
 }

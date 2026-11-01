@@ -11,10 +11,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { applyEditSteps } from '../lib/edit-engine.js'
-import { createEditTool, createRollbackTool } from '../lib/tools-edit.js'
-import { readLedgerTail, storeFor, getBlob, readKnownState } from '../lib/ledger.js'
-import { FinderPool } from '../lib/core.js'
+import { applyEditSteps } from '../src/edit-engine.ts'
+import { createEditTool, createRollbackTool } from '../src/tools-edit.ts'
+import { readLedgerTail, storeFor, getBlob, readKnownState } from '../src/ledger.ts'
+import { FinderPool } from '../src/core.ts'
 import { createHash } from 'node:crypto'
 
 process.env.DSH_FORGE_DATA_DIR = mkdtempSync(path.join(tmpdir(), 'forge-eval-edit-'))
@@ -162,12 +162,12 @@ const sha = (buf) => createHash('sha256').update(buf).digest('hex')
   const expectedOnRollback = ['HUMAN-SHOT', 'S3\n', 'S2\n', 'S1\n', 'S0\n']
   const all = readLedgerTail(storeFor(WORK)).filter((b) => b.nodes.some((n) => n.file === 'chain.txt'))
   // after S4 edit: disk = S4; rollback S4-batch → external snapshot state (HUMAN)
-  const r4 = await rollback.execute({ batch: 'last', dryRun: false, reason: 'chain revert 4' }, exec)
+  const r4 = await rollback.execute({ latest: true, dryRun: false, reason: 'chain revert 4' }, exec)
   assert.equal(r4.status, 'applied')
   // the S4 batch's before-blob is the HUMAN content (external tripwire fired)
   assert.equal(readFileSync(file(name), 'utf8'), 'HUMAN\n', 'external state restored')
   for (let i = batchIds.length - 1; i >= 0; i--) {
-    const rb = await rollback.execute({ batch: String(batchIds[i]), dryRun: false, reason: `chain revert ${i}` }, exec)
+    const rb = await rollback.execute({ batch: batchIds[i], dryRun: false, reason: `chain revert ${i}` }, exec)
     assert.equal(rb.status, 'applied', `revert of #${batchIds[i]}`)
     assert.equal(readFileSync(file(name), 'utf8'), `S${i}\n`, `state S${i} restored byte-exact`)
   }

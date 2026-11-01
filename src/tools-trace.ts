@@ -13,7 +13,8 @@
 
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, type Stats } from 'node:fs'
+import { stat as fspStat } from 'node:fs/promises'
 import { bridgeGlobalsOf, loadPreloadDecls } from './decls.ts'
 import { buildGraph, deriveRoleGlobals, exposedGlobalsOf, normalizeTraceFile, parseDependencyPath, type TraceGraph } from './linkgraph.ts'
 import { parseTarget, trace, type ExposesFormat } from './trace-queries.ts'
@@ -225,6 +226,36 @@ async function supplementBridgeBindings(
   return updated
 }
 
+/** Files stat'd per libuv-pool round: enough to keep four threads busy, few
+ *  enough that an abort lands within one round. */
+const STAT_CONCURRENCY = 64
+
+/**
+ * Stat every candidate through the libuv pool, in input order.
+ *
+ * A `null` entry means the pooled call refused (missing file, permission
+ * denied); the caller re-runs `statSync` for that path, so a `stat_failed`
+ * diagnostic carries exactly the message the synchronous path produced — and
+ * that message is hashed into the graph signature. Failures are rare, so the
+ * extra call never shows up in a query.
+ */
+async function statAll(files: ReadonlyArray<{ abs: string }>, signal?: AbortSignal): Promise<Array<Stats | null>> {
+  const out: Array<Stats | null> = new Array(files.length).fill(null)
+  for (let start = 0; start < files.length; start += STAT_CONCURRENCY) {
+    signal?.throwIfAborted()
+    const end = Math.min(files.length, start + STAT_CONCURRENCY)
+    const pending: Array<Promise<void>> = []
+    for (let index = start; index < end; index++) {
+      pending.push(fspStat(files[index].abs).then(
+        stats => { out[index] = stats },
+        () => { /* the caller re-states this path synchronously */ },
+      ))
+    }
+    await Promise.all(pending)
+  }
+  return out
+}
+
 /** Scan one root: per-file facts (HTML scanner + AST extractor). */
 async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorkerPool, capture = false, declaredGlobals: readonly string[] = []) {
   const { files, projectFiles, pythonFiles, cargoFiles, goFiles, truncated, walkErrors, ignoreHash } = capture ? collectCandidatesLocal(root, signal) : await collectCandidates(root, signal)
@@ -248,11 +279,15 @@ async function scanFacts(root: string, signal?: AbortSignal, workers?: AstWorker
   // `DSH_FORGE_INDEXER=0` mean "no sidecar at all", statistics included.
   const sidecar = files.length > 0 && indexerTraceWanted() && await indexerReady({ signal })
   const remote = sidecar ? await indexerStatPaths(files.map(file => file.abs), signal) : null
+  // Without the sidecar this was one blocking stat per file: ~120 µs each on
+  // Windows (the filter driver dominates, not the syscall), so 1.9 k candidates
+  // spent ~230 ms — most of a warm query. Same calls, four pool threads.
+  const local = remote ? null : await statAll(files, signal)
   for (let index = 0; index < files.length; index++) {
     const { abs, rel } = files[index]
     signal?.throwIfAborted()
     try {
-      const stat = remote?.[index] ?? statSync(abs)
+      const stat = remote?.[index] ?? local?.[index] ?? statSync(abs)
       stamps.push([rel, stat.mtimeMs, stat.size, stat.ctimeMs])
       const cacheKey = JSON.stringify([rootIdentity, abs])
       const cached = FACTS_CACHE.get(cacheKey)
@@ -1005,17 +1040,17 @@ export function assembleTraceGraph(root: string, options: TraceAssemblyOptions =
 
 export function createTraceTool(workers?: AstWorkerPool) {
   return {
-    name: 'fftrace',
+    name: 'ff_trace',
     description:
-      'Trace dependencies before changing code; read-only, never runs workspace code. Answers who breaks if a file changes, what a file imports, how A reaches B, where an IPC channel registers or a preload API lands, which globals preloads expose and who uses them, which scripts a page loads, where a name is defined, and FFI/binary exports. Targets: see the target parameter. Resolves tsconfig/jsconfig paths, baseUrl, project references, package exports/imports, re-export barrels and TS program membership; bare TS require() never joins a program. Covers JS/TS, HTML/Vue/Svelte, Python, Rust, C/C++, Go, Java, Lua and TS ambient declarations. Dynamic paths, external packages and generated code stay unresolved; edgeMode=certain drops candidates. ' +
+      'Trace dependencies before changing code; read-only, never runs workspace code. Answers who breaks if a file changes, what a file imports, how A reaches B, where an IPC channel registers or a preload API lands, which globals preloads expose and who uses them, which scripts a page loads, and FFI/binary exports. Targets: see the target parameter. Resolves tsconfig/jsconfig paths, baseUrl, project references, package exports/imports, re-export barrels and TS program membership; bare TS require() never joins a program. Covers JS/TS, HTML/Vue/Svelte, Python, Rust, C/C++, Go, Java, Lua and TS ambient declarations. Dynamic paths, external packages and generated code stay unresolved; edgeMode=certain drops candidates. ' +
       'ffi:<name> reports source declarations and PE/ELF/WASM exports as separate evidence, never a verified call chain. Optional compile_commands.json supplies C/C++ include flags, never running commands.',
     parameters: {
-      target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<a> -> <b>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), symbol:<name>, ffi:<name>.' },
+      target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<a> -> <b>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), ffi:<name>. Definitions belong to ff_symbols.' },
       declarations: { type: 'string', description: 'Absolute or workspace-relative JSON file, ≤256KiB: {apis:[{name,channel,kind,roles}],roleGlobals?:{role:global}}; kind=query/command/subscription.' },
       compileCommands: { type: 'string', description: 'Compilation database JSON (≤8MiB); defaults to workspace compile_commands.json for C/C++. Reads include flags without executing commands.' },
       edgeMode: { type: 'string', enum: ['all', 'certain'], description: 'File dependency edges for file:/impact:/path:. all (default) includes labelled candidates; certain excludes them. Static certainty does not prove runtime execution.' },
       format: { type: 'string', enum: ['auto', 'summary', 'detail'], description: 'exposes: 视图：auto（默认）按规模分档，survey 折叠为每个 expose 一行，小桥接保留逐键站点；detail 展开全部逐键站点。' },
-      limit: { type: 'integer', description: 'symbol: 最多返回的定义数（1-200，默认 50）；file:/impact:/exposes: 每页行数（1-500，默认 100）。' },
+      limit: { type: 'integer', description: 'file:/impact:/exposes: 每页行数（1-500，默认 100）；其他查询不接受。' },
       cursor: { type: 'string', description: 'file:/impact:/exposes: 的后续页游标，取自上一页的 nextCursor；只能与同一 target/edgeMode 和同一 limit 一起使用，过期或换查询需重新发起。' },
       capture: { type: 'boolean', description: '正式捕获路径：逐文件读取字节、按同一份内容提取事实并保存内容基线（跨进程可用于改动前后比较）。绕过缓存与 sidecar，比普通查询慢；不完整时明确报错而不谎称基线。' },
     },
@@ -1129,33 +1164,17 @@ export function createTraceTool(workers?: AstWorkerPool) {
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const raw = typeof args.target === 'string' ? args.target : ''
-      // Symbol lookup answers before any graph scan: one call replaces reading
-      // every candidate file when a name has several definitions (A8).
-      const symbol = /^\s*symbol\s*:\s*(.+?)\s*$/i.exec(raw)
-      if (symbol) {
-        if (args.edgeMode !== undefined && args.edgeMode !== 'all') return failure('edgeMode 不适用于 symbol: 查询。')
-        if (args.format !== undefined && args.format !== 'auto') return failure('format 不适用于 symbol: 查询。')
-        const name = symbol[1]
-        const found = await findDefinitions(exec, { name, ...(args.limit === undefined ? {} : { limit: args.limit }) }, workers)
-        if ('error' in found) return found
-        const files = new Set(found.items.map((item) => String(item.file))).size
-        const lines = [
-          `## Trace symbol:${name}`,
-          `- 定义 ${found.items.length} 处 · ${files} 个文件 · ${found.stats}${found.truncated ? ' · ⚠️ 结果已截断（可加 limit）' : ''}`,
-          ...found.items.map((item) => `- \`${item.file}:${item.startLine}-${item.endLine}\` · ${item.kind} · \`${item.qualifiedName}\`#${item.occurrence}${item.signature ? ` · ${item.signature}` : ''}`),
-          ...(found.items.length ? ['- 定位实现：ff_read view=body 传 path=文件 与 qualifiedName（或 path=文件#起-止行）；上方路径:行可直接回填 ffedit。'] : ['- 未找到该符号的定义；名称按精确匹配，不含模糊/前缀搜索。']),
-        ]
-        return {
-          found: found.items.length > 0,
-          target: `symbol:${name}`,
-          text: lines.join('\n'),
-          ...(found.truncated ? { truncated: true } : {}),
-        }
-      }
+      const allowed = ['target', 'declarations', 'compileCommands', 'edgeMode', 'format', 'limit', 'cursor', 'capture']
+      const unknown = Object.keys(args).find(key => !allowed.includes(key))
+      if (unknown) return failure(`unknown trace parameter: ${unknown}`)
+      if (/^\s*symbol\s*:/i.test(raw)) return failure('symbol definitions belong to ff_symbols view=definitions; ff_trace does not capture symbol queries')
       const target = parseTarget(raw)
       if (!target) {
-        return failure('fftrace needs a target like file:路径, impact:路径, path:源文件 -> 目标文件, ipc:通道名, api:名称, global:名称, page:xxx.html, exposes:名称, symbol:名称, or ffi:符号名.')
+        return failure('ff_trace needs a target like file:路径, impact:路径, path:源文件 -> 目标文件, ipc:通道名, api:名称, global:名称, page:xxx.html, exposes:名称, or ffi:符号名. Use ff_symbols for definitions.')
       }
+      if (args.edgeMode !== undefined && !['file', 'impact', 'path'].includes(target.kind)) return failure('edgeMode applies only to file:/impact:/path:')
+      if (args.format !== undefined && target.kind !== 'exposes') return failure('format applies only to exposes:')
+      if (args.limit !== undefined && !['file', 'impact', 'exposes'].includes(target.kind)) return failure('limit applies only to file:/impact:/exposes:')
       const edgeMode: EdgeMode = args.edgeMode === undefined || args.edgeMode === 'all' ? 'all' : args.edgeMode === 'certain' ? 'certain' : 'all'
       if (args.edgeMode !== undefined && args.edgeMode !== 'all' && args.edgeMode !== 'certain') return failure('edgeMode 仅接受 all 或 certain。')
       if (edgeMode === 'certain' && !['file', 'impact', 'path'].includes(target.kind)) return failure('edgeMode=certain 适用于 file:/impact:/path: 文件依赖查询。')
@@ -1220,31 +1239,52 @@ export function createTraceTool(workers?: AstWorkerPool) {
       const incomplete = truncated || parseErrors > 0 || partialFiles > 0 || walkErrors > 0 || decls.status === 'failed'
         || compilation?.status === 'failed' || Boolean(compilation?.unsupported) || result.analysis?.complete === false || graph.resolutionLimited === true || issues.length > 0 || resolutionIncomplete || graph.unboundBridge.length > 0
       const derivedKeys = graph.namedEntries.size
-      // Two lines, not eight. The scan scope, the confidence legend and the
-      // candidate-edge policy are identical in every reply on a given repo, so
-      // repeating them per call is a constant tax on a question that cannot
-      // change them — and the same facts already travel in the structured
-      // fields (scanned / decls / diagnostics / incomplete). Keep what the
-      // answer depends on: coverage (so "not found" is never mistaken for
-      // "absent"), edgeMode (the caller chose it), and anything that limits
-      // trust in THIS answer.
+      // Caveats belong to the query that can be moved by them, and they belong
+      // after the answer, not in front of it.
+      //
+      // Both halves were measured on VCPChat (docs/takeover-eval-result-2026-10-30.md,
+      // "Q8 为什么装了插件反而多绕"). `fftrace ipc:app-features:renderer-entries`
+      // returned 677 bytes that already named the registration line, the preload
+      // exposure and the invoke — and the caller still re-ran the same search with
+      // grep and then re-read the file. What it had read first was this header:
+      // "311 项本地未解析（另有 4123 项外部包）" / "桥接接收者绑定未确定 3074 处" /
+      // "含候选边" — three numbers that no ipc: query can be affected by, and one
+      // of them (edgeMode) is rejected outright on ipc:/api:/symbol:, where it
+      // means nothing. A correct answer announced as provisional gets re-checked.
+      //
+      // So: the dependency-walk caveats only ride on the dependency walks, the
+      // bridge count only rides on ffi: (api: and symbol: already print it inline,
+      // filtered to the name asked about), and an ok compile database is not a
+      // caveat at all.
+      const dependencyWalk = target.kind === 'file' || target.kind === 'impact' || target.kind === 'path'
       const scopeBits = [
         `${graph.stats.withFacts} 文件`,
         `${graph.stats.pages} 页面`,
         describeDecls(decls.status, decls.apis.length, decls.error),
         ...(derivedKeys ? [`${derivedKeys} 推导键`] : []),
         ...(truncated ? ['⚠️ 扫描截断'] : []),
-        edgeMode === 'certain' ? '仅确定边' : '含候选边',
+        ...(dependencyWalk ? [edgeMode === 'certain' ? '仅确定边' : '含候选边'] : []),
+      ]
+      const scanGaps = [
+        ...(parseErrors ? [`读取/解析失败 ${parseErrors} 处`] : []),
+        ...(partialFiles ? [`部分解析 ${partialFiles} 文件`] : []),
+        ...(walkErrors ? [`遍历失败 ${walkErrors} 处`] : []),
+        ...(truncated ? ['候选截断'] : []),
+        ...(result.analysis?.complete === false ? ['查询遍历受限'] : []),
+        ...(resolutionIncomplete && dependencyWalk ? ['存在配置或归属限制'] : []),
+        ...(compilation?.status === 'failed' || compilation?.unsupported ? ['编译元数据不全'] : []),
+        // onLimit fires from java-resolution (inheritance budget) and from
+        // rust-resolution (module ownership budget) — naming only Java would
+        // send a Rust caller looking for a Java problem.
+        ...(graph.resolutionLimited ? ['模块归属或继承成员解析达预算（Java/Rust），推断已停止'] : []),
       ]
       const caveats = [
-        ...(localUnresolved.length || externalUnresolved || issues.length
-          ? [`${localUnresolved.length} 项本地未解析${externalUnresolved ? `（另有 ${externalUnresolved} 项外部包）` : ''}，${issues.length} 项文件/工程问题`]
+        ...(dependencyWalk && (localUnresolved.length || externalUnresolved)
+          ? [`${localUnresolved.length} 项本地未解析${externalUnresolved ? `（另有 ${externalUnresolved} 项外部包）` : ''}`]
           : []),
-        ...(incomplete
-          ? [`读取/解析失败 ${parseErrors} 处，部分解析 ${partialFiles} 文件，遍历失败 ${walkErrors} 处${truncated ? '，候选截断' : ''}${result.analysis?.complete === false ? '，查询遍历受限' : ''}${resolutionIncomplete ? '，存在配置或归属限制' : ''}${compilation?.status === 'failed' || compilation?.unsupported ? '，编译元数据不全' : ''}${graph.unboundBridge.length ? `，桥接接收者绑定未确定 ${graph.unboundBridge.length} 处` : ''}`]
-          : []),
-        ...(compilation ? [`编译数据库 ${compilation.status} · ${compilation.entries} 条${compilation.unsupported ? ` · ${compilation.unsupported} 条不支持` : ''}`] : []),
-        ...(graph.resolutionLimited ? ['模块归属或 Java 继承成员解析达预算，推断已停止'] : []),
+        ...(scanGaps.length ? [scanGaps.join('，')] : []),
+        ...(issues.length ? [`${issues.length} 项文件/工程问题`] : []),
+        ...(graph.unboundBridge.length && target.kind === 'ffi' ? [`桥接接收者绑定未确定 ${graph.unboundBridge.length} 处`] : []),
       ]
       // Issue paths stay: they name the files whose facts are unreliable, which
       // is actionable. The per-issue message is the same sentence every time, so
@@ -1349,11 +1389,20 @@ export function createTraceTool(workers?: AstWorkerPool) {
           ...(truncated ? { truncated: true } : {}),
         }
       }
+      // A negative answer leads with its scope: "not found" is only meaningful
+      // next to what was searched. A positive answer leads with itself — the
+      // caveat block follows the rows it qualifies, so the caller reads a
+      // finding first and a boundary second, which is the order it will quote
+      // them in either way.
+      const body = [captureHeader(assembled.capture), ...rest].filter(Boolean).join('\n')
+      const text = result.found && body
+        ? `${title}\n${body}\n\n${header}`
+        : [title, captureHeader(assembled.capture), header, ...rest].filter(Boolean).join('\n')
       return {
         found: result.found,
         target: `${target.kind}:${value}`,
         edgeMode,
-        text: [title, captureHeader(assembled.capture), header, ...rest].filter(Boolean).join('\n'),
+        text,
         snapshot: snapshotInfo(assembled.snapshot),
         ...(assembled.capture ? { capture: assembled.capture } : {}),
         scanned,

@@ -113,9 +113,21 @@ try {
     clear()
 
     if (defaults.snapshot.provider === 'native') {
+      // A current sidecar resolves every receiver itself, so the supplement has
+      // nothing to redo. An OLDER binary omits them, and those files must fall
+      // back to one strict byte read rather than inherit an unbound site. The
+      // seam below is that older binary: it strips every receiver from the reply.
+      const native = await import('../lib/indexer-client.js')
+      native.setIndexerReplyTransformForTest((method, reply) => {
+        if (method !== 'traceFacts' || !reply?.results) return reply
+        for (const result of reply.results) for (const ref of result?.value?.bridge ?? []) delete ref.receiver
+        return reply
+      })
+      clear()
       const badSource = Buffer.concat([Buffer.from('const bad=window.bridgeA;bad.read()\n// '), Buffer.from([0xff])])
       bindingWrite('bad.js', badSource)
-      const rejected = await assembleTraceGraph(bindingRoot)
+      let rejected
+      try { rejected = await assembleTraceGraph(bindingRoot) } finally { native.setIndexerReplyTransformForTest(null) }
       assert.equal(rejected.snapshot.strength, 'observed')
       assert.ok(rejected.partialFiles > 0)
       assert.ok(rejected.diagnostics.some(issue => issue.path === 'bad.js' && issue.reason === 'bridge_binding_unavailable'))
@@ -125,11 +137,21 @@ try {
       const validSource = Buffer.from(badSource); validSource[validSource.length - 1] = 120
       bindingWrite('bad.js', validSource)
       fs.utimesSync(path.join(bindingRoot, 'bad.js'), stamp.atime, stamp.mtime)
+      clear()
       const recovered = await assembleTraceGraph(bindingRoot)
       assert.ok(!recovered.graph.unboundBridge.some(ref => ref.path === 'bad.js'))
       assert.ok(recovered.graph.bridgeByObject.get('bridgeA').some(ref => ref.path === 'bad.js'))
       assert.equal(recovered.partialFiles, 0)
-      ok('native facts with an unavailable strict-byte supplement stay unknown and retry after repair')
+      ok('an older sidecar\'s unbound sites stay unknown and bind after the bytes are repaired')
+
+      // And the current binary needs no supplement at all: every site arrives
+      // resolved, so a file with a stray byte is bound without a second parse.
+      bindingWrite('bad.js', badSource)
+      clear()
+      const bound = await assembleTraceGraph(bindingRoot)
+      assert.equal(bound.partialFiles, 0)
+      assert.ok(bound.graph.bridgeByObject.get('bridgeA').some(ref => ref.path === 'bad.js'))
+      ok('a current sidecar binds every site natively, with no WASM re-parse')
     } else console.log('SKIPPED native binding supplement failure case: native sidecar is not active')
   } finally {
     if (previousNative === undefined) delete process.env.DSH_FORGE_TRACE_NATIVE

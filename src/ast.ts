@@ -659,7 +659,7 @@ export interface SymbolParse {
  */
 export async function parseFile(absPath: string, options: { readPath?: string } = {}): Promise<ParseOutcome> {
   const lang = detectLanguage(absPath)
-  if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ffgrep for everything else` }
+  if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ff_grep for everything else` }
   // The caller's address supplies the language; a provider may pin byte reads
   // to a canonical target with a different extension (including no extension).
   const readPath = options.readPath ?? absPath
@@ -679,7 +679,7 @@ export async function parseFile(absPath: string, options: { readPath?: string } 
   // monsters are low-value for symbol extraction and their parse trees blow
   // up the WASM heap high-water mark for the rest of the session.
   if (Buffer.byteLength(text, 'utf8') > MAX_AST_FILE_BYTES) {
-    return { error: `${path.basename(absPath)} exceeds the ${(MAX_AST_FILE_BYTES / 1048576).toFixed(0)}MB AST cap — use ffgrep for it` }
+    return { error: `${path.basename(absPath)} exceeds the ${(MAX_AST_FILE_BYTES / 1048576).toFixed(0)}MB AST cap — use ff_grep for it` }
   }
 
   try {
@@ -701,7 +701,7 @@ export async function parseFile(absPath: string, options: { readPath?: string } 
     return { value: { absPath, lang, hash, text, symbols, signatures, partial } }
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause)
-    return { error: `AST engine unavailable for ${lang}: ${message} — use ffgrep instead` }
+    return { error: `AST engine unavailable for ${lang}: ${message} — use ff_grep instead` }
   }
 }
 
@@ -715,7 +715,7 @@ export async function parseFile(absPath: string, options: { readPath?: string } 
  */
 export async function parseFileSearch(absPath: string): Promise<{ value?: SymbolParse; error?: string }> {
   const lang = detectLanguage(absPath)
-  if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ffgrep for everything else` }
+  if (!lang) return { error: `unsupported language for ${path.basename(absPath)} — outline/symbol tools cover ${Object.keys(EXT_LANG).join(' ')}; use ff_grep for everything else` }
   const st = statSafe(absPath)
   if (st) {
     const cached = fileCache.get(absPath)

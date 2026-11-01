@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { dataDir } from './core.ts'
 import { atomicWrite } from './ledger.ts'
 import type { EditStep, StepCandidate } from './edit-engine.ts'
+import type { CheckSelector } from './check-static.ts'
 
 export const TICKET_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -46,6 +47,8 @@ export interface TicketPayload {
   mode: 'atomic'
   /** Persisted so a ticket replay keeps the refusal policy of the original call. */
   revertOnSyntaxError?: boolean
+  /** Verification intent survives every ambiguity decision; execution capabilities do not persist. */
+  verify?: CheckSelector[]
   /** Bind the whole original snapshot; choices cannot silently retarget. */
   sourceHash: string
   workdir: string
@@ -117,7 +120,9 @@ export function loadTicket(id: string): Ticket | { error: string } {
       || typeof ticket.sourceHash !== 'string' || !Array.isArray(ticket.steps)
       || !Array.isArray(ticket.candidates) || !Array.isArray(ticket.decisions)
       || !Number.isInteger(ticket.stepIndex) || !ticket.steps[ticket.stepIndex]
-      || !Number.isFinite(ticket.expiresAt)) {
+      || !Number.isFinite(ticket.expiresAt)
+      || (ticket.verify !== undefined && (!Array.isArray(ticket.verify)
+        || ticket.verify.some(check => !['bridge', 'ipc', 'syntax'].includes(check))))) {
       return { error: `ticket ${id} has an invalid or obsolete payload — re-send ffedit` }
     }
     if (Date.now() > ticket.expiresAt) {

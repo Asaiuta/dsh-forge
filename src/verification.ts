@@ -29,7 +29,38 @@ import path from 'node:path'
 import { withFileLock } from './core.ts'
 import { atomicWrite, storeFor, type StorePaths } from './ledger.ts'
 import { candidateSetDrift } from './trace-candidates.ts'
-import type { HostOutputRef } from './check-host.ts'
+
+/**
+ * One captured stream of a host execution.
+ *
+ * Declared here rather than beside the runner that produced it: the runner is
+ * gone (ffcheck's `action=run` was retired — see docs/forge-check-absorption.md),
+ * but records written by it are still on disk and `ffhistory checks=true` must
+ * keep rendering them. A record is data; the code that wrote it is history.
+ */
+export interface HostStreamRef {
+  sha256: string
+  bytes: number
+  truncated: boolean
+  spillPath?: string
+  detail?: string
+}
+
+/** Where a host execution's output lives, as the record remembers it. */
+export type HostOutputRef = {
+  kind: 'spill'
+  path: string
+  bytes: number
+  sha256: string
+  truncated: boolean
+  streams: { stdout: HostStreamRef; stderr: HostStreamRef }
+} | {
+  kind: 'digest'
+  sha256: string
+  bytes: number
+  truncated: boolean
+  streams: { stdout: HostStreamRef; stderr: HostStreamRef }
+}
 
 /** C2 closed status vocabulary. `stale` is this module's applicability verdict. */
 export type CheckStatus = 'passed' | 'failed' | 'partial' | 'not_run' | 'unavailable' | 'stale'

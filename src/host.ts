@@ -2,22 +2,18 @@
 import { defineTool, type ParameterSchemaSpec, type ValueSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ForgeExec } from './core.ts'
 import { freezePresentation } from './presentation.ts'
-import { FORGE_DEFINITION_TAG } from './delegate.ts'
 import type { ForgeFileSystem, ForgeFsEvents } from './execution.ts'
+
+/**
+ * Marks a definition as forge's own. `defineForgeTool` stamps it, so code that
+ * meets a definition by name (the augmentation in `./augment.ts`, the guidance
+ * gate) can tell forge's tools from the host's built-ins with a property read.
+ */
+export const FORGE_DEFINITION_TAG = 'dshForgeName'
 
 type Json = null | string | number | boolean | Json[] | { [key: string]: Json }
 interface Factory<V, O extends ValueSchemaSpec> {
   name: string
-  /**
-   * Host-facing name, when it differs from the forge name.
-   *
-   * `takeover` registers a forge tool under a built-in name (`read`) so it
-   * shadows that built-in for the agent. Only the *registry* name changes:
-   * `name` still labels the guard, the audit ledger and the presentation card,
-   * so history stays identical whichever mode produced the write and a reader
-   * of `ffhistory` is never left guessing which surface ran.
-   */
-  registerAs?: string
   description: string
   parameters: ParameterSchemaSpec
   output: { schema: O; render(args: unknown, value: V): Array<{ type: 'text'; text: string }> }
@@ -26,9 +22,9 @@ interface Factory<V, O extends ValueSchemaSpec> {
    * @param args - validated arguments.
    * @param exec - the guarded context (sandbox authorisation attached).
    * @param raw - the unmodified tool-run context of this call. Only a tool that
-   *   hands work to another definition needs it: `dsh-tools` keys per-execution
-   *   bookkeeping by object identity, so a delegated call must receive the
-   *   original, not the guarded copy.
+   *   hands work to a host seam needs it (ffcheck files its approval against the
+   *   registry `callId`): `dsh-tools` keys per-execution bookkeeping by object
+   *   identity, so the original must be passed on, not the guarded copy.
    */
   execute(args: Record<string, unknown>, exec: ForgeExec | undefined, raw?: ForgeExec): Promise<unknown>
 }
@@ -54,7 +50,7 @@ export function defineForgeTool<V, O extends ValueSchemaSpec>(factory: Factory<V
     forgePresentation: { type: 'object' as const, additionalProperties: true as const }, workspace: { type: 'string' as const },
   } } as ValueSchemaSpec
   const definition = compile({
-    name: factory.registerAs ?? factory.name,
+    name: factory.name,
     description: factory.description,
     parameters: factory.parameters,
     isConcurrencySafe: () => factory.isConcurrencySafe(),
@@ -72,14 +68,14 @@ export function defineForgeTool<V, O extends ValueSchemaSpec>(factory: Factory<V
       return presentation ? { ...(value as Record<string, Json>), forgePresentation: presentation as unknown as Json } : value
     },
   })
-  // Stamped so a fallback lookup can tell forge's own definitions apart: a
-  // scoped tool that resolved *itself* by name would delegate to itself.
+  // Stamped so code that meets a definition by name can tell forge's own apart
+  // from a host built-in (see FORGE_DEFINITION_TAG).
   ;(definition as unknown as Record<string, unknown>)[FORGE_DEFINITION_TAG] = factory.name
   definition.output.presentationMeta = (_args, value) => typeof value === 'object' && value !== null && !Array.isArray(value) ? value.forgePresentation ?? null : null
   definition.presentResult = (_args, result) => {
     const meta = result.meta
     if (result.isError || !meta || typeof meta !== 'object' || Array.isArray(meta) || !Array.isArray(meta.diffs) || meta.diffs.length === 0) return
-    return { card: 'diff', title: `Forge batch #${meta.batch}${meta.omitted ? ` (${meta.omitted} files omitted; use ffhistory)` : ''}`,
+    return { card: 'diff', title: `Forge batch #${meta.batch}${meta.omitted ? ` (${meta.omitted} files omitted; use ff_history)` : ''}`,
       diffs: meta.diffs as unknown as Array<{ path: string; oldText: string | null; newText: string }> }
   }
   return definition

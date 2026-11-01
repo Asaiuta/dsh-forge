@@ -64,7 +64,7 @@ function lineOf(rel, token) {
   return idx + 1
 }
 
-const S = (o) => ({ mode: 'plain', name: null, file: null, fileName: null, patterns: null, expect: 'visible', ...o })
+const S = (o) => ({ name: null, file: null, fileName: null, patterns: null, expect: 'visible', ...o })
 
 const SCENARIOS = [
   S({ id: 'A1', kind: '寻址', question: 'js 顶层函数定义', name: 'isEmail', pattern: 'isEmail', file: 'src/validate.js', target: { file: 'src/validate.js', line: truth.validateIsEmail } }),
@@ -83,8 +83,10 @@ const SCENARIOS = [
   S({ id: 'B2', kind: '发现', question: '调用点（用法，非定义）', pattern: 'store.putBlob(', target: { file: 'src/login.js', line: lineOf('src/login.js', 'store.putBlob(') } }),
   S({ id: 'B3', kind: '发现', question: 'markdown 文档里的内容', pattern: 'Call `putBlob`', target: { file: 'docs/guide.md', line: lineOf('docs/guide.md', 'Call `putBlob`') } }),
   S({ id: 'B4', kind: '发现', question: '中文文档内容（多字节）', pattern: '中文标记', target: { file: 'data/unicode.md', line: lineOf('data/unicode.md', '中文标记') } }),
-  S({ id: 'B5', kind: '发现', question: '拼写容错（fuzzy）', pattern: 'normailze_path', mode: 'fuzzy', target: { file: 'lib/utils.py', line: lineOf('lib/utils.py', 'def normalize_path') } }),
-  S({ id: 'B6', kind: '发现', question: '正则模式', pattern: 'function\\s+(submit|showError)', mode: 'regex', target: { file: 'src/login.js', line: lineOf('src/login.js', 'function submit') } }),
+  S({ id: 'B5', kind: '发现', question: '拼写容错（fuzzy）', pattern: 'normailze_path', target: { file: 'lib/utils.py', line: lineOf('lib/utils.py', 'def normalize_path') } }),
+  // B6 (正则模式) is no longer a forge scenario: regex search belongs to the
+  // built-in grep by contract, so no forge chain claims it. Keeping it here would
+  // score a capability the surface deliberately does not have.
   S({ id: 'B7', kind: '发现', question: '非代码文本常量', pattern: 'CRLF_TOKEN', target: { file: 'data/crlf.txt', line: truth.crlfToken } }),
   S({ id: 'B8', kind: '发现', question: '源码注释内容', pattern: 'Blob store with dedup', target: { file: 'src/store.js', line: lineOf('src/store.js', 'Blob store with dedup') } }),
 
@@ -186,38 +188,10 @@ const CHAINS = [
   {
     id: 'grep', needs: ['pattern'], label: 'ffgrep', family: 'forge',
     run: async (s) => {
-      const r = await grep.execute({ pattern: s.pattern, mode: s.mode, limit: 50 }, exec)
+      const r = await grep.execute({ pattern: s.pattern, limit: 50 }, exec)
       const items = r.items ?? []
       const ok = items.some((i) => norm(i.file) === s.target.file && i.line === s.target.line)
       return { ok, bytes: sumB(items.map((i) => i.text)), detail: `${items.length} hits` }
-    },
-  },
-  {
-    id: 'grep+enc', needs: ['pattern'], label: 'grep+enc', family: 'forge',
-    run: async (s) => {
-      const r = await grep.execute({ pattern: s.pattern, mode: s.mode, limit: 50, enclosing: true }, exec)
-      const items = r.items ?? []
-      const ok = items.some((i) => norm(i.file) === s.target.file && i.line === s.target.line)
-      return { ok, bytes: sumB(items.map((i) => i.text)), detail: `${items.length} hits, ${items.filter((i) => i.in).length} sym` }
-    },
-  },
-  {
-    id: 'grep→read', needs: ['pattern'], label: 'g→read', family: 'forge',
-    run: async (s) => {
-      const r = await grep.execute({ pattern: s.pattern, mode: s.mode, limit: 50, enclosing: true }, exec)
-      let bytes = sumB((r.items ?? []).map((i) => i.text))
-      const seen = new Set()
-      for (const item of (r.items ?? [])) {
-        if (!item.in?.name) continue
-        const key = `${item.file}#${item.in.name}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        const rr = await readSymbol.execute({ path: item.file, symbol: item.in.name, line: item.line }, exec)
-        if (rr.error) continue
-        bytes += b(rr.text)
-        if (norm(item.file) === s.target.file && covered(s.target, rr.startLine, rr.endLine)) return { ok: true, bytes, detail: `read ${key}` }
-      }
-      return { ok: false, bytes, detail: `${(r.items ?? []).length} hits, no covering read` }
     },
   },
   {

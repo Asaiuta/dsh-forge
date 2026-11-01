@@ -80,10 +80,12 @@ interface Entry {
    * stale line.
    */
   removed: boolean
+  revision: number
 }
 
 /** Keyed by normalized absolute path, so `D:/X` and `d:\x` are one file. */
 const entries = new Map<string, Entry>()
+let revision = 0
 
 function key(absPath: string): string {
   const resolved = path.resolve(absPath)
@@ -102,7 +104,7 @@ function key(absPath: string): string {
  */
 export function markWritten(absPath: string, bytes: Buffer | string | null): void {
   const buf = bytes === null ? Buffer.alloc(0) : Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes, 'utf8')
-  entries.set(key(absPath), { abs: path.resolve(absPath), bytes: buf, at: Date.now(), removed: bytes === null })
+  entries.set(key(absPath), { abs: path.resolve(absPath), bytes: buf, at: Date.now(), removed: bytes === null, revision: ++revision })
 }
 
 /** One overlaid file, resolved against the caller's index root. */
@@ -116,6 +118,8 @@ export interface OverlayFile {
 
 /** What the overlay says about one index root. */
 export interface OverlaySnapshot {
+  /** Changes on writes, deletions or expiry under this root, without hashing file bodies. */
+  identity: string
   /** Files whose committed content is authoritative and searchable, newest first. */
   files: OverlayFile[]
   /**
@@ -153,7 +157,7 @@ export function overlaySnapshot(basePath: string, now = Date.now()): OverlaySnap
     shadowed.add(rel)
     if (!entry.removed) files.push({ abs: entry.abs, rel, bytes: entry.bytes })
   }
-  return { files, shadowed }
+  return { files, shadowed, identity: live.map(({ entry }) => entry.revision).join(',') }
 }
 
 /** Test hook: forget everything. */
@@ -173,18 +177,22 @@ export function matchesCase(pattern: string, smartCase: boolean): boolean {
   return pattern === pattern.toLowerCase()
 }
 
-/** Build the matcher for one query, or `null` when the mode cannot be mirrored. */
+/** Build the matcher for one query. Every mode maps onto something safe. */
 function matcherFor(
   pattern: string,
   mode: 'plain' | 'regex' | 'fuzzy',
   smartCase: boolean,
-): ((line: string) => number) | null {
-  // `fuzzy` scores by an algorithm this file does not have, and a rough
-  // approximation would put hits in the page that the index would never
-  // produce. Refusing the mode is honest; the caller then keeps index-only
-  // results for this query, which is exactly the previous behaviour.
-  if (mode === 'fuzzy') return null
+): (line: string) => number {
+  // `fuzzy` scores by an algorithm this file does not have, so it cannot be
+  // mirrored faithfully. It is, however, a **superset** of the literal match:
+  // anything occurring as a substring also occurs as a subsequence. Matching
+  // literally therefore cannot invent a row the index would never produce — it
+  // can only omit the tolerant ones — which is the safe direction. Refusing the
+  // mode was the unsafe one: the caller drops the index's hits for every file
+  // this session wrote, so a refusal left that file answering *nothing* until
+  // the scan caught up.
   const flags = matchesCase(pattern, smartCase) ? 'i' : ''
+  if (mode === 'fuzzy') return literalMatcher(pattern, flags)
   if (mode === 'regex') {
     let re: RegExp
     try {
@@ -225,11 +233,20 @@ function clip(text: string): string {
  */
 export function searchOverlay(
   files: OverlayFile[],
-  pattern: string,
+  pattern: string | string[],
   options: { mode: 'plain' | 'regex' | 'fuzzy'; smartCase: boolean; context: number; limit: number },
 ): GrepItem[] {
-  const match = matcherFor(pattern, options.mode, options.smartCase)
-  if (match === null || files.length === 0 || pattern === '') return []
+  const patterns = (Array.isArray(pattern) ? pattern : [pattern]).filter(needle => needle !== '')
+  if (files.length === 0 || patterns.length === 0) return []
+  const matchers = patterns.map(needle => matcherFor(needle, Array.isArray(pattern) ? 'plain' : options.mode, options.smartCase))
+  const match = (line: string): number => {
+    let first = -1
+    for (const matcher of matchers) {
+      const at = matcher(line)
+      if (at >= 0 && (first < 0 || at < first)) first = at
+    }
+    return first
+  }
   const items: GrepItem[] = []
   for (const file of files) {
     // `limit` is applied at a FILE boundary, never mid-file: the engine collects

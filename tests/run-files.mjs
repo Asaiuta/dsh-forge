@@ -4,10 +4,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
-import { createFileTool } from '../lib/tools-files.js'
-import { createHistoryTool, createRollbackTool } from '../lib/tools-edit.js'
-import { FinderPool } from '../lib/core.js'
-import { storeFor, readLedgerTail, workspaceKey, putBlob, recordBatch } from '../lib/ledger.js'
+import { createFileTool } from '../src/tools-files.ts'
+import { createEditTool, createHistoryTool, createRollbackTool } from '../src/tools-edit.ts'
+import { FinderPool } from '../src/core.ts'
+import { storeFor, readLedgerTail, workspaceKey, putBlob, recordBatch } from '../src/ledger.ts'
 import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
 
 const sandbox = fs.mkdtempSync(path.join(tmpdir(), 'forge-files-'))
@@ -17,8 +17,10 @@ process.env.DSH_FORGE_DATA_DIR = path.join(sandbox, 'data')
 const exec = { agent: { session: { header: { cwd: workspace, id: 'files' } } }, token: {} }
 const file = name => path.join(workspace, name)
 const tool = createFileTool(), pool = new FinderPool(), rollback = createRollbackTool(pool)
+const editor = createEditTool(pool)
+const symbolCall = args => editor.execute({ reason: 'test', ...args }, exec)
 const call = args => tool.execute({ reason: 'test', ...args }, exec)
-const undo = batch => rollback.execute({ batch: String(batch), reason: 'undo', dryRun: false }, exec)
+const undo = batch => rollback.execute({ batch, reason: 'undo', dryRun: false }, exec)
 let passed = 0
 const ok = label => console.log(`ok ${++passed} - ${label}`)
 async function main() {
@@ -53,37 +55,37 @@ async function main() {
   fs.writeFileSync(file('src/source.js'), '/** A */\r\nfunction A() {\r\n  return 1\r\n}\r\nfunction B() {}\r\n')
   fs.writeFileSync(file('src/target.js'), '\uFEFF// target\r\n')
   const originalSource = fs.readFileSync(file('src/source.js')), originalTarget = fs.readFileSync(file('src/target.js'))
-  const copied = await call({ action: 'copy_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1 })
+  const copied = await call({ action: 'copy_code', path: 'src/source.js', sourceSymbol: 'A', destination: 'src/target.js', after: 1 })
   assert.ok(copied.batch, copied.error)
   assert.deepEqual(fs.readFileSync(file('src/source.js')), originalSource)
   assert.ok(fs.readFileSync(file('src/target.js'), 'utf8').includes('/** A */\r\nfunction A()'))
   await undo(copied.batch); assert.deepEqual(fs.readFileSync(file('src/target.js')), originalTarget)
-  const transferred = await call({ action: 'move_code', path: 'src/source.js', symbol: 'A', destination: 'src/target.js', after: 1 })
+  const transferred = await call({ action: 'move_code', path: 'src/source.js', sourceSymbol: 'A', destination: 'src/target.js', after: 1 })
   assert.ok(transferred.batch, transferred.error)
   assert.equal(fs.readFileSync(file('src/source.js'), 'utf8').includes('function A'), false)
   await undo(transferred.batch)
   assert.deepEqual(fs.readFileSync(file('src/source.js')), originalSource); assert.deepEqual(fs.readFileSync(file('src/target.js')), originalTarget)
   ok('cross-file symbol copy/move includes adjacent comments, preserves destination BOM/EOL, and rolls back together')
 
-  const reordered = await call({ action: 'move_code', path: 'src/source.js', destination: 'src/source.js', symbol: 'A', after: 5 })
+  const reordered = await call({ action: 'move_code', path: 'src/source.js', destination: 'src/source.js', sourceSymbol: 'A', after: 5 })
   assert.ok(reordered.batch, reordered.error)
   assert.ok(fs.readFileSync(file('src/source.js'), 'utf8').indexOf('function B') < fs.readFileSync(file('src/source.js'), 'utf8').indexOf('function A'))
   await undo(reordered.batch)
-  assert.match((await call({ action: 'move_code', path: 'src/source.js', destination: 'src/source.js', symbol: 'A', after: 2 })).error, /inside/)
+  assert.match((await call({ action: 'move_code', path: 'src/source.js', destination: 'src/source.js', sourceSymbol: 'A', after: 2 })).error, /inside/)
   ok('same-file move compiles source/destination against one snapshot and rejects overlap')
 
   fs.writeFileSync(file('src/inline.js'), '\uFEFFconst chinese="中文"; class C { run() { return "😀"; } other() {} }\r\n')
   const inlineBefore = fs.readFileSync(file('src/inline.js'))
-  const symbolEdit = await call({ action: 'edit_symbol', path: 'src/inline.js', symbol: 'C.run', edit: 'replace', content: 'run() { return "changed"; }' })
+  const symbolEdit = await symbolCall({ path: 'src/inline.js', sourceSymbol: 'C.run', edit: 'replace', content: 'run() { return "changed"; }' })
   assert.ok(symbolEdit.batch, symbolEdit.error)
   assert.equal(fs.readFileSync(file('src/inline.js'), 'utf8'), '\uFEFFconst chinese="中文"; class C { run() { return "changed"; } other() {} }\r\n')
   await undo(symbolEdit.batch); assert.deepEqual(fs.readFileSync(file('src/inline.js')), inlineBefore)
-  const deletedSymbol = await call({ action: 'edit_symbol', path: 'src/inline.js', symbol: 'C.other', edit: 'delete' })
+  const deletedSymbol = await symbolCall({ path: 'src/inline.js', sourceSymbol: 'C.other', edit: 'delete' })
   assert.ok(deletedSymbol.batch, deletedSymbol.error)
   assert.equal(fs.readFileSync(file('src/inline.js'), 'utf8').includes('other()'), false)
   assert.ok(fs.readFileSync(file('src/inline.js'), 'utf8').includes('return "😀";'))
   await undo(deletedSymbol.batch)
-  const insertedSymbol = await call({ action: 'edit_symbol', path: 'src/inline.js', symbol: 'C.other', edit: 'insert_before', content: 'added() {} ' })
+  const insertedSymbol = await symbolCall({ path: 'src/inline.js', sourceSymbol: 'C.other', edit: 'insert_before', content: 'added() {} ' })
   assert.ok(insertedSymbol.batch, insertedSymbol.error)
   assert.ok(fs.readFileSync(file('src/inline.js'), 'utf8').includes('added() {} other() {}'))
   await undo(insertedSymbol.batch)
@@ -91,7 +93,7 @@ async function main() {
   ok('exact symbol replace/delete/insert preserve same-line neighbors, Unicode offsets, BOM/EOL and byte rollback')
 
   fs.writeFileSync(file('src/comment.js'), 'const keep = 42; // docs for Drop\nfunction Drop() {}\n')
-  const dropped = await call({ action: 'edit_symbol', path: 'src/comment.js', symbol: 'Drop', edit: 'delete' })
+  const dropped = await symbolCall({ path: 'src/comment.js', sourceSymbol: 'Drop', edit: 'delete' })
   assert.ok(dropped.batch, dropped.error)
   assert.equal(fs.readFileSync(file('src/comment.js'), 'utf8'), 'const keep = 42; // docs for Drop\n\n')
   ok('preceding trailing comment cannot make symbol deletion consume another statement')
@@ -109,7 +111,9 @@ async function main() {
     fs.writeFileSync(file(`src/${name}`), content)
     const ledger = fs.readFileSync(storeFor(workspace).ledgerFile)
     for (const action of ['edit_symbol', 'move_code', 'copy_code']) {
-      const result = await call({ action, path: `src/${name}`, symbol, edit: 'delete', destination: 'src/target.js', after: 0 })
+      const result = action === 'edit_symbol'
+        ? await symbolCall({ path: `src/${name}`, sourceSymbol: symbol, edit: 'delete' })
+        : await call({ action, path: `src/${name}`, sourceSymbol: symbol, destination: 'src/target.js', after: 0 })
       assert.match(result.error, /shares a declaration|syntax-valid original parse|must be unique/, `${name} ${action}: ${result.error}`)
       assert.equal(fs.readFileSync(file(`src/${name}`), 'utf8'), content)
       assert.deepEqual(fs.readFileSync(storeFor(workspace).ledgerFile), ledger)
@@ -124,7 +128,7 @@ async function main() {
     ['Member.java', 'enum C { Drop, Keep }\n', 'C.Drop'],
   ]) {
     fs.writeFileSync(file(`src/${name}`), content)
-    assert.match((await call({ action: 'edit_symbol', path: `src/${name}`, symbol, edit:'delete' })).error, /separator handling/, name)
+    assert.match((await symbolCall({ path: `src/${name}`, sourceSymbol: symbol, edit:'delete' })).error, /separator handling/, name)
     assert.equal(fs.readFileSync(file(`src/${name}`), 'utf8'), content)
   }
   ok('comma list member deletion refuses unsafe separator removal even where grammar misses invalid output')
@@ -137,7 +141,7 @@ async function main() {
   ]) {
     fs.writeFileSync(file(`src/${name}`), content)
     fs.writeFileSync(file(`src/to-${name}`), '')
-    const transferred = await call({ action: 'move_code', path: `src/${name}`, symbol, destination: `src/to-${name}`, after: 0 })
+    const transferred = await call({ action: 'move_code', path: `src/${name}`, sourceSymbol: symbol, destination: `src/to-${name}`, after: 0 })
     assert.ok(transferred.batch, `${name}: ${transferred.error}`)
     assert.equal(fs.readFileSync(file(`src/${name}`), 'utf8'), neighbor + '\n')
     assert.ok(fs.readFileSync(file(`src/to-${name}`), 'utf8').startsWith(prefix), name)
@@ -153,7 +157,7 @@ async function main() {
   assert.equal(fs.readFileSync(file('src/timeline.txt'), 'utf8'), 'one\n')
   await undo(point.newBatch)
   assert.equal(fs.readFileSync(file('src/timeline.txt'), 'utf8'), 'two\n')
-  assert.match((await rollback.execute({ batch: String(timeline2.batch), throughBatch: timeline1.batch, reason: 'invalid' }, exec)).error, /exactly one/)
+  assert.match((await rollback.execute({ batch: timeline2.batch, throughBatch: timeline1.batch, reason: 'invalid' }, exec)).error, /exactly one/)
   ok('throughBatch restores file state at a named ledger boundary and its own rollback redoes the current bytes')
 
   const boundary = await call({ action: 'create', path: 'src/external-time.txt', content: 'AT_BOUNDARY' })
@@ -181,7 +185,7 @@ async function main() {
   assert.match((await call({ action: 'create', path: '../escape', content: 'x' })).error, /inside/)
   assert.match((await call({ action: 'create', path: 'missing/parent.txt', content: 'x' })).error, /parent/)
   fs.writeFileSync(file('src/invalid.js'), Buffer.from([65, 255, 10]))
-  assert.ok((await call({ action: 'copy_code', path: 'src/invalid.js', symbol: 'A', destination: 'src/target.js', after: 0 })).error)
+  assert.ok((await call({ action: 'copy_code', path: 'src/invalid.js', sourceSymbol: 'A', destination: 'src/target.js', after: 0 })).error)
   ok('workspace containment, absent parents and invalid source encoding fail before writes')
 
   fs.writeFileSync(file('src/human.txt'), 'HUMAN\n')
@@ -189,7 +193,7 @@ async function main() {
   fs.symlinkSync(file('src/human.txt'), link)
   const beforeLinks = fs.readFileSync(storeFor(workspace).ledgerFile)
   for (const action of ['remove', 'move']) {
-    assert.match((await call({ action, path: 'src/link.txt', destination: 'src/new-link.txt' })).error, /symbolic link identity/)
+    assert.match((await call({ action, path: 'src/link.txt', ...(action === 'move' ? { destination: 'src/new-link.txt' } : {}) })).error, /symbolic link identity/)
     assert.equal(fs.lstatSync(link).isSymbolicLink(), true)
     assert.equal(fs.readFileSync(file('src/human.txt'), 'utf8'), 'HUMAN\n')
   }
@@ -208,7 +212,7 @@ async function main() {
   fs.symlinkSync(file('src/absent-target.txt'), file('src/dangling.txt'))
   const danglingLedger = fs.readFileSync(storeFor(workspace).ledgerFile)
   for (const action of ['create', 'remove', 'move']) {
-    assert.match((await call({ action, path:'src/dangling.txt',destination:'src/other.txt',content:'AFTER' })).error, /symbolic link identity/)
+    assert.match((await call({ action, path: 'src/dangling.txt', ...(action === 'move' ? { destination: 'src/other.txt' } : action === 'create' ? { content: 'AFTER' } : {}) })).error, /symbolic link identity/)
   }
   assert.match((await undo(dangling.batch)).error, /symbolic link identity/)
   assert.equal(fs.lstatSync(file('src/dangling.txt')).isSymbolicLink(), true)
@@ -239,7 +243,7 @@ async function main() {
     file: oldRelative, op: 'update', before: beforeBlob, after: afterBlob, bytes: 6, eol: 'LF', bom: false,
   }] })
   assert.equal(storeFor(deepRoot).root, deepAlias)
-  const legacyUndo = await rollback.execute({ batch: String(legacyBatch.id), reason: 'coordinate regression', dryRun: false },
+  const legacyUndo = await rollback.execute({ batch: legacyBatch.id, reason: 'coordinate regression', dryRun: false },
     { agent: { session: { header: { cwd: deepRoot, id: 'new-host' } } } })
   assert.equal(legacyUndo.status, 'applied', legacyUndo.error)
   assert.equal(fs.readFileSync(originalFile, 'utf8'), 'BEFORE\n')
@@ -257,12 +261,12 @@ async function main() {
   // --- transfer anchor matrix + indent=auto + fromLines (PF MoveCode/CopyCode semantics) ---
   fs.writeFileSync(file('lib.js'), 'export function target() {}\n\nexport function afterMe() {\n  return 1;\n}\n')
   fs.writeFileSync(file('dest.js'), 'function wrapper() {\n  return 2;\n}\n')
-  const anchored = await call({ action: 'copy_code', path: 'lib.js', symbol: 'afterMe', destination: 'dest.js', afterSymbol: 'wrapper' })
+  const anchored = await call({ action: 'copy_code', path: 'lib.js', sourceSymbol: 'afterMe', destination: 'dest.js', afterSymbol: 'wrapper' })
   assert.ok(anchored.batch)
   assert.ok(fs.readFileSync(file('dest.js'), 'utf8').includes('export function afterMe()'))
   assert.ok(anchored.note.includes('insert after wrapper'))
   ok('copy_code anchors by afterSymbol')
-  const beforeAnchor = await call({ action: 'copy_code', path: 'lib.js', symbol: 'target', destination: 'dest.js', beforeSymbol: 'wrapper' })
+  const beforeAnchor = await call({ action: 'copy_code', path: 'lib.js', sourceSymbol: 'target', destination: 'dest.js', beforeSymbol: 'wrapper' })
   assert.ok(beforeAnchor.note.includes('incl. its leading comment'))
   const destText = fs.readFileSync(file('dest.js'), 'utf8')
   assert.ok(destText.indexOf('export function target() {}') < destText.indexOf('function wrapper'))
@@ -277,7 +281,7 @@ async function main() {
   const flat = await call({ action: 'copy_code', path: 'src2.js', destination: 'nest.js', fromLines: 'L1', after: 1, indent: 'none' })
   assert.ok(fs.readFileSync(file('nest.js'), 'utf8').includes('\ndoWork();\n  if (ok)'))
   ok('indent=none keeps block bytes as-is')
-  const conflicting = await call({ action: 'copy_code', path: 'lib.js', symbol: 'target', destination: 'dest.js', after: 1, beforeSymbol: 'wrapper' })
+  const conflicting = await call({ action: 'copy_code', path: 'lib.js', sourceSymbol: 'target', destination: 'dest.js', after: 1, beforeSymbol: 'wrapper' })
   assert.ok(conflicting.error.includes('exactly one destination anchor'))
   ok('conflicting anchors refuse explicitly')
   const moveSame = await call({ action: 'move_code', path: 'lib.js', fromLines: 'L1-3', destination: 'lib.js', after: 2 })

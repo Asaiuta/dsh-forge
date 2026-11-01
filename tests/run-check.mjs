@@ -1,5 +1,5 @@
 /**
- * ffcheck action=static — the formal verification entry.
+ * The static verification engine — reached through `ffedit {verify: [...]}`.
  *
  * What this suite is actually protecting (M1.3 in docs/forge-plan-m0-m1.md):
  *
@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createEditTool } from '../lib/tools-edit.js'
-import { createCheckTool } from '../lib/tools-check.js'
+import { runStaticCheck } from '../lib/check-static.js'
 import { loadBaseline } from '../lib/trace-capture.js'
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-data-'))
@@ -73,7 +73,10 @@ function workspace(files) {
     abs: rel => path.join(root, ...rel.split('/')),
     exec: { agent: { session: { header: { cwd: root, id: 'check' } } }, token: {} },
     tool: createEditTool({ peekMain: () => undefined }),
-    check: createCheckTool(),
+    // The tool that used to wrap this engine (ffcheck) is gone; the engine is
+    // now reached through ffedit's `verify` argument, so the semantics below are
+    // asserted against the function that argument calls.
+    check: { execute: (args, exec) => runStaticCheck(args, exec) },
     /** Run the check with this workspace as the cwd. */
     async run(args = {}) {
       return this.check.execute({ action: 'static', ...args }, this.exec)
@@ -321,17 +324,16 @@ const assertStructured = (result, label) => {
   const ws = workspace({ 'only.js': 'const a = 1\n' })
   try {
     for (const [args, pattern] of [
-      [{ action: 'tests' }, /action must be "static"/],
-      [{ action: 'static', checks: ['types'] }, /未知的检查项/],
-      [{ action: 'static', checks: [] }, /不能为空/],
-      [{ action: 'static', batches: [0] }, /positive integer/],
-      [{ action: 'static', batches: [] }, /non-empty/],
+      [{ checks: ['types'] }, /未知的检查项/],
+      [{ checks: [] }, /不能为空/],
+      [{ checks: ['bridge'], batches: [0] }, /positive integer/],
+      [{ checks: ['bridge'], batches: [] }, /non-empty/],
     ]) {
       const result = await ws.check.execute(args, ws.exec)
       assert.equal(typeof result.error, 'string', `${JSON.stringify(args)}: ${JSON.stringify(result)}`)
       assert.match(result.error, pattern)
     }
-    ok('tests, types, empty selections and bad ids are refused by name — the tool does not pretend to run them')
+    ok('types, empty selections and bad ids are refused by name — the engine does not pretend to run them')
   } finally { ws.close() }
 }
 

@@ -9,11 +9,18 @@ export async function promptSurface({ config, plugin, visibleNames } = {}) {
   const agent = { ctx: { tools: { register(definition) { scoped.push(definition); return () => {} } } } }
   const agents = { list: () => [agent] }
   const allowed = visibleNames === undefined ? undefined : new Set(visibleNames)
+  // The host's built-ins are not forge definitions: `visibleForgeText` probes them to
+  // decide whether the augmented `read` is the one that answers `file#Symbol`. Without
+  // them the captured guidance falls into the wrong branch (specialist search next to
+  // an additive read), which is a shape no real host ever shows.
+  const builtins = ['read', 'grep', 'glob', 'edit'].map(name => ({ name }))
   const host = {
     tools: {
       register: definition => { definitions.push(definition) },
       get: (name, scope) => allowed && !allowed.has(name) ? undefined
-        : (scope === agent.ctx ? scoped.find(d => d.name === name) : undefined) ?? definitions.find(d => d.name === name),
+        : (scope === agent.ctx ? scoped.find(d => d.name === name) : undefined)
+          ?? definitions.find(d => d.name === name)
+          ?? builtins.find(d => d.name === name),
     },
     commands: { register: command => { commands.push(command) } },
     systemPrompt: { section(section) { sections.push(section); return () => {} } },

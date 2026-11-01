@@ -628,11 +628,11 @@ export function allStores(): StorePaths[] {
 }
 
 /** Remove snapshot stores whose workspace root no longer exists on disk. */
-export function pruneOrphanedStores(): Array<{ root: string; dir: string; bytes: number }> {
+export function pruneOrphanedStores(stores: readonly StorePaths[] = allStores()): Array<{ root: string; dir: string; bytes: number }> {
   const removed: Array<{ root: string; dir: string; bytes: number }> = []
-  for (const store of allStores()) {
+  for (const store of stores) {
     const stats = statsFor(store)
-    if (!stats.orphan) continue
+    if (!stats.orphan || hasPendingTransaction(store)) continue
     try {
       rmSync(store.dir, { recursive: true, force: true })
       removed.push({ root: stats.root, dir: store.dir, bytes: stats.blobBytes })
@@ -643,7 +643,7 @@ export function pruneOrphanedStores(): Array<{ root: string; dir: string; bytes:
   return removed
 }
 
-/** Blob ids referenced by any ledger node (before/after hashes) — the GC reachability root set. */
+/** Snapshot roots from committed history and any pending recovery journal. */
 export function referencedBlobIds(store: StorePaths): Set<string> {
   const refs = new Set<string>()
   for (const batch of readLedgerTail(store, Number.MAX_SAFE_INTEGER)) {
@@ -652,11 +652,18 @@ export function referencedBlobIds(store: StorePaths): Set<string> {
       if (node.after) refs.add(node.after)
     }
   }
+  if (hasPendingTransaction(store)) {
+    // Validate before deleting anything: a damaged journal has unknown roots.
+    for (const node of readJournal(store).nodes) {
+      if (node.before) refs.add(node.before)
+      if (node.after) refs.add(node.after)
+    }
+  }
   return refs
 }
 
-/** Reference-aware blob recycling inside one live store: delete only files
- *  no ledger node points at (torn-write leftovers), never reachable ones.
+/** Reference-aware blob recycling. Call while holding the workspace lock.
+ *  Pending recovery snapshots remain roots even before a batch is committed.
  *  Reports each freed blob with its compressed size on disk. */
 export function gcStoreBlobs(store: StorePaths): Array<{ id: string; bytes: number }> {
   if (!existsSync(store.blobsDir)) return []

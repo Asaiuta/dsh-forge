@@ -29,19 +29,47 @@
  * @module dsh-forge/absence
  */
 
-import { readdirSync } from 'node:fs'
+import { readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 
-/** Depth of the diagnostic walk. Deep enough for `node_modules/@scope/pkg/…`. */
-const MAX_DEPTH = 6
+/**
+ * Depth of every diagnostic walk.
+ *
+ * Three levels cover both jobs. For the note: the top-level segment the index
+ * prunes (`node_modules/`) and the shape `src/client/foo.tsx`. For freshness:
+ * the parent of any file a session realistically creates. Measured on this repo
+ * with a name that is absent — depth 6 costs 416 ms (name walk) / 149 ms
+ * (freshness walk), depth 3 costs 7 ms / 8 ms. The deep levels are almost
+ * entirely build output and dependency trees, which `HEAVY_DIRS` skips anyway;
+ * what is left in them is a name nobody searches for.
+ */
+const MAX_DEPTH = 3
 /** Visited-entry budget. A 23k-file `node_modules` finishes well inside this. */
 const MAX_ENTRIES = 60_000
-/** Wall-clock budget. Bounds the added latency of a failed call. */
+/** Wall-clock budget for the freshness walk. */
 const MAX_MS = 400
+/** Wall-clock budget for the name walk. */
+const NOTE_MS = 120
 /** Matches are evidence, not an enumeration; three is enough to fix the call. */
 const MAX_HITS = 3
 /** Directories never worth entering (pseudo-filesystems, VCS metadata). */
 const SKIP_DIRS = new Set(['.git', '.hg', '.svn', '$RECYCLE.BIN', 'System Volume Information', 'lost+found'])
+/**
+ * Dependency trees and build output.
+ *
+ * Two reasons, and only the second one is about speed. The index does not hold
+ * these trees — fff honours `.gitignore` — so a name found here produces the
+ * note "exists on disk" for a file the caller can never search; the honest
+ * answer for `node_modules/x` is the visibility note, not a path. And they are
+ * most of the tree: on this repo, entering them doubled the entries visited
+ * (12,664 → 24,701) and took 300 of the 400 ms budget.
+ */
+const HEAVY_DIRS = new Set([
+  'node_modules', 'bower_components', 'jspm_packages',
+  'target', 'dist', 'build', 'out', 'obj',
+  '.venv', 'venv', 'site-packages', '__pycache__', '.tox',
+  '.next', '.nuxt', '.turbo', '.parcel-cache', 'coverage',
+])
 /** Longest reminder we are willing to add to a failed page. */
 const MAX_NOTE = 360
 
@@ -77,6 +105,11 @@ export function literalNeedle(query: string): string {
  *
  * Breadth-first so a shallow match is found before the walk descends into a
  * large tree. Symlinks are not followed, which also rules out cycles.
+ *
+ * Bounded in depth as well as in time: the note only ever needs the top few
+ * levels (see `MAX_DEPTH`), and an unbounded walk spends its budget
+ * proving a negative across build output. Measured on this repo, a name that is
+ * absent: 416 ms at depth 6 vs 7 ms at depth 3.
  */
 export function walkForName(root: string, needle: string): AbsenceWalk {
   const lower = needle.toLowerCase()
@@ -87,12 +120,13 @@ export function walkForName(root: string, needle: string): AbsenceWalk {
   let truncated = false
 
   walk: while (queue.length > 0) {
-    if (Date.now() - started > MAX_MS || visited >= MAX_ENTRIES) {
+    if (Date.now() - started > NOTE_MS || visited >= MAX_ENTRIES) {
       truncated = true
       break
     }
     const current = queue.shift()
     if (current === undefined) break
+    if (current.depth + 1 > MAX_DEPTH) continue
     let entries
     try {
       entries = readdirSync(current.dir, { withFileTypes: true })
@@ -100,7 +134,7 @@ export function walkForName(root: string, needle: string): AbsenceWalk {
       continue
     }
     for (const entry of entries) {
-      if (++visited >= MAX_ENTRIES || Date.now() - started > MAX_MS) {
+      if (++visited >= MAX_ENTRIES || Date.now() - started > NOTE_MS) {
         truncated = true
         break walk
       }
@@ -110,12 +144,83 @@ export function walkForName(root: string, needle: string): AbsenceWalk {
         hits.push({ rel, dir })
         if (hits.length >= MAX_HITS) break walk
       }
-      if (dir && current.depth + 1 <= MAX_DEPTH && !SKIP_DIRS.has(entry.name)) {
+      if (dir && current.depth + 1 <= MAX_DEPTH && !SKIP_DIRS.has(entry.name) && !HEAVY_DIRS.has(entry.name)) {
         queue.push({ dir: path.join(current.dir, entry.name), rel, depth: current.depth + 1 })
       }
     }
   }
   return { hits, truncated }
+}
+
+/**
+ * Did anything appear under this root since the index last scanned it?
+ *
+ * The counterpart of `walkForName` for content queries. A grep page that is
+ * empty cannot be checked by name — the answer depends on bytes — so the only
+ * honest question left is whether the index could still be *behind*. Directory
+ * mtimes answer that: creating or deleting an entry bumps its parent, so a
+ * directory newer than the scan is a directory the index has not seen the
+ * current shape of.
+ *
+ * Deliberately cheap: one readdir per directory plus one stat per subdirectory,
+ * no file reads. It cannot see a file whose *contents* changed in place (that
+ * does not touch the parent's mtime) — the overlay in `tools.ts` covers the
+ * files this session wrote, which is where that case actually bites.
+ *
+ * @param root - scope root of the lease that produced the empty page.
+ * @param sinceMs - `lease.scannedAt`: epoch ms of the last completed scan.
+ * @param budgetMs - wall-clock cap, same budget as the absence walk.
+ */
+export function walkNewerThan(root: string, sinceMs: number, budgetMs = MAX_MS): { newer: string[]; truncated: boolean } {
+  const newer: string[] = []
+  const queue: Array<{ dir: string; rel: string; depth: number }> = [{ dir: root, rel: '', depth: 0 }]
+  const started = Date.now()
+  let visited = 0
+  let truncated = false
+
+  // The root itself: adding a file directly under it bumps only its own mtime.
+  try {
+    if (statSync(root).mtimeMs > sinceMs) newer.push('')
+  } catch {
+    // an unreadable root is not evidence of staleness
+  }
+
+  walk: while (queue.length > 0) {
+    if (Date.now() - started > budgetMs || visited >= MAX_ENTRIES) {
+      truncated = true
+      break
+    }
+    const current = queue.shift()
+    if (current === undefined) break
+    if (current.depth + 1 > MAX_DEPTH) continue
+    let entries
+    try {
+      entries = readdirSync(current.dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (++visited >= MAX_ENTRIES || Date.now() - started > budgetMs) {
+        truncated = true
+        break walk
+      }
+      if (!entry.isDirectory() || SKIP_DIRS.has(entry.name) || HEAVY_DIRS.has(entry.name)) continue
+      const abs = path.join(current.dir, entry.name)
+      const rel = current.rel === '' ? entry.name : `${current.rel}/${entry.name}`
+      let mtime = 0
+      try {
+        mtime = statSync(abs).mtimeMs
+      } catch {
+        continue
+      }
+      if (mtime > sinceMs) {
+        newer.push(rel)
+        if (newer.length >= MAX_HITS) break walk
+      }
+      queue.push({ dir: abs, rel, depth: current.depth + 1 })
+    }
+  }
+  return { newer, truncated }
 }
 
 function clip(value: string, max = 72): string {
@@ -125,26 +230,46 @@ function clip(value: string, max = 72): string {
 }
 
 /**
- * One clause per hit, phrased as the call that would have found it.
+ * One clause, phrased as the call that would have found it.
  *
- * A path is only called "not indexed" after `canList` — a real engine probe —
- * says its containing segment is invisible. A top-level entry is never called
- * excluded: it is simply a directory, or a name the pattern did not match.
+ * Earlier versions emitted one clause per hit — `"node_modules/" is a directory
+ * (these tools list files only) — use path="node_modules"; "node_modules/accepts/
+ * node_modules/" is a directory, not indexed at this scope — use path=…`. On a
+ * real page that read as a debug dump: nested quotes, a suggestion that
+ * repeated the segment the caller had already typed, and three different
+ * explanations of one empty result. The first hit is the evidence; the rest is
+ * a count. A path is only called invisible after `canList` — a real engine
+ * probe — says its containing segment is pruned.
+ *
+ * @param hit - first name the disk walk found.
+ * @param matches - how many names the walk found in total.
+ * @param canList - engine probe for a top-level segment.
+ * @param truncated - the walk hit a budget, so the list is not exhaustive.
  */
-function describe(hit: AbsenceHit, canList: (segment: string) => boolean): { text: string; excluded: string | null } {
-  const nested = hit.rel.includes('/')
-  const segment = nested ? (hit.rel.split('/')[0] ?? hit.rel) : ''
-  // Only a nested path can be invisible because a *container* is unindexed.
-  const hidden = nested && !canList(segment)
+function clause(
+  hit: AbsenceHit,
+  matches: number,
+  canList: (segment: string) => boolean,
+  truncated: boolean,
+  rescanned: boolean,
+): string {
   const shown = clip(hit.rel, 58)
+  const rest = matches > 1 ? ` (+${matches - 1} more)` : ''
+  const partial = truncated ? '; disk walk stopped early, list is partial' : ''
   if (hit.dir) {
+    const segment = hit.rel.includes('/') ? (hit.rel.split('/')[0] ?? '') : ''
+    const hidden = segment !== '' && !canList(segment)
     return hidden
-      ? { text: `"${shown}/" is a directory, not indexed at this scope — use path="${shown}"`, excluded: segment }
-      : { text: `"${shown}/" is a directory (these tools list files only) — use path="${shown}"`, excluded: null }
+      ? `[directory "${shown}/" is not visible at this scope${rest} — search inside it with path="${shown}"${partial}]`
+      : `[ffind lists files only: "${shown}/" is a directory${rest} — search inside it with path="${shown}"${partial}]`
   }
-  return hidden
-    ? { text: `"${shown}" exists on disk, not indexed at this scope`, excluded: segment }
-    : { text: `"${shown}" exists on disk — matching is case-sensitive`, excluded: null }
+  // The file is on disk, the index was rebuilt, and it is still absent. That is
+  // an exclusion (ignore rule, scope), not a spelling problem — and saying so
+  // is the whole reason for rescanned.
+  if (rescanned) {
+    return `[no match — "${shown}" is on disk but the rebuilt index still excludes it${rest}${partial}]`
+  }
+  return `[no match, but "${shown}" exists on disk${rest} — the pattern matches case-sensitively${partial}]`
 }
 
 export interface AbsenceLookup {
@@ -157,40 +282,31 @@ export interface AbsenceLookup {
    * Injected so the wording never claims an exclusion the engine does not have.
    */
   readonly canList: (segment: string) => boolean
+  /**
+   * The caller rebuilt the index after this name was found on disk. Turns the
+   * note from "you may have mis-typed it" into "the index excludes it".
+   */
+  readonly rescanned?: boolean
+  /**
+   * A walk the caller already ran (it needed the same answer to decide whether
+   * to rebuild the index). Passing it back keeps an empty page at one disk walk
+   * instead of two — measured 805 ms vs 400 ms for a name that is simply absent.
+   */
+  readonly walk?: AbsenceWalk
 }
 
 /**
  * Explain an empty page, or return `undefined` when the disk agrees that there
  * is nothing to find (or nothing specific enough to search for).
  *
- * Clauses are added until the budget runs out rather than truncated, so the
- * note never ends mid-sentence.
+ * The note is a single sentence by construction — see `clause` — so there is no
+ * budget-trimming loop and no possibility of ending mid-clause.
  */
 export function explainAbsence(lookup: AbsenceLookup): string | undefined {
   const needle = literalNeedle(lookup.query)
   if (needle === '') return undefined
-  const { hits, truncated } = walkForName(lookup.scopeRoot, needle)
+  const { hits, truncated } = lookup.walk ?? walkForName(lookup.scopeRoot, needle)
   if (hits.length === 0) return undefined
-
-  const head = `no match for "${needle}", but the tree on disk contains it:`
-  const described = hits.map(hit => describe(hit, lookup.canList))
-  const excluded = new Set<string>()
-  for (const item of described) {
-    if (item.excluded !== null && item.excluded !== needle) excluded.add(item.excluded)
-  }
-  // The "why" is worth more than the third example, so the closing sentence is
-  // fixed first and example clauses are dropped from the end until it fits.
-  const tails: string[] = []
-  if (excluded.size > 0) {
-    tails.push(`${[...excluded].map(name => `"${name}"`).join(', ')} is not indexed at this scope — point path inside it to search there`)
-  }
-  if (truncated) tails.push('the disk walk stopped early, so this list is partial')
-
-  const chosen = described.map(item => item.text)
-  while (chosen.length > 0) {
-    const note = [head, chosen.join('; '), ...tails].join(' ').trim()
-    if (note.length <= MAX_NOTE) return note
-    chosen.pop()
-  }
-  return [head, ...tails].join(' ').trim()
+  const note = clause(hits[0], hits.length, lookup.canList, truncated, lookup.rescanned === true)
+  return note.length <= MAX_NOTE ? note : `${note.slice(0, MAX_NOTE - 1)}…]`
 }

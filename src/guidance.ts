@@ -1,91 +1,171 @@
 /**
- * Task-oriented guidance for the names and capabilities visible in one scope.
- * Native takeover keeps the host's argument contracts; its guidance must not
- * advertise additive-only options such as ffgrep.patterns or fffind.mode.
+ * Task-oriented guidance for the forge tools visible in one scope.
+ *
+ * Forge never renames itself onto a built-in, so every line names a forge tool
+ * by its own name, and a line appears only when that tool resolves in the
+ * calling scope. The built-ins `read`/`grep`/`glob` carry their own prompt
+ * sections; augmenting them adds exactly one line here, for the one behaviour
+ * the model cannot discover from the built-in's description (`file#Symbol`).
  */
-import { FORGE_DEFINITION_TAG } from './delegate.ts'
+import { FORGE_DEFINITION_TAG } from './host.ts'
+import type { AugmentName } from './augment.ts'
+
 export const FORGE_GUIDANCE_ORDER = 130
 export const FORGE_GUIDANCE_SECTION = 'plugin:dsh-forge'
 
 export const FORGE_CAPABILITIES = [
-  'find', 'grep', 'read', 'edit', 'file', 'history', 'rollback', 'trace', 'cards', 'check',
+  'find', 'grep', 'read', 'edit', 'file', 'history', 'rollback', 'trace', 'verify', 'project',
 ] as const
 export type ForgeCapability = (typeof FORGE_CAPABILITIES)[number]
-export type ForgeSurface = Record<ForgeCapability, string>
 
-export const ADDITIVE_SURFACE: ForgeSurface = {
-  find: 'fffind', grep: 'ffgrep', read: 'ff_read', edit: 'ffedit', file: 'ff_file',
-  history: 'ffhistory', rollback: 'ffrollback', trace: 'fftrace', cards: 'ff_cards', check: 'ffcheck',
+/** The forge tool serving each capability. */
+export const FORGE_TOOLS: Record<ForgeCapability, string> = {
+  find: 'ff_find', grep: 'ff_grep', read: 'ff_symbols', edit: 'ff_edit', file: 'ff_file',
+  history: 'ff_history', rollback: 'ff_rollback', trace: 'ff_trace', verify: 'ff_verify', project: 'ff_project',
 }
-export function surfaceNames(surface: ForgeSurface): string[] {
-  return FORGE_CAPABILITIES.map(capability => surface[capability])
+export const FORGE_TOOL_NAMES = FORGE_CAPABILITIES.map((capability) => FORGE_TOOLS[capability])
+
+/** What an augmented built-in adds to the model-facing surface. */
+export interface AugmentedSurface {
+  /** The built-in `read` answers `file_path=<file>#<Symbol>` with that definition's lines. */
+  symbolRead?: boolean
+  /**
+   * The scope resolves a built-in `grep`, so plain and regex content search is
+   * not ffgrep's job. `undefined` (no registry to ask) keeps the routing that
+   * matches a full host.
+   */
+  builtinGrep?: boolean
+  /** The scope resolves a built-in `glob`, so path patterns are not fffind's. */
+  builtinGlob?: boolean
 }
-export const FORGE_TOOL_NAMES = surfaceNames(ADDITIVE_SURFACE)
 
 /** Render only available capabilities, with no references to hidden tools. */
-export function forgeGuidance(surface: ForgeSurface, visible: readonly ForgeCapability[] = FORGE_CAPABILITIES): string {
-  if (!visible.length) return ''
-  const n = surface, has = (cap: ForgeCapability): boolean => visible.includes(cap)
+const RETRIEVAL_CAPABILITIES: readonly ForgeCapability[] = ['find', 'grep', 'read']
+
+export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CAPABILITIES, augmented: AugmentedSurface = {}): string {
+  const has = (cap: ForgeCapability): boolean => visible.includes(cap)
+  // A missing built-in is the one case where "use the built-in" is a dead end:
+  // hosting without `glob`/`grep` leaves the forge tool as the only answer, and
+  // the line has to say so. Only an explicit `false` (a scope that was asked and
+  // answered) overrides the full-host wording.
+  const builtinGlob = augmented.builtinGlob !== false
+  const builtinGrep = augmented.builtinGrep !== false
+  if (!visible.length && !augmented.symbolRead) return ''
+  const n = FORGE_TOOLS
   return [
-    'dsh-forge is installed. For the tasks below, prefer these tools; follow each tool\'s schema.',
-    ...(has('read') ? [
-      `- Understand a file → ${n.read} view=outline first, then view=body for selected lines or path#symbol. Find a definition → view=definitions with symbol (also when several files define the same name — it lists every definition with signatures). Batch paths/ranges in one read when useful.`,
+    'Route by task below, not by habit; each tool\'s schema says how to call it.',
+    // One line either way: when `read` answers `file#Symbol`, a plain read stays
+    // the built-in's and ff_read keeps what only it can do.
+    //
+    // Order matters and was measured: leading with "view=outline first" made two
+    // real sessions run a 21KB outline before reading a symbol they had already
+    // named (Q5 of docs/takeover-eval-result-2026-10-30.md — 5.4k tok and one
+    // round trip burnt for nothing). The known-symbol case comes first and says
+    // not to outline; the outline is introduced only as what answers the
+    // opposite question. That correction is the one thing here no schema can
+    // carry, so it survives every trim.
+    ...(has('read') && augmented.symbolRead ? [
+      `- Symbol known → read with file_path=<file>#<Symbol> (no offset/limit): that definition only, no outline first. Need the names → ${n.read} view=outline; every definition of one name → view=definitions. A plain read stays the built-in read.`,
+    ] : has('read') ? [
+      `- Code structure → ${n.read} view=outline for names and line ranges; view=definitions with symbol=<name> for exact definitions. Read source through the built-in read using the returned file and line range.`,
+    ] : augmented.symbolRead ? [
+      '- Read one definition → read with file_path=<file>#<Symbol> (no offset/limit): only that definition\'s lines come back, numbered like any read.',
     ] : []),
-    ...(has('find') ? [n.find === 'glob'
-      ? '- Find files by path → glob with pattern and optional path.'
-      : `- Find files → ${n.find} mode=name for fuzzy names; mode=glob for path patterns (page continues results). Prefer over glob for these tasks.`,
-    ] : []),
-    ...(has('grep') ? [n.grep === 'grep'
-      ? '- Search file contents → grep with a regular-expression pattern, optional path and include.'
-      : `- Search file contents → ${n.grep} over grep: pattern for plain/regex/fuzzy search, or patterns for 2-16 literals in one pass; cursor continues results, enclosing=true adds symbol context.`,
-    ] : []),
-    ...(has('read') || has('find') || has('grep') ? [
-      'For reads/searches outside the workspace, pass path at the target file/directory, including another checkout or node_modules, subject to the active filesystem permissions. Check partial/truncated results before concluding absence.',
-    ] : []),
+    // Only the routing is left: which tool for the question, not how to call it.
+    ...(has('find') ? [builtinGlob
+      ? `- Find files → built-in glob for path patterns; ${n.find} only for fuzzy names or typos.`
+      : `- Find files → ${n.find}: fuzzy names and typos, any directory.`] : []),
+    ...(has('grep') ? [builtinGrep
+      ? `- Search contents → built-in grep for plain/regex; ${n.grep} for fuzzy search or multi-literal.`
+      : `- Search contents → ${n.grep}: fuzzy by default, literal for multi-pattern or non-ASCII.`] : []),
     ...(has('trace') ? [
-      `- ${n.trace} answers wiring questions in one query — pick target= by question: who breaks if I change a file → impact:src/file.ts; what a file imports → file:<path>; how A reaches B → path:<a> -> <b>; where an IPC channel registers or a preload API lands → ipc:<channel> / api:<name>; which globals a preload exposes and who uses each member → exposes:<global|file>; who defines/uses a window.* global → global:<name>; which scripts a page loads → page:<file.html>; where a name is defined → symbol:<name>; FFI/binary exports → ffi:<name>. Results carry 路径:行. Add capture=true before a batch of edits when you want a content-bound baseline: it returns a snapshotId, and the edit is then verified against those exact bytes.`,
+      // What stays is the one thing no schema can state: the old wording ("pass
+      // edgeMode=certain before reporting a dependency as fact") read as a duty
+      // on any answer, so on an ipc: registration the caller went off and
+      // re-verified a literal edge by hand and never came back: Q8 cost two
+      // extra rounds and ~100k tokens against a plain grep
+      // (docs/takeover-eval-result-2026-10-30.md). A negative rule that stops
+      // that hunt is worth its tokens; the target list and the edgeMode
+      // mechanics are the `target`/`edgeMode` descriptions verbatim, and the
+      // sentence "answers who breaks if a file changes … FFI/binary exports"
+      // was this tool's own description copied into the prompt.
+      `- ${n.trace} answers wiring questions. A literal channel registration, a declared exposure or a symbol definition is not a dependency — take it as given. capture=true returns a snapshotId that a later ${has('edit') ? n.edit : 'edit'} checks.`,
     ] : []),
     ...(has('edit') ? [
-      `- Edit text after reading it → ${n.edit} with path, find, replaceWith and reason; use steps for multiple changes. Ambiguity writes nothing and returns a ticket; resolve with {ticket, choice}. Pass the snapshotId from a capture when one exists: the write is then refused if those bytes moved.`,
+      // The ticket protocol and the verify whitelist are the tool description and
+      // the `verify` parameter respectively. What survives is what the schema
+      // cannot draw: several steps land against one snapshot, and the receipt
+      // gives the symbol and the new line range — the two things the next edit
+      // needs. A built-in edit is now recorded as well (src/augment.ts), so the
+      // line cannot promise history it alone provides; what it keeps is the
+      // per-file limit and the missing reason.
+      `- Edit after reading → ${n.edit}: 1-50 steps against one snapshot, each receipt naming its symbol and new line range. A built-in edit is recorded too, but one file per batch and with no reason.`,
     ] : []),
-    ...(has('file') ? [`- Create/remove/move files or transfer a symbol → ${n.file}; read before changing existing files.`] : []),
-    ...(has('check') && has('edit') ? [
-      `- After a write, the edit's own [audit] line already says whether the change looked safe; follow its suggestion rather than re-checking everything. For a formal answer covering a whole batch → ${n.check} action=static, which rebuilds the before-state from the ledger and diffs bridge/IPC surface and syntax by member identity. To execute a command, action=plan freezes it into a checkPlanId, then action=run takes only that id and asks the host for approval first.`,
-      '  - declare each recipe\'s kind, because the kind is what a result is allowed to claim: kind=tests interprets a Node TAP report (a suite that ran nothing, skipped everything, or reports inconsistently is NOT a pass); kind=types interprets TypeScript diagnostics (silence counts only with exit 0); the default kind=process claims the exit code alone and is never upgraded to a test verdict.',
-    ] : (has('check') ? [`- Verify a batch formally → ${n.check} action=static; to run commands use action=plan then action=run, declaring each recipe's kind (tests → TAP, types → tsc diagnostics, process → exit code only). A recipe left as process is never reported as a test pass.`] : [])),
-    ...(has('history') ? [`- Inspect changes or an immutable snapshot diff → ${n.history}, optionally batch or node; add checks=true to see archived verification records with their CURRENT applicability (a recorded pass whose inputs changed is shown as stale).`] : []),
-    ...(has('rollback') ? [`- Revert a recorded batch → ${n.rollback}; inspect its dry-run first.`] : []),
-    ...(has('cards') ? [`- Orient from recorded construction history → ${n.cards}; no arguments lists cards, card=<name> reads one. Cards describe ledger activity, not complete repository history.`] : []),
-    'Use available built-in tools for attachments, multimodal reads and unsupported operations. Respect sandbox denials; switching tools does not grant additional access.',
+    ...(has('file') ? [`- Create, remove, move, transfer → ${n.file}; edit one symbol through ${has('edit') ? n.edit : 'the available editing tool'}.`] : []),
+    ...(has('verify') ? [`- Check existing work without modifying it → ${n.verify}; keep recorded verdicts separate from current applicability.`] : []),
+    ...(has('project') ? [`- Organize projects, tasks and acceptance reports → ${n.project}; human acceptance is not a machine verification result.`] : []),
+    ...(has('history') ? [
+      `- Look back → ${n.history}; revert → ${has('rollback') ? n.rollback : 'ff_rollback'}.`,
+    ] : has('rollback') ? [`- Revert a recorded batch → ${n.rollback}.`] : []),
+    'Use built-in tools for attachments and multimodal reads. Respect sandbox denials; switching tools grants no extra access.',
   ].join('\n')
 }
-export const FORGE_GUIDANCE = forgeGuidance(ADDITIVE_SURFACE)
+export const FORGE_GUIDANCE = forgeGuidance()
 
 export interface ScopedToolLookup { get(name: string, scope?: unknown): unknown }
 export interface SectionScopeContext { scope?: unknown }
 
-/** A lookup failure is unknown availability, not proof of removal. */
-export function visibleForgeText(tools: ScopedToolLookup | undefined, surface: ForgeSurface): (context: SectionScopeContext) => string {
-  if (!tools || typeof tools.get !== 'function') return () => forgeGuidance(surface)
-  return context => {
-    const visible = FORGE_CAPABILITIES.filter(capability => {
+/**
+ * The guidance one scope should see.
+ *
+ * A capability is announced only when its forge tool resolves in that scope, and
+ * the `file#Symbol` line only when the scope's `read` is the host built-in that
+ * the augmentation answers for. A lookup failure is unknown availability, not
+ * proof of removal, so it keeps the line.
+ *
+ * @param tools - the registry lookup, or `undefined` on a host without one.
+ * @param augmented - built-in names the augmentation serves in this process.
+ */
+export function visibleForgeText(
+  tools: ScopedToolLookup | undefined,
+  augmented: readonly AugmentName[] = [],
+  registeredTools: readonly string[] = FORGE_TOOL_NAMES,
+): (context: SectionScopeContext) => string {
+  const readAugmented = augmented.includes('read')
+  const registered = new Set(registeredTools)
+  const candidates = FORGE_CAPABILITIES.filter((capability) => registered.has(FORGE_TOOLS[capability]))
+  if (!tools || typeof tools.get !== 'function') return () => forgeGuidance(candidates, { symbolRead: readAugmented })
+  return (context) => {
+    const visible = candidates.filter((capability) => {
       try {
-        const definition = tools.get(surface[capability], context?.scope)
-        if (definition === undefined) return false
-        // Failed scoped installation can leave the native built-in visible.
-        // Its name alone does not promise Forge's extended read parameters.
-        if (surface[capability] !== ADDITIVE_SURFACE[capability]) {
-          if (typeof definition !== 'object' || definition === null) return false
-          const forgeName = (definition as Record<string, unknown>)[FORGE_DEFINITION_TAG]
-          // Native search factories identify themselves as grep/glob; read
-          // keeps ff_read. Both are stamped Forge definitions, unlike built-ins.
-          return forgeName === ADDITIVE_SURFACE[capability] || forgeName === surface[capability]
-        }
-        return true
+        return tools.get(FORGE_TOOLS[capability], context?.scope) !== undefined
+      } catch {
+        return registered.has(FORGE_TOOLS[capability])
       }
-      catch { return true }
     })
-    return forgeGuidance(surface, visible)
+    // Present-but-unknown stays `undefined` so the full-host wording survives a
+    // registry that throws; only a scope without the tool says `false`.
+    const resolves = (name: string): boolean | undefined => {
+      try {
+        return tools.get(name, context?.scope) !== undefined
+      } catch {
+        return undefined
+      }
+    }
+    let symbolRead = false
+    if (readAugmented) {
+      try {
+        const builtin = tools.get('read', context?.scope)
+        symbolRead = typeof builtin === 'object' && builtin !== null && (builtin as Record<string, unknown>)[FORGE_DEFINITION_TAG] === undefined
+      } catch {
+        symbolRead = true
+      }
+    }
+    return forgeGuidance(visible, {
+      symbolRead,
+      builtinGrep: resolves('grep'),
+      builtinGlob: resolves('glob'),
+    })
   }
 }
 

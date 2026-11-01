@@ -4,9 +4,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
-import { syncBuiltinESMExports } from 'node:module'
 import { apply, Config, inject } from '../lib/index.js'
-import { createStatusCommand } from '../lib/tools.js'
+import { createStatusCommand } from '../lib/status.js'
 import { withFileLock } from '../lib/core.js'
 import { storeFor, recordBatch, readLedgerTail } from '../lib/ledger.js'
 import { createTraceTool, resetTraceFactsCache } from '../lib/tools-trace.js'
@@ -51,7 +50,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
       effect(fn) { disposers.push(fn()) },
       tools: { register: tool => { tools.push(tool) } }, commands: { register() {} } }
     observationPolicy.apply(host)
-    for (const dispose of apply(host)) if (typeof dispose === 'function') disposers.push(dispose)
+    for (const dispose of apply(host, { surface: 'full' })) if (typeof dispose === 'function') disposers.push(dispose)
     const call = async (name, args, exec) => {
       const tool = tools.find(value => value.name === name)
       const value = await tool.execute(args, exec)
@@ -62,195 +61,109 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
   }
   const put = (file, text = 'function One() { return 1; }\n') => fs.writeFileSync(path.join(root, file), text)
   try {
-    const activation = new Context(), scope = new Context(), globalDefinitions = [], scopedDefinitions = [], sections = []
+    const activation = new Context(), scope = new Context(), globalDefinitions = [], sections = []
+    // The scope's `read` is the host built-in: the file#Symbol line follows it.
     activation.provide('tools', { register(definition) { globalDefinitions.push(definition); return () => {} },
-      get(name, gotScope) { return (gotScope === scope ? scopedDefinitions.find(d=>d.name===name) : undefined) ?? globalDefinitions.find(d=>d.name===name) } })
-    scope.provide('tools', { register(definition) { scopedDefinitions.push(definition); return () => {} } })
+      get(name, gotScope) { return globalDefinitions.find(d=>d.name===name) ?? (gotScope === scope && name === 'read' ? { name: 'read' } : undefined) } })
     activation.provide('commands', { register() { return () => {} } })
     activation.provide('fs', { observeNativeRead() {} })
     activation.provide('systemPrompt', { section(section) { sections.push(section); return () => {} } })
-    activation.provide('agents', { list: () => [{ctx:scope}] })
-    const mounted = activation.plugin({ name:'forge-loader-regression', Config, inject, apply }, { registration:'takeover', takeover:['read','glob','grep'], prewarm:false })
+    const mounted = activation.plugin({ name:'forge-loader-regression', Config, inject, apply }, { surface:'full' })
     await new Promise(resolve=>setImmediate(resolve))
-    assert.equal(globalDefinitions.length,7); assert.equal(scopedDefinitions.length,3)
-    assert.ok(globalDefinitions.some(tool => tool.name === 'ffcheck'))
+    // Augmentation registers no built-in name. The indexed specialist rows
+    // remain global because their fuzzy/multi-pattern modes have no host
+    // equivalent; the full Forge surface includes verification and project tools.
+    assert.equal(globalDefinitions.length,10)
+    assert.ok(!globalDefinitions.some(tool => ['read','grep','glob'].includes(tool.name)))
+    // Per-tool schema shape (mode enums, parameter sets) is anchored in
+    // run-registration; this test only proves the loader activated the surface.
+    assert.ok(!globalDefinitions.some(tool => tool.name === 'ffcheck' || tool.name === 'ff_cards'), 'retired rows must not come back')
     assert.equal(sections.length,1)
     const activationGuidance = sections[0].text({scope})
-    assert.match(activationGuidance,/read view=outline/)
-    assert.match(activationGuidance,/Find files by path → glob with pattern/)
-    assert.match(activationGuidance,/Search file contents → grep with a regular-expression pattern/)
-    assert.ok(!activationGuidance.includes('mode=name') && !activationGuidance.includes('patterns for'))
+    assert.match(activationGuidance,/ff_symbols view=outline/)
+    assert.match(activationGuidance,/read with file_path=<file>#<Symbol>/)
+    // This host provides only a built-in `read`, so the augmentation answers
+    // read alone and the routing lines must not send the model to a built-in
+    // grep/glob that is not there. The "built-in grep for plain/regex" wording
+    // belongs to a host that also exposes them (run-mount covers that shape).
+    assert.match(activationGuidance, /Find files → ff_find: fuzzy names and typos/)
+    assert.match(activationGuidance, /Search contents → ff_grep: fuzzy by default/)
+    assert.doesNotMatch(activationGuidance, /built-in (glob|grep) for/)
     mounted.dispose(); await new Promise(resolve=>setImmediate(resolve))
-    ok('the installed Cordis loader validates the complete plugin Config and activates all 10 takeover tools including ffcheck')
+    ok('the installed Cordis loader validates the plugin Config and activates the full Forge surface')
     for (const defaultMode of ['read-only', 'workspace-write', 'danger-full-access']) {
       const { call } = mount(defaultMode)
       for (const mode of [undefined, 'read-only', 'workspace-write', 'danger-full-access']) {
         put('one.js')
         const exec = execFor(mode), effective = mode || defaultMode
-        for (const [name, args] of [ ['ff_read',{path:'one.js'}], ['ff_read',{path:'one.js',symbol:'One'}],
-          ['ff_read',{view:'outline',path:'one.js'}], ['fftrace',{target:'file:one.js'}], ['ffgrep',{pattern:'One'}],
-          ['fffind',{pattern:'one.js'}], ['ffgrep',{patterns:['One','return']}],
-          ['ff_read',{view:'definitions',symbol:'One'}], ['ffhistory',{}] ]) {
+        for (const [name, args] of [ ['ff_symbols',{view:'outline',path:'one.js'}], ['ff_trace',{target:'file:one.js'}], ['ff_grep',{pattern:'One'}],
+          ['ff_find',{pattern:'one.js'}], ['ff_grep',{patterns:['One','return']}],
+          ['ff_symbols',{view:'definitions',symbol:'One'}], ['ff_history',{}] ]) {
           await call(name,args,exec)
         }
-        const mutation = () => call('ffedit', {path:'one.js',steps:[{start:1,text:'function One() { return 2; }'}],reason:'sandbox integration'},exec)
+        const mutation = () => call('ff_edit', {path:'one.js',steps:[{start:1,text:'function One() { return 2; }'}],reason:'sandbox integration'},exec)
         if (effective === 'read-only') {
           await assert.rejects(mutation,/read-only/)
           assert.match(fs.readFileSync(path.join(root,'one.js'),'utf8'),/return 1/)
         } else assert.equal((await mutation()).status,'applied')
-        ok(`installed sandbox default=${defaultMode}, session=${mode || 'default'}: 9 registered reads + write policy`)
+        ok(`installed sandbox default=${defaultMode}, session=${mode || 'default'}: every advertised read plus write policy`)
       }
     }
-    const { call, observations, provider, host } = mount('workspace-write'), exec = execFor('workspace-write')
-    for (const file of ['batch-a.js','batch-b.js','glob.js','symbol.js']) put(file)
-    await call('ff_read',{paths:['batch-a.js','batch-b.js']},exec)
-    await call('ff_read',{glob:'glob.js'},exec)
-    await call('ff_read',{path:'symbol.js#One'},exec)
-    for (const file of ['batch-a.js','batch-b.js','glob.js','symbol.js']) {
-      assert.equal((await call('ffedit',{path:file,steps:[{start:1,text:'function One() { return 3; }'}],reason:'read then edit'},exec)).status,'applied')
-    }
-    await call('ff_read',{path:'absent.js'},exec)
-    assert.ok(observations.some(item=>item.path.endsWith('absent.js') && item.value.kind==='absent'))
-    assert.ok((await call('ff_file',{action:'create',path:'absent.js',content:'created',reason:'absence'},exec)).batch > 0)
-    ok('path/symbol/paths/glob and missing-file observations satisfy the actual DSH policy')
+    const { call, provider, host } = mount('workspace-write'), exec = execFor('workspace-write')
+    // ff_read answers structure only (view=outline|definitions). Source windows,
+    // `paths`/`glob` batching and `file#Symbol` reads moved to the built-in
+    // `read`, which this harness does not mount; those observation cases are
+    // covered where that seam exists (run-augment).
+    ok('ff_read answers structure only; source reads belong to the built-in read')
 
     put('ticket.txt','A\nA\n')
-    await call('ff_read',{path:'ticket.txt'},exec)
-    const ticket=await call('ffedit',{path:'ticket.txt',steps:[{find:'A',replaceWith:'B'}],reason:'host ticket'},exec)
+    const ticket=await call('ff_edit',{path:'ticket.txt',steps:[{find:'A',replaceWith:'B'}],reason:'host ticket'},exec)
     assert.equal(ticket.status,'ticket')
-    const resolved=await call('ffedit',{ticket:ticket.ticket,choice:'0'},exec)
+    const resolved=await call('ff_edit',{ticket:ticket.ticket,choice:'0'},exec)
     assert.equal(resolved.status,'applied')
-    assert.ok((await call('ffhistory',{batch:resolved.batch},exec)).items.length)
-    const rollback=await call('ffrollback',{batch:String(resolved.batch),dryRun:false,reason:'host rollback'},exec)
+    assert.ok((await call('ff_history',{batch:resolved.batch},exec)).items.length)
+    const rollback=await call('ff_rollback',{batch:resolved.batch,dryRun:false,reason:'host rollback'},exec)
     assert.ok(rollback.newBatch)
     assert.equal(fs.readFileSync(path.join(root,'ticket.txt'),'utf8'),'A\nA\n')
     ok('every registered read tool success contract, including ticket resolution, immutable diff and rollback, materialize in the actual SDK')
 
     put('sdk-check.js', 'const value = 1\n')
-    await call('ff_read', {path:'sdk-check.js'}, exec)
-    const checkedEdit = await call('ffedit', {path:'sdk-check.js',find:'value = 1',replaceWith:'value = 2',reason:'installed SDK verification'}, exec)
+    const checkedEdit = await call('ff_edit', {path:'sdk-check.js',find:'value = 1',replaceWith:'value = 2',reason:'installed SDK verification',verify:['syntax']}, exec)
     assert.equal(checkedEdit.status, 'applied')
-    const checkedBatch = await call('ffcheck', {action:'static',batches:[checkedEdit.batch],checks:['syntax']}, exec)
-    assert.equal(checkedBatch.status, 'passed')
-    assert.equal(checkedBatch.verification.persisted, true)
-    const checkedHistory = await call('ffhistory', {batch:checkedEdit.batch,checks:true}, exec)
+    assert.equal(checkedEdit.verification.status, 'passed')
+    assert.equal(checkedEdit.verification.persisted, true)
+    const checkedHistory = await call('ff_history', {batch:checkedEdit.batch,checks:true}, exec)
     assert.ok(checkedHistory.items.length > 0)
     assert.ok(checkedHistory.items[0].diffs.length > 0)
-    assert.ok(checkedHistory.items[0].checks.some(record => checkedBatch.verification.id.startsWith(record.id)))
-    const checkedDelete = await call('ff_file', {action:'remove',path:'sdk-check.js',reason:'installed SDK zero-check evidence'}, exec)
-    const zeroChecked = await call('ffcheck', {action:'static',batches:[checkedDelete.batch],checks:['syntax']}, exec)
-    assert.equal(zeroChecked.status, 'not_run')
-    assert.equal(zeroChecked.syntax.checked, 0)
-    ok('installed SDK validates ffcheck and history results, including a deleted input with zero executed syntax checks')
+    assert.ok(checkedHistory.items[0].checks.some(record => checkedEdit.verification.id.startsWith(record.id)))
+    // A verdict asked for on a call that wrote nothing has no batch to speak
+    // for; it must say so rather than return a silent pass.
+    const noChange = await call('ff_edit', {path:'sdk-check.js',find:'value = 2',replaceWith:'value = 2',reason:'no-op with a verdict request',verify:['syntax']}, exec)
+    assert.equal(noChange.verification.status, 'not_run')
+    const checkedDelete = await call('ff_file', {action:'remove',path:'sdk-check.js',reason:'installed SDK removed input'}, exec)
+    assert.equal(typeof checkedDelete.batch, 'number')
+    ok('installed SDK materializes the ffedit verify verdict and its history record, and refuses to invent one for a call that wrote nothing')
 
-    // Only the SDK output validator is real here; approval/process seams are
-    // controlled fixtures, and this case sends no command to the desktop.
-    const emptyStream = {readFrom: () => ({text:'',nextOffset:0,lossy:false})}
-    const stoppedHost = mount('workspace-write', {
-      approval: {request: async () => 'allowed-once'},
-      subprocess: {spawn: () => ({done:Promise.resolve({exitCode:null,signal:'SIGTERM'}),collected:{stdout:emptyStream,stderr:emptyStream}})},
-    })
-    const stoppedExec = {...execFor('workspace-write'),callId:'offline-sdk-terminated'}
-    const stoppedPlan = await stoppedHost.call('ffcheck', {action:'plan',inputs:['ticket.txt'],checks:[],recipes:[{id:'stopped',kind:'process',program:process.execPath,argv:[]}]}, stoppedExec)
-    const stoppedRun = await stoppedHost.call('ffcheck', {action:'run',checkPlanId:stoppedPlan.checkPlanId}, stoppedExec)
-    assert.equal(stoppedRun.status, 'failed')
-    assert.equal(stoppedRun.reason, 'nonzero_exit')
-    assert.equal(stoppedRun.runs[0].exitCode, null)
-    ok('installed SDK accepts a nullable exit from a controlled signal-termination seam without fabricating exit zero')
 
-    let deniedSpawned = false
-    const deniedHost = mount('workspace-write', {
-      approval: {request: async () => 'rejected'},
-      subprocess: {spawn: () => {deniedSpawned = true; throw new Error('denied command must not start')}},
-    })
-    const deniedExec = {...execFor('workspace-write'),callId:'offline-sdk-denied'}
-    const deniedPlan = await deniedHost.call('ffcheck', {action:'plan',inputs:['ticket.txt'],checks:[],recipes:[{id:'denied',kind:'process',program:process.execPath,argv:[]}]}, deniedExec)
-    const deniedRun = await deniedHost.call('ffcheck', {action:'run',checkPlanId:deniedPlan.checkPlanId}, deniedExec)
-    assert.equal(deniedRun.status, 'denied')
-    assert.equal(deniedRun.runs[0].status, 'denied')
-    assert.equal(deniedSpawned, false)
-    assert.equal(deniedRun.verification.persisted, true)
-    ok('installed SDK materializes a controlled approval denial and its archived result without starting a process')
-
-    put('race.js')
-    const raced = execFor('workspace-write'), before = observations.length
-    const originalRead = fs.readSync
-    let injected = false
-    fs.readSync = (fd,...args) => {
-      const n = originalRead(fd,...args)
-      if (!injected && fs.fstatSync(fd).ino === fs.statSync(path.join(root,'race.js')).ino) {
-        injected = true; queueMicrotask(()=>put('race.js','function Human() {}\n'))
-      }
-      return n
-    }
-    syncBuiltinESMExports()
-    try { await call('ff_read',{path:'race.js#One'},raced) }
-    finally { fs.readSync = originalRead; syncBuiltinESMExports() }
-    assert.equal(observations.slice(before).filter(item=>item.path.endsWith('race.js')).length,0)
-    // ffedit performs its own observed planning read. Check the interrupted
-    // read's policy state directly, before another operation can refresh it.
-    const raceTarget = await provider.resolve(path.join(root,'race.js'))
-    const raceIntent = await host.waterfall('fs/write-intent', raceTarget, raced, () => undefined)
-    assert.equal(raceIntent.kind, 'createIfAbsent')
-    assert.match(fs.readFileSync(path.join(root,'race.js'),'utf8'),/Human/)
-    ok('a changing file is never marked observed; its write intent still refuses replacing existing bytes')
-
+    // Race and symlink-observation regressions exercised ff_read's own read
+    // path. That path is gone (the built-in read owns it) and this harness
+    // mounts no built-in read, so the cases are retired with it.
     put('alias-one.js','function First() {}\n');put('alias-two.js','function Second() {}\n')
     const alias=path.join(root,'alias.js');fs.symlinkSync(path.join(root,'alias-one.js'),alias)
-    const originalStat=provider.stat.bind(provider), aliasStart=observations.length
-    let swapped=false
-    provider.stat=async (...args)=>{
-      const value=await originalStat(...args)
-      if(!swapped && args[0].targetKey===path.join(root,'alias-one.js')){
-        swapped=true;fs.unlinkSync(alias);fs.symlinkSync(path.join(root,'alias-two.js'),alias)
-      }
-      return value
-    }
-    try {
-      const aliasRead=await call('ff_read',{path:'alias.js'},execFor('workspace-write'))
-      assert.match(aliasRead.blocks[0].text,/First/)
-    } finally {provider.stat=originalStat}
-    assert.equal(observations.length,aliasStart)
-    ok('a redirected symlink reads its fixed canonical target and does not observe a changed alias')
+    const originalStat=provider.stat.bind(provider)
 
-    for (const [name,args] of [['ff_read',{path:'alias.js'}],['ff_read',{path:'alias.js#First'}],
-      ['ff_read',{view:'outline',path:'alias.js'}],['ff_read',{path:'alias.js',symbol:'First'}]]) {
-      fs.unlinkSync(alias);fs.symlinkSync(path.join(root,'alias-one.js'),alias)
-      let redirected=false,restored=false
-      const readFile=fs.readFileSync,readFd=fs.readSync,mark=observations.length
-      const restore=()=>{if(redirected && !restored){restored=true;fs.unlinkSync(alias);fs.symlinkSync(path.join(root,'alias-one.js'),alias)}}
-      provider.stat=async (...values)=>{
-        const value=await originalStat(...values)
-        if(!redirected && values[0].targetKey===path.join(root,'alias-one.js')){
-          redirected=true;fs.unlinkSync(alias);fs.symlinkSync(path.join(root,'alias-two.js'),alias)
-        }
-        return value
-      }
-      fs.readFileSync=(file,...values)=>{const raw=readFile(file,...values);if([alias,path.join(root,'alias-one.js')].includes(String(file)))restore();return raw}
-      fs.readSync=(fd,...values)=>{const n=readFd(fd,...values);if([fs.statSync(path.join(root,'alias-one.js')).ino,fs.statSync(path.join(root,'alias-two.js')).ino].includes(fs.fstatSync(fd).ino))restore();return n}
-      syncBuiltinESMExports()
-      try {
-        const value=await call(name,args,execFor('workspace-write'))
-        assert.ok(redirected && restored)
-        assert.match(JSON.stringify(value),/First/);assert.doesNotMatch(JSON.stringify(value),/Second/)
-      } finally {provider.stat=originalStat;fs.readFileSync=readFile;fs.readSync=readFd;syncBuiltinESMExports()}
-      assert.equal(observations.length,mark+1)
-      assert.equal(observations.at(-1).targetKey,path.join(root,'alias-one.js'))
-    }
-    ok('alias ABA during plain/symbol/outline/ff_read#Symbol reads cannot observe bytes from another target')
+    const aliasOutline=await call('ff_symbols',{view:'outline',path:'alias.js'},execFor('workspace-write'))
+    assert.match(JSON.stringify(aliasOutline),/First/)
+    ok('a structural read follows a symlink to its canonical target')
 
     put('backing','export function Typed(value: number): number { return value; }\n')
     fs.symlinkSync(path.join(root,'backing'),path.join(root,'typed.ts'))
-    for (const [name,args] of [['ff_read',{view:'outline',path:'typed.ts'}],['ff_read',{path:'typed.ts',symbol:'Typed'}],
-      ['ff_read',{path:'typed.ts#Typed'}]]) {
-      const value=await call(name,args,execFor('workspace-write'))
-      assert.match(JSON.stringify(value),/Typed/)
-    }
-    ok('a typed symlink address keeps its source language while reading extensionless canonical bytes')
+    const typedOutline = await call('ff_symbols',{view:'outline',path:'typed.ts'},execFor('workspace-write'))
+    assert.match(JSON.stringify(typedOutline),/Typed/)
+    ok('an extensionless symlink keeps its address language for structural reads')
 
     put('shared-lock.txt','BEFORE\n')
     const concurrentExec=execFor('workspace-write')
-    await call('ff_read',{path:'shared-lock.txt'},concurrentExec)
     const target=await provider.resolve(path.join(root,'shared-lock.txt'))
     const version=(await provider.stat(target)).version
     let staged,release,waiting
@@ -261,7 +174,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     await ready
     provider.withLock=function(key,operation){if(key===target.targetKey)waiting();return originalWithLock.call(this,key,operation)}
     let forgeFinished=false
-    const forge=call('ffedit',{path:'shared-lock.txt',steps:[{start:1,text:'FORGE'}],reason:'provider concurrency'},concurrentExec)
+    const forge=call('ff_edit',{path:'shared-lock.txt',steps:[{start:1,text:'FORGE'}],reason:'provider concurrency'},concurrentExec)
       .then(value=>({value}),error=>({error})).finally(()=>{forgeFinished=true})
     let outcome
     try {
@@ -277,28 +190,27 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
 
     const external = path.join(outside,'external.js'); fs.writeFileSync(external,'function External() {}\n')
     fs.symlinkSync(external,path.join(root,'escape.js'))
-    await call('ff_read',{path:'escape.js'},exec)
-    await assert.rejects(()=>call('ffedit',{path:'escape.js',steps:[{start:1,text:'changed'}],reason:'escape'},exec),/workspace-write/)
+    await assert.rejects(()=>call('ff_edit',{path:'escape.js',steps:[{start:1,text:'changed'}],reason:'escape'},exec),/workspace-write/)
     assert.match(fs.readFileSync(external,'utf8'),/External/)
     ok('workspace-write uses canonical target containment and rejects a symlink escaping the session workspace')
 
     const local = mount(), localExec = execFor()
-    put('local.js'); await local.call('ff_read',{path:'local.js'},localExec)
-    assert.equal((await local.call('ffedit',{path:'local.js',steps:[{start:1,text:'function Local() {}'}],reason:'local'},localExec)).status,'applied')
+    put('local.js')
+    assert.equal((await local.call('ff_edit',{path:'local.js',steps:[{start:1,text:'function Local() {}'}],reason:'local'},localExec)).status,'applied')
     local.provider.processPathFromHostPath = () => undefined
-    await assert.rejects(()=>local.call('ff_read',{path:'local.js'},localExec),/not shared/)
+    await assert.rejects(()=>local.call('ff_edit',{path:'local.js',steps:[{start:1,text:'function Remote() {}'}],reason:'unshared'},localExec),/not shared/)
     ok('shared local provider works; a remote/unshared mapping fails closed')
 
     fs.mkdirSync(path.join(root,'preloads/core'),{recursive:true})
     fs.writeFileSync(path.join(root,'preloads/core/registry.js'),"require('node:fs').writeFileSync('unexpected-execution','bad'); exports.describeApis=()=>[];")
-    const traced = await call('fftrace',{target:'file:one.js'},exec)
+    const traced = await call('ff_trace',{target:'file:one.js'},exec)
     assert.equal(traced.decls,'absent'); assert.equal(fs.existsSync(path.join(root,'unexpected-execution')),false)
     fs.writeFileSync(path.join(root,'declarations.json'),JSON.stringify({apis:[],roleGlobals:{app:'appBridge'}}))
-    assert.equal((await call('fftrace',{target:'file:one.js',declarations:'declarations.json'},exec)).decls,'ok')
+    assert.equal((await call('ff_trace',{target:'file:one.js',declarations:'declarations.json'},exec)).decls,'ok')
     fs.writeFileSync(path.join(root,'declarations.json'),JSON.stringify({apis:[{name:'bad',roles:5}]}))
-    assert.equal((await call('fftrace',{target:'file:one.js',declarations:'declarations.json'},exec)).decls,'failed')
+    assert.equal((await call('ff_trace',{target:'file:one.js',declarations:'declarations.json'},exec)).decls,'failed')
     const abort = new AbortController()
-    const pending = call('fftrace',{target:'file:one.js'},{...exec,signal:abort.signal})
+    const pending = call('ff_trace',{target:'file:one.js'},{...exec,signal:abort.signal})
     setImmediate(()=>abort.abort(new Error('trace cancelled')))
     await assert.rejects(()=>pending,/trace cancelled|resolve aborted/)
     const scanAbort=new AbortController()
@@ -310,7 +222,7 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
     ok('Trace defaults to static facts, accepts validated JSON data, never executes registry, and honors cancellation')
     put('native.rs', '#[no_mangle]\npub extern "C" fn shared() {}\n')
     fs.writeFileSync(path.join(root,'native.wasm'), Buffer.from('0061736d01000000010401600000020c0103656e7604726561640000070a01067368617265640000','hex'))
-    const ffi = await call('fftrace', {target:'ffi:shared'}, exec)
+    const ffi = await call('ff_trace', {target:'ffi:shared'}, exec)
     assert.equal(ffi.ffi.total, 2); assert.ok(ffi.ffi.matches.some(ref=>ref.lang==='binary'))
     assert.ok(ffi.ffi.matches.some(ref=>ref.kind==='source-export'))
     ok('FFI source and binary evidence materialize through the installed SDK output schema')
@@ -333,6 +245,10 @@ if (!modules || !fs.existsSync(path.join(modules, 'dsh-fs-sandbox/lib/index.js')
   } finally {
     for (const dispose of disposers.reverse()) await dispose?.()
     if (previousData === undefined) delete process.env.DSH_FORGE_DATA_DIR; else process.env.DSH_FORGE_DATA_DIR=previousData
-    fs.rmSync(base,{recursive:true,force:true,maxRetries:5,retryDelay:100})
+    // Teardown must not be able to fail the run. On Windows a provider may still
+    // hold a handle in `workspace/` for a moment, and `rmSync` then throws
+    // ENOTEMPTY even with retries — measured with the safe-delete shim disabled.
+    // The directory is disposable; a leftover temp tree is not a test result.
+    try { fs.rmSync(base,{recursive:true,force:true,maxRetries:5,retryDelay:100}) } catch { /* leftover temp tree */ }
   }
 }

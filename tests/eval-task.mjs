@@ -4,8 +4,10 @@
  * Measures what line-B/perf evals cannot: the cost of completing a WHOLE
  * locate task under each toolchain, using the real tools on both sides.
  *
- *   forge   = ffgrep(enclosing:true) → ff_read by the returned symbol
- *             address (edit-ready evidence: symbol body only)
+ *   forge   = ff_read view=definitions (name + exact range) → ff_read#Symbol
+ *             (edit-ready evidence: symbol body only). ffgrep is the fallback
+ *             for a query that names no definition, and costs a whole-file read
+ *             to recover structure — the same floor the builtin pays.
  *   builtin = content grep rows (no symbol knowledge) → whole-file reads
  *             until the target is seen (the only way builtin can confirm)
  *
@@ -31,6 +33,7 @@ import { FinderPool } from '../lib/core.js'
 import { createGrepTool } from '../lib/tools.js'
 import { createReadTool } from '../lib/tools-read.js'
 import { symbolReader } from './lib/symbol-read.mjs'
+import { definitionsView } from './lib/read-views.mjs'
 import { createEditTool } from '../lib/tools-edit.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
 
@@ -70,6 +73,7 @@ const TASKS = [
 const pool = new FinderPool()
 const ffgrep = createGrepTool(pool)
 const ffReadSymbol = symbolReader(createReadTool)
+const ffDefs = definitionsView(createReadTool())
 const ffedit = createEditTool(pool)
 const exec = { agent: { session: { header: { cwd: FIXTURE_DIR, id: 'eval-task' } } }, token: {} }
 
@@ -110,38 +114,59 @@ function builtinGrep(pattern) {
 
 /** Run one task under a toolchain. Returns accounting. */
 async function runTask(task) {
-  // ---- forge: ffgrep + symbol reads -------------------------------------
-  const g = await ffgrep.execute({ pattern: task.query, enclosing: true, limit: 20 }, exec)
-  assert.ok(Array.isArray(g.items) && g.items.length > 0, `ffgrep must hit for "${task.query}"`)
-  let forgeBytes = g.items.reduce((s, i) => s + bytes(i.text), 0)
+  // ---- forge: definitions view, then one symbol body ---------------------
+  // Every task here asks "where is the implementation", which is a definition
+  // question, not a text question: `view=definitions` answers with the symbol
+  // name and its exact range in a single call, so one body read is both the
+  // evidence and the edit anchor. Grep is the fallback — it answers with
+  // lines, and a line has to be turned into structure by reading the file.
+  const symbolName = task.query.trim().split(/\s+/).pop()
+  const defs = await ffDefs.execute({ name: symbolName, limit: 20 }, exec)
+  assert.ok(!defs.error, `definitions must answer for "${task.query}": ${defs.error}`)
+  let forgeBytes = 0
   let forgeCalls = 1
   let forgeIrrelevant = 0
   let forgeLocated = false
   let editAnchor = null // signature line of the located definition — edit-ready evidence
-  const readSymbols = new Set()
-  for (const item of g.items) {
+  for (const def of defs.items) {
     if (forgeLocated) break
-    if (!item.in || !item.in.name) {
-      // No enclosing symbol (top-level hit): the row itself pins the coordinate.
-      if (item.file === task.oracleFile && item.line === task.oracleLine) {
-        forgeLocated = true
-        editAnchor = item.text
-      }
-      continue
-    }
-    const key = `${item.file}#${item.in.name}`
-    if (readSymbols.has(key)) continue
-    readSymbols.add(key)
+    // The row itself is the answer's cost, rendered the way the tool renders it.
+    forgeBytes += bytes(`${def.file}#${def.qualifiedName} (${def.kind}) L${def.startLine}-${def.endLine}`)
+    if (def.file !== task.oracleFile) continue
     forgeCalls++
-    const r = await ffReadSymbol.execute({ path: item.file, symbol: item.in.name, line: item.line, body: true }, exec)
+    const r = await ffReadSymbol.execute({ path: def.file, symbol: def.qualifiedName, line: def.startLine, body: true }, exec)
     if (r.error) continue
     forgeBytes += bytes(r.text)
-    if (item.file === task.oracleFile && r.startLine <= task.oracleLine && task.oracleLine <= r.endLine) {
+    if (r.startLine <= task.oracleLine && task.oracleLine <= r.endLine) {
       forgeLocated = true
       // Signature line from the already-in-context symbol body — no extra read.
       editAnchor = (r.text.split('\n').find((l) => l.includes('(')) ?? r.text.split('\n')[0]).trim()
     } else {
       forgeIrrelevant++
+    }
+  }
+  if (!forgeLocated) {
+    // No definition carries that name: fall back to content search and pay the
+    // whole-file read the builtin pays. Correctness first — both toolchains
+    // must locate every task; the comparison is cost.
+    const g = await ffgrep.execute({ pattern: task.query, limit: 20 }, exec)
+    assert.ok(!g.error && g.items.length > 0, `ffgrep must hit for "${task.query}"`)
+    forgeCalls++
+    forgeBytes += g.items.reduce((s, i) => s + bytes(i.text), 0)
+    const seen = new Set()
+    for (const item of g.items) {
+      if (forgeLocated) break
+      if (item.file !== task.oracleFile || seen.has(item.file)) continue
+      seen.add(item.file)
+      forgeCalls++
+      const whole = readFileSync(path.join(FIXTURE_DIR, ...item.file.split('/')), 'utf8')
+      forgeBytes += bytes(whole)
+      if (item.line === task.oracleLine) {
+        forgeLocated = true
+        editAnchor = item.text
+      } else {
+        forgeIrrelevant++
+      }
     }
   }
 

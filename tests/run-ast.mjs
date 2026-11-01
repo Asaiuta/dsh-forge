@@ -1,7 +1,7 @@
 /**
  * AST tool-path unit tests for dsh-forge stage 2 — pure Node on built lib/
  * (build first). Covers extraction, symbol addressing, comment capture,
- * content-anchored staleness, the grep→symbol weld, and degradation paths.
+ * content-anchored staleness, and degradation paths.
  */
 
 import assert from 'node:assert/strict'
@@ -9,9 +9,8 @@ import { writeFileSync, rmSync, mkdtempSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { FinderPool } from '../lib/core.js'
-import { createGrepTool } from '../lib/tools.js'
 import { createReadTool } from '../lib/tools-read.js'
-import { singleSymbolView } from './lib/symbol-read.mjs'
+import { symbolReader } from './lib/symbol-read.mjs'
 import { outlineView, definitionsView } from './lib/read-views.mjs'
 import { flattenSymbols, parseFile } from '../lib/ast.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
@@ -20,13 +19,12 @@ buildFixture()
 const pool = new FinderPool()
 const exec = { agent: { session: { header: { cwd: FIXTURE_DIR } } } }
 const readTool = createReadTool()
-// ff_outline and ff_find_symbol were folded into ff_read's views; these shims
+// ff_outline and ff_find_symbol were folded into ff_symbols's views; these shims
 // keep the historic call shape so the assertions stay about behaviour.
 const outline = outlineView(readTool)
 const findSymbolTool = definitionsView(readTool)
-// ff_read_symbol was merged into ff_read; these cases drive the merged tool.
-const readSymbol = { execute: async (args, exec) => singleSymbolView(await readTool.execute(args, exec)) }
-const grep = createGrepTool(pool)
+// Body windows are measured in the harness after the real outline query.
+const readSymbol = symbolReader(createReadTool)
 
 let passed = 0
 function ok(label) {
@@ -89,7 +87,7 @@ async function main() {
   }
   {
     const r = await outline.execute({ path: 'docs/guide.md' }, exec)
-    assert.match(r.error, /ffgrep/, 'unsupported language error points back to ffgrep')
+    assert.match(r.error, /ff_grep/, 'unsupported language error points back to ff_grep')
     ok('outline degrade: unsupported extension → structured error')
   }
 
@@ -103,7 +101,7 @@ async function main() {
     const body = await readSymbol.execute({ path: 'src/doced.js', symbol: 'greet', body: true }, exec)
     assert.equal(body.startLine, 2, 'body=true trims to signature')
     assert.doesNotMatch(body.text, /Format a greeting/)
-    ok('ff_read#symbol: comment-default vs body=true')
+    ok('built-in read#symbol: comment-default vs body=true')
   }
   {
     const r = await readSymbol.execute({ path: 'src/store.js', symbol: 'Store.putBlob' }, exec)
@@ -112,7 +110,7 @@ async function main() {
     assert.equal(r.startLine, 7)
     const ctx = await readSymbol.execute({ path: 'src/store.js', symbol: 'Store.putBlob', context: 2 }, exec)
     assert.match(ctx.text, /getBlob\(hash\) \{/, 'context lines included')
-    ok('ff_read#symbol: qualified address + context')
+    ok('built-in read#symbol: qualified address + context')
   }
   {
     const r = await readSymbol.execute({ path: 'src/store.js', symbol: 'noSuchSymbol' }, exec)
@@ -120,7 +118,7 @@ async function main() {
     const rust = await readSymbol.execute({ path: 'lib/scoring.rs', symbol: 'Config::default_weight' }, exec)
     assert.ok(!rust.error, `rust-style address failed: ${rust.error}`)
     assert.match(rust.text, /Default weight for new configs/, 'rust :: address + doc comment')
-    ok('ff_read#symbol: not-found + Rust :: addressing')
+    ok('built-in read#symbol: not-found + Rust :: addressing')
   }
   {
     const tmp = path.join(FIXTURE_DIR, 'src', 'ambig.js')
@@ -131,7 +129,7 @@ async function main() {
     assert.ok(!picked.error, `line disambiguation failed: ${picked.error}`)
     assert.match(picked.text, /return 2;/, 'line hint picks the nearest definition')
     rmSync(tmp)
-    ok('ff_read#symbol: ambiguity → candidates, line hint disambiguates')
+    ok('built-in read#symbol: ambiguity → candidates, line hint disambiguates')
   }
 
   // --- find_symbol across workspace ---------------------------------------
@@ -143,7 +141,7 @@ async function main() {
     assert.equal(hit.file, 'src/store.js')
     assert.equal(hit.startLine, 7)
     assert.ok(r.stats.includes('code files'), 'stats reported')
-    ok('ff_read view=definitions: workspace scan with exact hit')
+    ok('ff_symbols view=definitions: workspace scan with exact hit')
   }
   {
     const r = await findSymbolTool.execute({ name: 'Config::default_weight' }, exec)
@@ -152,7 +150,7 @@ async function main() {
     const kinds = await findSymbolTool.execute({ name: 'put', kind: 'method' }, exec)
     assert.ok(!kinds.error)
     assert.ok(kinds.items.every((i) => i.kind === 'method'), 'kind filter honored')
-    ok('ff_read view=definitions: rust query + kind filter')
+    ok('ff_symbols view=definitions: rust query + kind filter')
   }
 
   // --- find_symbol: `path` re-roots the walk (the host-wide axis) ----------
@@ -194,7 +192,7 @@ async function main() {
     assert.match(missing.error ?? '', /path not found/, `missing path names the reason, got ${missing.error}`)
 
     rmSync(OUTSIDE, { recursive: true, force: true })
-    ok('ff_read view=definitions: path re-roots the walk, glob follows the root, file narrows, missing path errors')
+    ok('ff_symbols view=definitions: path re-roots the walk, glob follows the root, file narrows, missing path errors')
   }
 
   // --- content-anchored staleness (the forge principle) --------------------
@@ -266,38 +264,23 @@ async function main() {
     assert.ok(!r.error, `find helper: ${r.error}`)
     assert.deepEqual(r.items.map((i) => i.occurrence), [1, 2], 'find_symbol annotates occurrence per same-name group')
     rmSync(tmp)
-    ok('identity chain: view=definitions → occurrence → ff_read#Symbol')
+    ok('identity chain: view=definitions → occurrence → built-in read#Symbol')
   }
   {
     // Anonymous-by-name bindings stay addressable (const arrow captured as a
-    // symbol); unassigned inline callbacks are covered by the grep→symbol
-    // weld (enclosingSymbol), not by the symbol table.
+    // symbol); an unassigned inline callback has no binding to address, so it
+    // is reached by text search, not by the symbol table.
     const shout = await readSymbol.execute({ path: 'src/doced.js', symbol: 'shout' }, exec)
     assert.ok(!shout.error, `const-arrow symbol: ${shout.error}`)
     assert.equal(shout.occurrence, 1)
-    ok('anonymous coverage: const-arrow bindings addressable; inline callbacks via grep weld')
+    ok('anonymous coverage: const-arrow bindings addressable; unbound callbacks fall to text search')
   }
 
-  // --- grep → symbol weld --------------------------------------------------
-  {
-    const r = await grep.execute({ pattern: 'putBlob', enclosing: true }, exec)
-    assert.ok(!r.error)
-    const storeHit = r.items.find((i) => i.file === 'src/store.js' && i.line === 7)
-    assert.ok(storeHit?.in, 'store.js definition hit annotated')
-    assert.equal(storeHit.in.name, 'Store.putBlob')
-    assert.equal(storeHit.in.startLine, 7)
-    const loginHit = r.items.find((i) => i.file === 'src/login.js')
-    assert.ok(loginHit?.in, 'call-site hit annotated too')
-    assert.equal(loginHit.in.name, 'submit')
-    assert.ok(loginHit.in.startLine <= loginHit.line && loginHit.line <= loginHit.in.endLine,
-      'enclosing range must contain the hit line')
-    ok('grep→symbol weld: definitions and call sites annotated with enclosing symbol')
-  }
-  {
-    const r = await grep.execute({ pattern: 'putBlob' }, exec)
-    assert.ok(r.items.every((i) => !i.in), 'weld off by default (no annotation without the param)')
-    ok('grep→symbol weld: opt-in only')
-  }
+  // --- symbol attachment lives in ff_symbols ----------------------------------
+  // The grep→symbol weld (`enclosing: true`) is gone with the specialist
+  // surface: ff_grep answers "where does this text appear", and the enclosing
+  // symbol for a hit is `ff_symbols view=definitions` → occurrence → built-in read#Symbol
+  // above. Nothing to assert here that ok 11-19 does not already pin.
 
   // --- determinism ---------------------------------------------------------
   {

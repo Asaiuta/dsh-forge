@@ -106,12 +106,15 @@ process.env.DSH_FORGE_DATA_DIR = path.join(sandbox, '.forge-data')
     0,
     'an uncompilable regex falls back to a literal, like the engine',
   )
-  assert.equal(
-    searchOverlay(all, 'a', { mode: 'fuzzy', smartCase: true, context: 0, limit: 50 }).length,
-    0,
-    'fuzzy is refused rather than approximated: the index stays the only answer for it',
+  // fuzzy 的语义在这里没法复现，只能退到它的子集：子串必然是子序列，所以按
+  // 字面量匹配只会少给"容忍式"命中，不会造出索引不会产出的行。拒绝反而更危险
+  // ——调用方会丢掉本会话写过的文件的索引命中，那个文件在扫描追上之前一条不给。
+  assert.deepEqual(
+    searchOverlay(all, 'a', { mode: 'fuzzy', smartCase: true, context: 0, limit: 50 }).map((i) => i.line),
+    [1, 2],
+    'fuzzy is mirrored as its literal subset, never as an approximation',
   )
-  ok('regex / plain / fallback behaviour mirrors the engine, fuzzy is refused')
+  ok('regex / plain / fallback behaviour mirrors the engine, fuzzy mirrors its literal subset')
 }
 
 {

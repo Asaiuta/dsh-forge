@@ -85,13 +85,19 @@ async function main() {
   const multi = grep // fff_multi_grep merged into ffgrep
 
   // Warm the index once (first call pays the scan; wait it out).
-  const warm = await grep.execute({ pattern: 'putBlob', limit: 200 }, exec)
+  // These floors measure literal recall/precision. Fuzzy mode deliberately
+  // tolerates spelling variants, so it cannot carry them; `patterns` is literal
+  // by contract and needs two entries, hence the sentinel that never matches.
+  const SENTINEL = 'zzz_no_such_token_evar'
+  const literal = (pattern, extra = {}) => grep.execute({ patterns: [pattern, SENTINEL], limit: 200, ...extra }, exec)
+
+  const warm = await literal('putBlob')
   assert.ok(!warm.error, `warm-up grep failed: ${warm.error}`)
   if (warm.warming) {
     // Wait for warmup to settle so floors measure steady state, not scan races.
     const lease = await pool.main(FIXTURE_DIR)
     if (!lease.error) await lease.finder.waitForIndexReady(30_000)
-    const settled = await grep.execute({ pattern: 'putBlob', limit: 200 }, exec)
+    const settled = await literal('putBlob')
     assert.ok(!settled.error)
     Object.assign(warm, { items: settled.items, warming: settled.warming })
   }
@@ -101,7 +107,7 @@ async function main() {
   // prose occurrences.
   const LITERAL_PATTERNS = ['putBlob', 'getBlob', 'isEmail', 'compute_score', 'CRLF_TOKEN', '中文标记', 'normalize_path']
   for (const pattern of LITERAL_PATTERNS) {
-    const result = await grep.execute({ pattern, limit: 200 }, exec)
+    const result = await literal(pattern)
     assert.ok(!result.error, `grep ${pattern}: ${result.error}`)
     const got = new Set(result.items.map((i) => `${i.file}:${i.line}`))
     const expected = oracleFor(pattern)
@@ -114,7 +120,7 @@ async function main() {
   // Floor 2: smart-case precision — capitalized query on lowercase corpus
   // must produce zero false positives.
   {
-    const result = await grep.execute({ pattern: 'PutBlob', limit: 200 }, exec)
+    const result = await literal('PutBlob')
     assert.ok(!result.error)
     assert.equal(result.items.length, 0, 'smart case must not match lowercase identifiers for a capitalized query')
   }
@@ -123,7 +129,7 @@ async function main() {
   // Floor 3: precision vs oracle — every engine hit is a real oracle hit
   // (no invented lines).
   for (const pattern of ['putBlob', 'isEmail']) {
-    const result = await grep.execute({ pattern, limit: 200 }, exec)
+    const result = await literal(pattern)
     const oracleSet = new Set(oracleFor(pattern).map((h) => `${h.file}:${h.line}`))
     for (const item of result.items) {
       assert.ok(oracleSet.has(`${item.file}:${item.line}`),
@@ -134,19 +140,19 @@ async function main() {
 
   // Floor 4: determinism — two identical calls return identical item arrays.
   {
-    const a = await grep.execute({ pattern: 'putBlob', limit: 200, context: 1 }, exec)
-    const b = await grep.execute({ pattern: 'putBlob', limit: 200, context: 1 }, exec)
+    const a = await literal('putBlob', { context: 1 })
+    const b = await literal('putBlob', { context: 1 })
     assert.deepEqual(a.items, b.items, 'repeated call must be byte-identical')
   }
   floor('grep-determinism', 'identical calls → identical output')
 
   // Floor 5: pagination closure — walking pages unites to the single big page.
   {
-    const single = await grep.execute({ pattern: 'e', limit: 200 }, exec)
+    const single = await literal('e')
     const walked = new Map()
     let cursor
     for (let page = 0; page < 50; page++) {
-      const res = await grep.execute({ pattern: 'e', limit: 5, ...(cursor ? { cursor } : {}) }, exec)
+      const res = await literal('e', { limit: 5, ...(cursor ? { cursor } : {}) })
       assert.ok(!res.error, `paged grep failed: ${res.error}`)
       for (const item of res.items) walked.set(`${item.file}:${item.line}`, item)
       if (!res.nextCursor) break
@@ -181,19 +187,27 @@ async function main() {
   }
   floor('find-recall', '6 exact names in top-3, 2 typo paths in top-10')
 
-  // Floor 7: multi-grep equals the union of single greps (same limits).
+  // Floor 7: multi-grep equals the union of per-pattern literal sets (same
+  // limits), in both directions.
+  //
+  // The reference is the oracle, not three single-pattern calls: `pattern`
+  // alone is fuzzy by contract now (a typo is what it is for), so a single
+  // call is a *ranked approximation* and would drag tolerant hits into the
+  // union — comparing against it would measure fuzzy recall, not OR
+  // aggregation. `patterns` is literal, so the literal oracle is its true
+  // denominator, and exact equality here also pins that no pattern's hits are
+  // lost to the shared page cap.
   {
-    const p1 = await grep.execute({ pattern: 'putBlob', limit: 200 }, exec)
-    const p2 = await grep.execute({ pattern: 'getBlob', limit: 200 }, exec)
-    const p3 = await grep.execute({ pattern: 'putUser', limit: 200 }, exec)
-    const unionKeys = new Set([...p1.items, ...p2.items, ...p3.items].map((i) => `${i.file}:${i.line}`))
-    const combined = await multi.execute({ patterns: ['putBlob', 'getBlob', 'putUser'], limit: 200 }, exec)
+    const PATTERNS = ['putBlob', 'getBlob', 'putUser']
+    const unionKeys = new Set(PATTERNS.flatMap((p) => oracleFor(p)).map((h) => `${h.file}:${h.line}`))
+    assert.ok(unionKeys.size > 0, 'multi-grep oracle must be non-empty (fixture drift)')
+    const combined = await multi.execute({ patterns: PATTERNS, limit: 200 }, exec)
     assert.ok(!combined.error, `multi failed: ${combined.error}`)
     const combinedKeys = new Set(combined.items.map((i) => `${i.file}:${i.line}`))
     assert.deepEqual([...combinedKeys].sort(), [...unionKeys].sort(),
-      'multi-grep line set must equal the per-pattern union')
+      'multi-grep line set must equal the per-pattern literal union')
   }
-  floor('multi-grep-semantics', '3-pattern OR == union of singles (exact)')
+  floor('multi-grep-semantics', '3-pattern OR == per-pattern literal union (exact, both ways)')
 
   // Floor 8: ignore rules — nothing from gitignored paths, anywhere.
   {

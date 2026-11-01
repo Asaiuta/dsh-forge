@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createTraceTool } from '../lib/tools-trace.js'
+import { createReadTool } from '../lib/tools-read.js'
 import { resetFactsCache } from '../lib/ast.js'
 
 let passed = 0
@@ -378,14 +379,20 @@ resetFactsCache()
   ok('exposes: aggregate, global filter, file filter, dynamic role-global name')
 }
 {
-  const r = await run('symbol:escapeHtml')
-  assert.equal(r.found, true)
-  assert.ok(r.text.includes('renderer/a.js') && r.text.includes('renderer/b.js'), r.text)
-  assert.ok(/定义 2 处 · 2 个文件/.test(r.text), r.text)
-  assert.ok(r.text.includes('view=body'), r.text)
-  const none = await run('symbol:definitelyMissing')
-  assert.equal(none.found, false)
-  ok('symbol: one call lists every definition across files')
+  const symbols = createReadTool()
+  assert.equal(symbols.name, 'ff_symbols')
+  const r = await symbols.execute({ view: 'definitions', symbol: 'escapeHtml' }, exec)
+  assert.equal(r.error, undefined)
+  assert.deepEqual(r.items.map(item => item.file).sort(), ['renderer/a.js', 'renderer/b.js'])
+  assert.equal(r.items.length, 2, 'both definitions remain discoverable after the route migration')
+  assert.ok(r.items.every(item => item.qualifiedName === 'escapeHtml' && item.startLine >= 1 && item.endLine >= item.startLine))
+  const none = await symbols.execute({ view: 'definitions', symbol: 'definitelyMissing' }, exec)
+  assert.equal(none.error, undefined)
+  assert.deepEqual(none.items, [])
+  const removed = await run('symbol:escapeHtml')
+  assert.match(removed.error, /ff_symbols/)
+  assert.equal(removed.found, undefined, 'a removed route must fail, not return discovery results')
+  ok('ff_symbols definitions preserves every definition and missing results; ff_trace rejects symbol:')
 }
 
 // ---- failure modes --------------------------------------------------------

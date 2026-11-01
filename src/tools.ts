@@ -4,34 +4,21 @@
  * strings are English; /forge-status human-facing text is zh-CN, following
  * the dsh-blackhole convention.
  *
- * Tool-surface shape decision (documented in README): three separate tools —
- * fffind / ffgrep / fff-multi-grep — rather than ProjectForge's one-tool-many-
- * commands dispatch. Per-tool descriptions give the model clearer selection
- * signals, which matters more than schema-token savings at this size.
+ * Search surface: two focused tools, `fffind` and `ffgrep`. Status and
+ * verification commands live in their own modules so search owns only search.
  *
  * @module dsh-forge/tools
  */
 
-import type { FileFinderApi, GrepMode, GrepResult } from '@ff-labs/fff-node'
+import type { GrepMode, GrepResult } from '@ff-labs/fff-node'
 import type { ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
-import type { NativeDelegate } from './delegate.ts'
-import { explainAbsence } from './absence.ts'
+import { explainAbsence, literalNeedle, walkForName, walkNewerThan, type AbsenceWalk } from './absence.ts'
 import { overlaySnapshot, searchOverlay } from './overlay.ts'
-import { attachEnclosingSymbols } from './tools-symbol.ts'
-import { allStores, hasPendingTransaction, pruneOrphanedStores, gcStoreBlobs, purgeStore, statsFor, storeFor } from './ledger.ts'
-import { cardsStatusFor, CARD_NAMES } from './cards.ts'
-import { canonicalWorkspace } from './fs-paths.ts'
-import { countTickets } from './tickets.ts'
-import { peekIndexerStatus } from './indexer-client.ts'
-import { TRACE_CAPABILITY_MATRIX, TRACE_BINARY_EVIDENCE } from './trace-capabilities.ts'
-import { traceSnapshotStatus } from './tools-trace.ts'
 import {
   CONTEXT_MAX,
   FILTER_MAX_EXTRA_PAGES,
   FIND_LIMIT_DEFAULT,
   FIND_LIMIT_MAX,
-  GLOB_LIMIT_DEFAULT,
-  GLOB_LIMIT_MAX,
   GREP_LIMIT_DEFAULT,
   GREP_LIMIT_MAX,
   GREP_MAX_MATCHES_PER_FILE,
@@ -44,9 +31,6 @@ import {
   type ToolFailure,
   clampInt,
   compileConstraintFilter,
-  dataDir,
-  globToRegExp,
-  isHomeDir,
   noteQueryHit,
   renderFindItems,
   renderGrepItems,
@@ -56,45 +40,63 @@ import {
   takeCursor,
   weakNameMatch,
   workdirOf,
-  withFileLock,
 } from './core.ts'
 import path from 'node:path'
-import { existsSync, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { statSync } from 'node:fs'
+import { everythingSearch, type GlobalHit, type GlobalLookup } from './global-index.ts'
 
 function failure(error: string): { error: string } {
   return { error }
 }
-
 function isFailure<T>(value: T | ToolFailure): value is ToolFailure {
   return typeof (value as ToolFailure).error === 'string'
 }
+function text(value: string): Array<{ type: 'text'; text: string }> {
+  return [{ type: 'text', text: value }]
+}
+
+function displayPath(workdir: string, root: string, relative: string): string {
+  const absolute = path.resolve(root, relative)
+  const local = path.relative(workdir, absolute)
+  return (local === '..' || local.startsWith(`..${path.sep}`) || path.isAbsolute(local)
+    ? absolute : local).split(path.sep).join('/')
+}
 
 /** Resolve a `path` tool parameter against the session workspace. */
+/**
+ * Turn `path=` into a lease plus an optional filter.
+ *
+ * One index, one rule: **the workspace is the only long-lived index**. A `path`
+ * inside it is answered by filtering that index, never by building a second one
+ * over a subdirectory — the pages are already there, and a second finder was
+ * both a memory leak and (in fff 0.11.0) a way to break every later finder in
+ * the process. A `path` outside it borrows a one-shot finder from the pool,
+ * which is size-capped and expires.
+ */
 async function resolveScope(
   pool: FinderPool,
   workdir: string,
   rawPath: string | undefined,
 ): Promise<{ lease: FinderLease; prefixFilter?: (rel: string) => boolean } | ToolFailure> {
-  if (!rawPath || rawPath.trim() === '') {
-    const lease = await pool.main(workdir)
-    if (isFailure(lease)) return lease
-    return { lease }
-  }
+  const main = await pool.main(workdir)
+  if (isFailure(main)) return main
+  const root = main.basePath
+  if (!rawPath || rawPath.trim() === '') return { lease: main }
+
   const trimmed = rawPath.trim()
   // `path.resolve` is load-bearing, not cosmetic: the single-file branch below
   // compares a resolved path against this value with `===`. Keeping the
   // caller's separators meant `F:/x/file.ts` never equalled the engine's
   // `F:\x\file.ts`, so `path` pointing at one file matched nothing on Windows
   // — measured 8/8 deterministic. Normalizing here makes both spellings work.
-  const absolute = path.isAbsolute(trimmed) ? path.resolve(trimmed) : path.resolve(workdir, trimmed)
+  const absolute = path.isAbsolute(trimmed) ? path.resolve(trimmed) : path.resolve(root, trimmed)
 
   // Glob-style constraint: keep the main index, filter by glob on relative paths.
   if (/[*?{[]/.test(trimmed)) {
-    const lease = await pool.main(workdir)
-    if (isFailure(lease)) return lease
     const filter = compileConstraintFilter(trimmed)
     if (!filter) return failure(`could not parse constraint ${trimmed}`)
-    return { lease, prefixFilter: filter }
+    return { lease: main, prefixFilter: filter }
   }
 
   let st: { isDirectory(): boolean; isFile(): boolean }
@@ -103,20 +105,40 @@ async function resolveScope(
   } catch {
     return failure(`path not found: ${absolute}`)
   }
+  const inside = isInsideRoot(root, absolute)
   if (st.isDirectory()) {
-    // Inside the indexed workspace a subdirectory constraint still goes to an
-    // aux finder: GrepOptions has no path scoping, and post-filtering a whole
-    // tree burns the page budget on out-of-scope hits.
-    const lease = await pool.aux(absolute)
-    if (isFailure(lease)) return lease
-    return { lease }
+    if (inside) {
+      const filter = directoryFilter(root, absolute)
+      return filter === undefined ? { lease: main } : { lease: main, prefixFilter: filter }
+    }
+    const borrowed = await pool.temporary(absolute, { retain: true })
+    if (isFailure(borrowed)) return borrowed
+    return { lease: borrowed }
   }
   if (st.isFile()) {
-    const lease = await pool.aux(path.dirname(absolute))
-    if (isFailure(lease)) return lease
-    return { lease, prefixFilter: (rel) => path.resolve(lease.basePath, rel) === absolute }
+    if (inside) return { lease: main, prefixFilter: (rel) => path.resolve(root, rel) === absolute }
+    const borrowed = await pool.temporary(path.dirname(absolute), { retain: true })
+    if (isFailure(borrowed)) return borrowed
+    return { lease: borrowed, prefixFilter: (rel) => path.resolve(borrowed.basePath, rel) === absolute }
   }
   return failure(`unsupported path kind: ${absolute}`)
+}
+
+/** True when `absolute` is `root` itself or sits below it. */
+function isInsideRoot(root: string, absolute: string): boolean {
+  const rel = path.relative(root, absolute)
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+/**
+ * Filter for "everything under this directory of the workspace", expressed in
+ * the workspace index's relative paths. `undefined` means no filter is needed
+ * (the directory *is* the root).
+ */
+function directoryFilter(root: string, absolute: string): ((rel: string) => boolean) | undefined {
+  const prefix = path.relative(root, absolute).split(path.sep).join('/')
+  if (prefix === '') return undefined
+  return (rel) => rel === prefix || rel.startsWith(`${prefix}/`)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +155,11 @@ const WARM_RETRY_MS = 4_000
  * The `canList` probe is a real engine read, so the note only claims an
  * exclusion the index actually has for this scope.
  */
-function absenceNote(scope: { lease: FinderLease }, query: string): string | undefined {
+function absenceNote(
+  scope: { lease: FinderLease },
+  query: string,
+  extra: { rescanned?: boolean; walk?: AbsenceWalk } = {},
+): string | undefined {
   const canList = (segment: string): boolean => {
     try {
       const probe = scope.lease.finder.glob(`${segment}/**`, { pageSize: 1, pageIndex: 0 })
@@ -142,7 +168,13 @@ function absenceNote(scope: { lease: FinderLease }, query: string): string | und
       return false
     }
   }
-  return explainAbsence({ scopeRoot: scope.lease.basePath, query, canList })
+  return explainAbsence({
+    scopeRoot: scope.lease.basePath,
+    query,
+    canList,
+    ...(extra.rescanned === true ? { rescanned: true } : {}),
+    ...(extra.walk === undefined ? {} : { walk: extra.walk }),
+  })
 }
 
 /**
@@ -156,6 +188,52 @@ async function waitForWarm(scope: { lease: FinderLease }): Promise<void> {
     await scope.lease.finder.waitForScan(WARM_RETRY_MS)
   } catch {
     // best-effort; a still-warming finder is reported through the warming flag
+  }
+  try { scope.lease.warming = scope.lease.finder.isScanning() } catch { scope.lease.warming = true }
+}
+
+/**
+ * Ask the disk what the index will not answer, once per empty page.
+ *
+ * This is both the absence evidence and the staleness check, so it runs at most
+ * once and its result is threaded to whichever of the two needs it.
+ *
+ * @returns `undefined` when the query has no checkable literal run.
+ */
+function diskProbe(lease: FinderLease, pattern: string): AbsenceWalk | undefined {
+  // A glob, or a query with no 3-character literal run, is not something a name
+  // walk can validate.
+  const needle = literalNeedle(pattern)
+  if (needle === '') return undefined
+  try {
+    return walkForName(lease.basePath, needle)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Could the index be missing a file created since it last scanned?
+ *
+ * The name path answers this with a disk walk that found the file by name. A
+ * content search has no name to look for, so the equivalent evidence is
+ * structural: a directory whose mtime is newer than the last scan is a directory
+ * whose current shape the index has not seen. Creating or deleting a file bumps
+ * its parent, which is the case that matters here — a file that exists but is
+ * not indexed at all.
+ *
+ * No time window skips this check. Suppressing it was tried and reverted: the
+ * empty page that prompts a write is followed within the same second by the
+ * `ffgrep` that must see it, so any "we just scanned" window hides exactly the
+ * query this exists to rescue. The walk is what an empty page already cost
+ * before (the absence note ran one too); the rebuild it may trigger is the part
+ * that is throttled.
+ */
+function contentIndexIsStale(lease: FinderLease): boolean {
+  try {
+    return walkNewerThan(lease.basePath, lease.scannedAt).newer.length > 0
+  } catch {
+    return false
   }
 }
 
@@ -207,12 +285,13 @@ interface GrepOutcome {
  */
 function runGrep(
   lease: FinderLease,
-  pattern: string,
+  pattern: string | string[],
   options: GrepCallOptions,
   cursorId: string | undefined,
   filter: ((rel: string) => boolean) | undefined,
 ): { value: GrepOutcome } | ToolFailure {
   const engineCursor = takeCursor(cursorId)
+  if (cursorId && engineCursor === null) return failure('engine cursor expired; restart without cursor')
   let nextEngineCursor = engineCursor
   const collected: GrepItem[] = []
   let filteredFrom = 0
@@ -225,7 +304,7 @@ function runGrep(
   const cappedFiles: string[] = []
 
   for (let page = 0; page <= (filter ? FILTER_MAX_EXTRA_PAGES : 0); page++) {
-    const result = lease.finder.grep(pattern, {
+    const callOptions = {
       ...options,
       cursor: nextEngineCursor,
       maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
@@ -240,7 +319,10 @@ function runGrep(
       // at the files actually opened, so it cannot be compared to
       // `filteredFileCount` to infer a cut. Since "0 hits" is the one answer a
       // caller acts on by giving up, it must stay trustworthy.
-    })
+    }
+    const result = Array.isArray(pattern)
+      ? lease.finder.multiGrep({ ...callOptions, patterns: pattern })
+      : lease.finder.grep(pattern, callOptions)
     if (!result.ok) return failure(`fff grep failed: ${result.error}`)
     const value = result.value
     filesSearched += value.totalFilesSearched
@@ -286,15 +368,6 @@ const GREP_ITEM_SCHEMA = {
     text: { type: 'string', required: true },
     git: { type: 'string', required: true },
     frecency: { type: 'number', required: true },
-    in: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        name: { type: 'string', required: true },
-        startLine: { type: 'integer', required: true },
-        endLine: { type: 'integer', required: true },
-      },
-    },
     context: {
       type: 'array',
       items: {
@@ -310,293 +383,34 @@ const GREP_ITEM_SCHEMA = {
   },
 } as const
 
-// ---------------------------------------------------------------------------
-// Serving as the built-in `grep`
-// ---------------------------------------------------------------------------
-
 /**
- * The built-in `grep` name, and the only name this branch ever delegates to.
+ * ffgrep's surface: the two operations the built-in grep cannot express.
+ *
+ * Plain and regex search belong to the built-in `grep` — it is always present,
+ * it owns the host's render/spill/timeout contract, and duplicating its modes
+ * here only buys the model a choice it does not need. What is left is fuzzy
+ * content search and 2-16 literals OR-matched in one pass.
  */
-const NATIVE_GREP_NAME = 'grep'
-
-/**
- * How many lines the built-in `grep` shows before it stops (`GREP_MAX_MATCHES`
- * in `dsh-tool-fs-search`). Not a tunable: it is the number the built-in's own
- * callers are used to, so a takeover that showed a different amount would be a
- * third behaviour rather than the one it replaced.
- */
-const NATIVE_GREP_LIMIT = 250
-
-/**
- * The built-in `grep` arguments, verbatim: a regular expression, a path and one
- * include glob. `mode` is absent on purpose — the built-in's `pattern` is
- * ripgrep syntax and always case-sensitive, and this branch serves exactly that.
- */
-const NATIVE_GREP_PARAMETERS: ParameterSchemaSpec = {
-  pattern: { type: 'string', required: true, description: 'Regular expression to search for (ripgrep syntax). Case-sensitive.' },
-  path: { type: 'string', description: 'File or directory to search. Defaults to the session workspace; a relative path resolves against it.' },
-  include: { type: 'string', description: 'One glob filter for which files to search (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.' },
-}
-
-/**
- * Compile one ripgrep `--glob` into a predicate.
- *
- * Three details are ripgrep's, not forge's, and each of them is a wrong answer
- * if borrowed from {@link compileConstraintFilter}:
- *
- *   basename   a glob with no `/` matches the file NAME at any depth, so
- *              `*.ts` must not be anchored to the whole relative path.
- *   case       rg's globs follow the filesystem: sensitive on Linux, insensitive
- *              elsewhere. Forge's own constraints are case-insensitive everywhere.
- *   slash      a glob WITH a `/` is matched against the path as rg walked it,
- *              which for a `path=` subdirectory is relative to that subdirectory
- *              — the documented reason `path=src` + `include=src/*.ts` finds
- *              nothing here and the empty page says so instead of inventing hits.
- *
- * @param glob - the `include` argument.
- * @returns a predicate over lease-relative paths.
- */
-function compileRipgrepGlob(glob: string): (relativePath: string) => boolean {
-  const pattern = glob.trim()
-  const anchored = pattern.includes('/')
-  const re = globToRegExp(pattern, process.platform !== 'linux')
-  return (relativePath: string) => {
-    const normalized = relativePath.split(path.sep).join('/')
-    return re.test(anchored ? normalized : normalized.slice(normalized.lastIndexOf('/') + 1))
-  }
-}
-
-/**
- * Why the built-in would refuse this `include`, or `undefined` when it would
- * take it. Rejecting here rather than silently over-matching keeps an
- * unsupported glob from becoming an answer.
- */
-function includeProblem(include: string): string | undefined {
-  if (include.startsWith('!')) return 'include does not support negation — pass the glob to search, not the one to skip'
-  // `{a,b}` is alternation; a comma outside braces is the "list" the built-in
-  // refuses (it would otherwise search for a file literally named `*.ts,*.js`).
-  if (include.replace(/\{[^{}]*\}/g, '').includes(',')) {
-    return 'include must be one glob, not a comma-separated list (use {a,b} alternation instead)'
-  }
-  return undefined
-}
-
-/**
- * The engine's column unit: a 0-based **byte** offset into the line.
- *
- * Computed, not guessed. A JS match index is a UTF-16 code-unit offset, so on a
- * line with non-ASCII text (this repository has plenty) handing it back as `col`
- * would point at the wrong byte. `overlay.ts` measures the same way for the same
- * reason; both feed one schema, so both must agree on the unit.
- */
-function columnOf(re: RegExp | null, line: string): number {
-  if (re === null) return 0
-  re.lastIndex = 0
-  const found = re.exec(line)
-  return found === null ? 0 : Buffer.byteLength(line.slice(0, found.index), 'utf8')
-}
-
-/** The JS-regex view of `pattern`, for column recovery only. */
-function columnRegex(pattern: string): RegExp | null {
-  try {
-    return new RegExp(pattern)
-  } catch {
-    // ripgrep's dialect is not JavaScript's; a pattern this engine cannot
-    // compile still matches on disk, it just loses its column.
-    return null
-  }
-}
-
-/**
- * Turn a built-in `grep` value into this tool's page.
- *
- * The built-in answers `{matches: [{path, lineNumber, line}]}` — no column, no
- * git status, no frecency. Those three fields are filled with their honest
- * zero values rather than guessed, and the column is recovered from the line
- * because a wrong column is worse than an absent one.
- *
- * @param value - the built-in's returned value (untrusted shape).
- * @param pattern - the pattern that produced it, for column recovery.
- * @returns the page plus the cap note when the built-in returned more lines
- *   than it would have shown.
- */
-function nativeGrepPage(value: unknown, pattern: string): { items: GrepItem[]; totalMatched: number; note?: string } {
-  const raw = (value as { matches?: unknown } | null | undefined)?.matches
-  if (!Array.isArray(raw)) return { items: [], totalMatched: 0 }
-  const re = columnRegex(pattern)
-  const items: GrepItem[] = []
-  for (const entry of raw) {
-    if (typeof entry !== 'object' || entry === null) continue
-    const match = entry as { path?: unknown; lineNumber?: unknown; line?: unknown }
-    if (typeof match.path !== 'string' || typeof match.lineNumber !== 'number') continue
-    const line = typeof match.line === 'string' ? match.line : ''
-    items.push({ file: match.path, line: match.lineNumber, col: columnOf(re, line), text: line, git: '', frecency: 0 })
-  }
-  if (items.length <= NATIVE_GREP_LIMIT) return { items, totalMatched: items.length }
-  // The built-in shows the same number and saves the rest to a file; there is
-  // no file here, so the count is the only part of that promise this can keep.
-  return {
-    items: items.slice(0, NATIVE_GREP_LIMIT),
-    totalMatched: NATIVE_GREP_LIMIT,
-    note: `more than ${NATIVE_GREP_LIMIT} lines match; the first ${NATIVE_GREP_LIMIT} are shown — narrow pattern, path or include`,
-  }
-}
-
-/** AND two path predicates, tolerating either being absent. */
-function combineFilters(
-  first: ((relativePath: string) => boolean) | undefined,
-  second: ((relativePath: string) => boolean) | undefined,
-): ((relativePath: string) => boolean) | undefined {
-  if (first === undefined) return second
-  if (second === undefined) return first
-  return (relativePath) => first(relativePath) && second(relativePath)
-}
-
-/**
- * The built-in `grep` as this tool serves it: index first, ripgrep on disk
- * whenever the index's answer could be wrong or incomplete.
- *
- * Delegation is not a speed path. It is entered on the four occasions where the
- * index cannot be trusted, and every one of them ends with a note naming who
- * answered:
- *
- *   warming      a scan is still running, so a page is a sample, not an answer
- *   unavailable  the finder could not start for this root at all
- *   no match     the index found nothing — and the index is a snapshot, so a
- *                file written by another process since it caught up is invisible
- *   bad path     `path` holds a glob, which the built-in refuses as a path
- *
- * The no-match case is the one that matters: "0 matches" is the only answer a
- * caller acts on by giving up, and the built-in makes it verifiable instead of
- * merely probable.
- */
-async function nativeGrep(
-  pool: FinderPool,
-  args: Record<string, unknown>,
-  exec: ForgeExec | undefined,
-  raw: ForgeExec | undefined,
-  delegate: NativeDelegate | undefined,
-): Promise<unknown> {
-  const pattern = typeof args.pattern === 'string' ? args.pattern : ''
-  if (pattern === '') return failure('pattern is required')
-  const rawPath = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
-  const include = typeof args.include === 'string' && args.include.trim() !== '' ? args.include.trim() : undefined
-  if (include !== undefined) {
-    const problem = includeProblem(include)
-    if (problem !== undefined) return failure(problem)
-  }
-  // The built-in's own argument shape — never this tool's.
-  const builtin = { pattern, ...(rawPath === undefined ? {} : { path: rawPath }), ...(include === undefined ? {} : { include }) }
-  const canDelegate = delegate !== undefined && delegate.available(NATIVE_GREP_NAME)
-
-  // A glob in `path` is not a path. The built-in answers with an error and so
-  // does this; treating it as a constraint would answer a different question.
-  if (canDelegate && rawPath !== undefined && /[*?{[]/.test(rawPath)) {
-    const delegated = await delegate.run(NATIVE_GREP_NAME, builtin, raw)
-    if (delegated.ok) return nativeGrepPage(delegated.value, pattern)
-    return failure(delegated.error)
-  }
-
-  const scope = await resolveScope(pool, workdirOf(exec), rawPath)
-  if (isFailure(scope)) {
-    if (!canDelegate) return scope
-    const delegated = await delegate.run(NATIVE_GREP_NAME, builtin, raw)
-    if (delegated.ok) return nativeGrepPage(delegated.value, pattern)
-    return scope
-  }
-  if (canDelegate && scope.lease.warming) {
-    const delegated = await delegate.run(NATIVE_GREP_NAME, builtin, raw)
-    // A failed disk search still leaves a partial index page, which is more
-    // than an error message; fall through and let the warming flag say so.
-    if (delegated.ok) return nativeGrepPage(delegated.value, pattern)
-  }
-
-  const filter = combineFilters(scope.prefixFilter, include === undefined ? undefined : compileRipgrepGlob(include))
-  // `mode: 'regex'` and `smartCase: false` are the built-in's contract, not a
-  // preference: ripgrep's default is a case-sensitive regular expression.
-  // `timeBudgetMs: 0` is the other half of it — the built-in has no partial
-  // result, it has a timeout that fails the call, and this tool exposes no
-  // cursor to continue a cut scan with, so a budget here would truncate a
-  // takeover answer with nothing to point at.
-  const options: GrepCallOptions = { mode: 'regex', beforeContext: 0, afterContext: 0, pageSize: NATIVE_GREP_LIMIT, timeBudgetMs: 0, smartCase: false }
-  const result = runGrep(scope.lease, pattern, options, undefined, filter)
-  if (isFailure(result)) {
-    if (canDelegate) {
-      const delegated = await delegate.run(NATIVE_GREP_NAME, builtin, raw)
-      if (delegated.ok) return nativeGrepPage(delegated.value, pattern)
-    }
-    return result
-  }
-  const value = result.value
-  const notes: string[] = []
-
-  if (value.items.length === 0) {
-    if (value.filteredFrom > 0) {
-      // The index matched and `include` dropped it — not an absence on disk,
-      // and delegating here would answer "no such file" for a file it can see.
-      notes.push(`${value.filteredFrom} line(s) matched outside include="${String(include)}" — widen or drop include to see them`)
-    } else if (canDelegate) {
-      const delegated = await delegate.run(NATIVE_GREP_NAME, builtin, raw)
-      if (delegated.ok) {
-        const disk = nativeGrepPage(delegated.value, pattern)
-        if (disk.items.length > 0) {
-          return { ...disk, note: ['the index had no match — these lines come from ripgrep on disk, so the index has not caught up', ...(disk.note === undefined ? [] : [disk.note])].join('; ') }
-        }
-        return { items: [], totalMatched: 0, note: 'no match in the index and none on disk' }
-      }
-      notes.push(`no match in the index; the on-disk check could not run (${delegated.error})`)
-    } else {
-      const hint = absenceNote(scope, pattern)
-      if (hint !== undefined) notes.push(hint)
-    }
-  }
-  if (value.regexFallbackError) notes.push(`regex failed to compile (${value.regexFallbackError}); literal fallback used`)
-  if (value.cappedFiles.length > 0) {
-    const shown = value.cappedFiles.slice(0, 3).map(file => `"${file}"`).join(', ')
-    notes.push(`${shown} hit the ${GREP_MAX_MATCHES_PER_FILE}-matches-per-file cap — more lines there are not shown; narrow the pattern or read the file directly`)
-  }
-  const page = value.items.slice(0, NATIVE_GREP_LIMIT)
-  if (value.items.length > NATIVE_GREP_LIMIT) {
-    notes.push(`more than ${NATIVE_GREP_LIMIT} lines match; the first ${NATIVE_GREP_LIMIT} are shown — narrow pattern, path or include`)
-  }
-  if (!scope.lease.aux) {
-    for (const item of page.slice(0, 20)) noteQueryHit(path.resolve(scope.lease.basePath, item.file), pattern)
-  }
-  return {
-    items: page.map(item => ({ ...item, file: displayPath(workdirOf(exec), scope.lease.basePath, item.file) })),
-    totalMatched: page.length,
-    ...(scope.lease.warming ? { warming: true } : {}),
-    ...(notes.length > 0 ? { note: notes.join('; ') } : {}),
-  }
-}
-
-/** ffgrep's own surface — every mode, both search shapes, paging. */
 const FORGE_GREP_PARAMETERS: ParameterSchemaSpec = {
-  pattern: { type: 'string', description: 'One nonempty search text.' },
-  patterns: { type: 'array', items: { type: 'string' }, description: '2-16 nonempty literals, OR-matched in one pass; always literal — no mode applies.' },
-  path: { type: 'string', description: 'Directory, file, or globs "*.ts !test/"; absolute or workspace-relative, default workspace. With patterns: filter files only.' },
-  mode: { type: 'string', enum: ['plain', 'regex', 'fuzzy'], description: 'plain (default) = literal; regex (invalid expressions fall back); fuzzy (typos). pattern only.' },
-  context: { type: 'integer', description: `Lines around hits, 0-${CONTEXT_MAX}; default 0.` },
-  limit: { type: 'integer', description: `Hits per page (default ${GREP_LIMIT_DEFAULT}, max ${GREP_LIMIT_MAX}); file boundaries may exceed it.` },
+  pattern: { type: 'string', description: 'One nonempty fuzzy search text; use this for typos or frecency-ranked content search.' },
+  patterns: { type: 'array', items: { type: 'string' }, description: '2-16 nonempty literals, OR-matched in one pass.' },
+  path: { type: 'string', description: 'Directory or file, absolute or workspace-relative, default workspace.' },
+  context: { type: 'integer', description: `Lines around each hit, 0-${CONTEXT_MAX}; positive context forces literal matching; default 0.` },
+  limit: { type: 'integer', description: `Hits per page (default ${GREP_LIMIT_DEFAULT}, max ${GREP_LIMIT_MAX}).` },
   cursor: { type: 'string', description: 'Previous nextCursor; keep search arguments unchanged.' },
-  timeBudgetMs: { type: 'integer', description: `Soft cap on scan time in ms (default ${TIME_BUDGET_DEFAULT_MS}, max 60000; 0 = unlimited). It can only cut a scan that is already matching: a query with no hits always reads every candidate file, so an empty page means "absent", not "gave up". A cut scan returns nextCursor — continue with cursor to get the rest.` },
-  enclosing: { type: 'boolean', description: 'Attach enclosing symbol + range for ff_read (file#Symbol); default false. pattern only.' },
 }
 
-/** ffgrep — SIMD content search in frecency order, no subprocess. */
-export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?: NativeDelegate) {
-  const native = nativeName === 'grep'
+/** ffgrep — fuzzy and multi-literal content search in frecency order, no subprocess. */
+export function createGrepTool(pool: FinderPool) {
+  const pages = new Map<string, { key: string; finder: FinderLease['finder']; outcome: GrepOutcome; shadowed: Set<string>; overlayIdentity: string; bytes: number; at: number }>()
+  const pageBudget = 8 * 1024 * 1024
   return {
-    name: native ? NATIVE_GREP_NAME : 'ffgrep',
-    description: native
-      ? 'Search file contents with a ripgrep regular expression. Case-sensitive; returns matching lines as "path:line: text". ' +
-        'Searches the workspace index, which holds no .gitignore\'d paths and no node_modules — point path at one to search it — and does hold dot-directories, which the built-in ripgrep skips. ' +
-        'When the index cannot answer — still scanning, fails to start, or finds no match — the same pattern is re-run with ripgrep over the disk, and the note says which one answered. ' +
-        `Returns up to ${NATIVE_GREP_LIMIT} lines; narrow pattern, path or include to see more.`
-      : 'Search text, including references. Use pattern (one plain/regex/fuzzy search) or patterns (2-16 literals, one OR pass) — exactly one of the two. ' +
-        'Pass path at any directory and the index re-roots onto it — node_modules, another drive and another checkout included. ' +
-        'For definitions use ff_read view=definitions. Lowercase patterns ignore case. Warming/timeout pages may be partial; paginate with cursor.',
-    parameters: native ? NATIVE_GREP_PARAMETERS : FORGE_GREP_PARAMETERS,
+    name: 'ff_grep',
+    description: 'Fuzzy content search (typos tolerated, frecency-ranked) and 2-16 literal patterns in one OR pass. '
+      + 'For plain or regex searches use the built-in grep. '
+      + 'Pass path at any directory and the engine re-roots onto it — node_modules, another drive and another checkout included. '
+      + 'For definitions use ff_symbols view=definitions. Lowercase patterns ignore case; positive context and non-ASCII queries use literal matching. Warming pages may be partial; paginate with cursor.',
+    parameters: FORGE_GREP_PARAMETERS,
     output: {
       schema: {
         type: 'object',
@@ -613,7 +427,14 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
         // Headers first, then the empty case — see renderGlobPage for why.
         if (value.items.length === 0) {
           const header: string[] = []
-          if (value.warming) header.push('[index still warming — this page is not an answer; retry]')
+          // A scanning finder has no answer yet. Printing "no matches" under
+          // the sentence that says the page is not an answer is a contradiction
+          // the caller has to resolve; emit only the fact that nothing is known.
+          if (value.warming) {
+            header.push('[index still scanning — an empty page here is not an answer; retry]')
+            if (value.note) header.push(`[${value.note}]`)
+            return text(header.join('\n'))
+          }
           if (value.note) header.push(`[${value.note}]`)
           return text([...header, 'no matches'].join('\n'))
         }
@@ -624,69 +445,57 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
       },
     },
     isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined, raw?: ForgeExec) {
-      if (native) return nativeGrep(pool, args, exec, raw, delegate)
+    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const pattern = typeof args.pattern === 'string' ? args.pattern : ''
       const patterns = Array.isArray(args.patterns)
         ? args.patterns.filter((p): p is string => typeof p === 'string' && p !== '')
         : []
-      const mode = typeof args.mode === 'string' ? args.mode : undefined
       if (pattern !== '' && patterns.length > 0) return failure('provide either pattern or patterns, not both')
       if (pattern === '' && patterns.length === 0) return failure('pattern is required (or patterns with 2-16 literals)')
+      // Neither key is in the schema. They are refused rather than ignored so a
+      // caller that learned them from an older surface is told where the
+      // built-in already answers: plain/regex search, and symbol attachment.
+      if (args.mode !== undefined) return failure('no mode: use the built-in grep for plain or regex search')
+      if (args.enclosing !== undefined) return failure('does not attach symbols; use ff_symbols for structure')
+      const context = clampInt(args.context, 0, 0, CONTEXT_MAX)
+      // Fuzzy is the default because a typo is what this tool is for, but two
+      // requests override it, both because fuzzy cannot serve them and would
+      // answer something else without saying so:
+      //
+      // - A non-ASCII query: fff 0.11.0's fuzzy matcher returns nothing at all
+      //   for CJK (measured: "中文标记" → 0 hits, the same text as a literal →
+      //   1), and subsequence matching across ideographs is not a useful answer
+      //   anyway.
+      // - `context`: fuzzy hits carry no context lines at all (measured: the
+      //   same putBlob call returns contextBefore/After length 0 in fuzzy, 2 in
+      //   plain). Asking for context is asking to see the lines around a match,
+      //   so a page without them is a failed answer — run the literal match the
+      //   caller is clearly describing.
+      const mode: GrepMode | undefined = patterns.length === 0
+        ? (/[^\x00-\x7F]/.test(pattern) || context > 0 ? 'plain' : 'fuzzy')
+        : undefined
       // Multi-literal OR mode. Absorbed from the former fff_multi_grep: same
       // engine call, same page/cursor contract, so a caller that used
       // `patterns` keeps working — it just has one fewer tool to choose from.
-      if (patterns.length > 0) {
-        if (patterns.length === 1) return failure('patterns requires at least 2 literals (use pattern for a single one)')
-        if (patterns.length > 16) return failure('patterns accepts at most 16 patterns')
-        if (mode !== undefined) return failure('mode applies to pattern only; patterns are always literal')
-        if (args.enclosing === true) return failure('enclosing applies to pattern only; patterns carries no enclosing-symbol annotation')
-        const multiContext = clampInt(args.context, 0, 0, CONTEXT_MAX)
-        const multiLimit = clampInt(args.limit, GREP_LIMIT_DEFAULT, 1, GREP_LIMIT_MAX)
-        const multiBudget = clampInt(args.timeBudgetMs, TIME_BUDGET_DEFAULT_MS, 0, 60_000)
-        const multiLease = await pool.main(workdirOf(exec))
-        if (isFailure(multiLease)) return multiLease
-        const multi = multiLease.finder.multiGrep({
-          patterns,
-          constraints: typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined,
-          beforeContext: multiContext,
-          afterContext: multiContext,
-          pageSize: multiLimit,
-          maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
-          smartCase: true,
-          timeBudgetMs: multiBudget,
-          cursor: takeCursor(typeof args.cursor === 'string' ? args.cursor : undefined),
-        })
-        if (!multi.ok) return failure(`fff multi-grep failed: ${multi.error}`)
-        for (const item of multi.value.items.slice(0, 20)) {
-          noteQueryHit(path.resolve(multiLease.basePath, item.relativePath), patterns.join(' | '))
-        }
-        // Same silent-loss risk as single-pattern grep: the per-file cap drops
-        // the rest of a hot file and the cursor skips past it.
-        const multiPerFile = new Map<string, number>()
-        for (const item of multi.value.items) {
-          multiPerFile.set(item.relativePath, (multiPerFile.get(item.relativePath) ?? 0) + 1)
-        }
-        const multiCapped = [...multiPerFile].filter(([, n]) => n >= GREP_MAX_MATCHES_PER_FILE).map(([file]) => file)
-        const multiNotes: string[] = []
-        if (multiCapped.length > 0) {
-          multiNotes.push(`${multiCapped.slice(0, 3).map(file => `"${file}"`).join(', ')} hit the ${GREP_MAX_MATCHES_PER_FILE}-matches-per-file cap — more lines there are not shown and no cursor reaches them; narrow the pattern or read the file directly`)
-        }
-        return {
-          items: multi.value.items.map(shapeGrepItem),
-          totalMatched: multi.value.totalMatched,
-          ...(multi.value.nextCursor ? { nextCursor: storeCursor(multi.value.nextCursor) } : {}),
-          ...(multiLease.warming ? { warming: true } : {}),
-          ...(multiNotes.length ? { note: multiNotes.join('; ') } : {}),
-        }
-      }
-      const context = clampInt(args.context, 0, 0, CONTEXT_MAX)
+      if (patterns.length === 1) return failure('patterns requires at least 2 literals (use pattern for a single one)')
+      if (patterns.length > 16) return failure('patterns accepts at most 16 patterns')
+      const query = patterns.length > 0 ? patterns : pattern
       const limit = clampInt(args.limit, GREP_LIMIT_DEFAULT, 1, GREP_LIMIT_MAX)
-      const timeBudgetMs = clampInt(args.timeBudgetMs, TIME_BUDGET_DEFAULT_MS, 0, 60_000)
+      const timeBudgetMs = TIME_BUDGET_DEFAULT_MS
       const scope = await resolveScope(pool, workdirOf(exec), typeof args.path === 'string' ? args.path : undefined)
       if (isFailure(scope)) return scope
+      try {
       const options = grepCallOptions(mode, context, limit, timeBudgetMs)
-      const result = runGrep(scope.lease, pattern, options, typeof args.cursor === 'string' ? args.cursor : undefined, scope.prefixFilter)
+      const overlay = overlaySnapshot(scope.lease.basePath)
+      const key = JSON.stringify([workdirOf(exec), scope.lease.basePath, args.path ?? null, query, context, limit])
+      const cursor = typeof args.cursor === 'string' ? args.cursor : ''
+      const saved = cursor ? pages.get(cursor) : undefined
+      if (cursor && (!saved || saved.key !== key || saved.finder !== scope.lease.finder || saved.overlayIdentity !== overlay.identity || Date.now() - saved.at > 300_000)) {
+        return failure('cursor expired or belongs to another query/index; restart without cursor')
+      }
+      const buffered = saved && saved.outcome.items.length > 0
+      const result = buffered ? { value: saved.outcome }
+        : runGrep(scope.lease, query, options, saved?.outcome.nextCursorId ?? undefined, scope.prefixFilter)
       if (isFailure(result)) return result
       let value = result.value
       // Files committed by this process are authoritative: the index still holds
@@ -694,48 +503,32 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
       // round trip to notice, and ff exposes no per-file rebuild). So drop index
       // hits under those paths — keeping them would print a deleted line next to
       // its replacement — and answer for them from the bytes just written.
-      const overlay = overlaySnapshot(scope.lease.basePath)
+      const shadowed = saved?.shadowed ?? overlay.shadowed
       let liveHits = 0
       const withLive = (outcome: typeof value, liveMode: GrepMode): typeof value => {
         liveHits = 0
-        if (overlay.shadowed.size === 0) return outcome
-        const kept = outcome.items.filter((item) => !overlay.shadowed.has(item.file))
-        const live = searchOverlay(overlay.files, pattern, {
-          mode: liveMode,
+        if (buffered) return outcome
+        const kept = outcome.items.filter((item) => !shadowed.has(item.file))
+        const files = overlay.files.filter(file => !scope.prefixFilter || scope.prefixFilter(file.rel))
+        const live = saved ? [] : searchOverlay(files, query, {
+          mode: Array.isArray(query) ? 'plain' : liveMode,
           smartCase: options.smartCase,
           context,
-          limit,
+          limit: Number.MAX_SAFE_INTEGER,
         })
         liveHits = live.length
         return { ...outcome, items: [...live, ...kept], totalMatched: live.length + kept.length }
       }
       value = withLive(value, options.mode)
-      // Zero-hit literal→regex escalation: the built-in grep treats patterns as
-      // regex, so the model freely writes \d+ or a|b into a tool whose default
-      // mode is literal — and a zero-hit page reads as "not in the repo".
-      // When a first-page literal search matched nothing and the pattern is
-      // regex-shaped, retry once in regex mode (the engine already falls back
-      // literal on invalid regex). First page only: cursor pagination replays
-      // the same query, and re-escalating mid-pagination would skip hits.
+
       const paginating = typeof args.cursor === 'string' && args.cursor.trim() !== ''
       const notes: string[] = []
-      if ((mode === undefined || mode === 'plain') && !paginating && value.items.length === 0
-        && /[$^.*+?()[\]{}|\\]/.test(pattern)) {
-        const retry = runGrep(scope.lease, pattern, { ...options, mode: 'regex' }, undefined, scope.prefixFilter)
-        if (!isFailure(retry) && retry.value.items.length > 0) {
-          value = withLive(retry.value, 'regex')
-          notes.push('no literal matches — automatically retried as regex')
-        }
-      }
-      if (args.enclosing === true && value.items.length > 0) {
-        await attachEnclosingSymbols(value.items, scope.lease.basePath)
-      }
       // An empty page gets the same treatment as the glob page: wait out a scan that
       // is still running, then say what the disk holds if it is still empty.
       if (value.items.length === 0 && !paginating) {
         await waitForWarm(scope)
-        if (scope.lease.warming && value.items.length === 0) {
-          const retry = runGrep(scope.lease, pattern, options, undefined, scope.prefixFilter)
+        if (value.items.length === 0) {
+          const retry = runGrep(scope.lease, query, options, undefined, scope.prefixFilter)
           if (!isFailure(retry)) value = withLive(retry.value, options.mode)
         }
         if (value.items.length === 0) {
@@ -743,16 +536,16 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
           //
           // If the index did hand back hits and the `path=` constraint dropped
           // all of them, the answer is "your constraint is too narrow". Running
-          // the disk walk here would instead report "exists on disk — matching
-          // is case-sensitive" or "not indexed at this scope": a wrong root
-          // cause that sends the caller off to rewrite the pattern while the
-          // real fix is to widen the path.
+          // a disk walk here would instead say something about a *name*, which
+          // is not the question a content search asked.
           const outside = value.filteredFrom
           if (outside > 0) {
             notes.push(`${outside} line(s) matched outside path="${String(args.path ?? '')}" — widen or drop path to see them`)
-          } else {
-            const hint = absenceNote(scope, pattern)
-            if (hint !== undefined) notes.push(hint)
+          } else if (contentIndexIsStale(scope.lease) && await pool.rescan(scope.lease)) {
+            // The index was demonstrably behind (a directory changed after the
+            // last scan), so the empty page was not an answer. Retry once.
+            const retry = runGrep(scope.lease, query, options, undefined, scope.prefixFilter)
+            if (!isFailure(retry)) value = withLive(retry.value, options.mode)
           }
         }
       }
@@ -764,7 +557,7 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
       if (value.cappedFiles.length > 0) {
         const shown = value.cappedFiles.slice(0, 3).map(file => `"${file}"`).join(', ')
         const more = value.cappedFiles.length > 3 ? ` and ${value.cappedFiles.length - 3} more file(s)` : ''
-        notes.push(`${shown}${more} hit the ${GREP_MAX_MATCHES_PER_FILE}-matches-per-file cap — more lines there are not shown and no cursor reaches them; narrow the pattern or read the file directly`)
+        notes.push(`${shown}${more} at the ${GREP_MAX_MATCHES_PER_FILE}-per-file cap — rest not paged; narrow the pattern or read the file`)
       }
       // Never let a live answer pass as an indexed one: the two disagree for a
       // few seconds, and the model is the one who decides whether to trust it.
@@ -774,55 +567,51 @@ export function createGrepTool(pool: FinderPool, nativeName?: 'grep', delegate?:
       if (scope.prefixFilter && value.filteredFrom > value.items.length) {
         notes.push(`page filled from ${value.filteredFrom} raw hits before constraint filtering`)
       }
+      const shown = value.items.slice(0, limit)
+      const rest = value.items.slice(limit)
+      let nextCursor: string | undefined
+      if (rest.length > 0 || value.nextCursorId) {
+        const outcome = { ...value, items: rest, totalMatched: rest.length }
+        const bytes = Buffer.byteLength(JSON.stringify(outcome))
+        if (bytes > pageBudget) return failure('search page exceeds the 8 MiB cursor budget; narrow path or pattern')
+        nextCursor = randomUUID()
+        pages.set(nextCursor, { key, finder: scope.lease.finder, outcome, shadowed, overlayIdentity: overlay.identity, bytes, at: Date.now() })
+        let used = 0
+        for (const page of pages.values()) used += page.bytes
+        while (pages.size > 200 || used > pageBudget) {
+          const oldest = pages.keys().next().value!
+          used -= pages.get(oldest)!.bytes
+          pages.delete(oldest)
+        }
+      }
       // Query→file memory for the ledger→fff feedback: when ffedit later
       // writes one of these files, the (query, file) pair is replayed into
       // trackQuery. Main leases only — aux finders persist no learning data.
-      if (!scope.lease.aux) {
-        for (const item of value.items.slice(0, 20)) {
-          noteQueryHit(path.resolve(scope.lease.basePath, item.file), pattern)
+      if (!scope.lease.temporary) {
+        for (const item of shown.slice(0, 20)) {
+          noteQueryHit(path.resolve(scope.lease.basePath, item.file), Array.isArray(query) ? query.join(' | ') : query)
         }
       }
       return {
-        items: value.items.map(item => ({ ...item, file: displayPath(workdirOf(exec), scope.lease.basePath, item.file) })),
-        totalMatched: value.totalMatched,
-        ...(value.nextCursorId ? { nextCursor: value.nextCursorId } : {}),
+        items: shown.map(item => ({ ...item, file: displayPath(workdirOf(exec), scope.lease.basePath, item.file) })),
+        totalMatched: shown.length,
+        ...(nextCursor ? { nextCursor } : {}),
         ...(scope.lease.warming ? { warming: true } : {}),
         ...(notes.length ? { note: notes.join('; ') } : {}),
       }
+      } finally { scope.lease.release?.() }
     },
   } as const
 }
 
 // ---------------------------------------------------------------------------
-// fffind — fuzzy file-name search (mode=name) and glob path listing (mode=glob)
+// fffind — fuzzy file-name search; path patterns belong to the built-in glob
 // ---------------------------------------------------------------------------
 
-const FIND_MODES = ['name', 'glob'] as const
-type FindMode = (typeof FIND_MODES)[number]
-
-/** One row of a `mode=glob` page: the four shared fields, none of the ranking ones. */
-interface FindGlobRow {
-  path: string
-  size: number
-  modified: string
-  git: string
-}
-
 /**
- * Absent or unrecognised `mode` reads as `name` — i.e. exactly what this tool did
- * before `ffglob` was folded into it, so every pre-merge `fffind` call is
- * unchanged. Validation of an explicit-but-wrong value happens in `execute`.
- */
-function findModeOf(args: unknown): FindMode {
-  const raw = (args as { mode?: unknown } | undefined)?.mode
-  return typeof raw === 'string' && raw.trim() === 'glob' ? 'glob' : 'name'
-}
-
-/**
- * The two modes return different row shapes, so the output schema is their flat
- * union with the ranking fields optional: `defineForgeTool` spreads the root
- * `properties`, so a top-level `oneOf` cannot survive — the same constraint that
- * shaped `ff_read`'s three views. `mode=name` always fills all eight fields.
+ * One row of a fuzzy name page. Every field is filled: the ranked fields exist
+ * because this is a fuzzy answer, where "how well did it match" is part of the
+ * result rather than decoration.
  */
 const FIND_ITEM_SCHEMA = {
   type: 'object',
@@ -840,7 +629,7 @@ const FIND_ITEM_SCHEMA = {
 } as const
 
 interface FindRenderValue {
-  items: Array<FindItem | FindGlobRow>
+  items: FindItem[]
   totalMatched?: number
   warming?: boolean
   note?: string
@@ -853,13 +642,19 @@ interface FindRenderValue {
  * stays *inside* this tool, which is the point of folding the two together.
  */
 const GLOB_LOOKING_PATTERN_NOTE =
-  '[pattern looks like a glob — mode=name matches file names fuzzily; for path patterns pass mode=glob, or use ff_read with glob= to read the matches directly]'
+  '[pattern looks like a glob — use the built-in glob for path patterns; fffind only matches names fuzzily]'
 
 function renderNamePage(args: unknown, value: FindRenderValue): Array<{ type: 'text'; text: string }> {
   // Headers first, then the empty case — see renderGlobPage for why.
   if (value.items.length === 0) {
+    if (value.warming) {
+      // Nothing is known yet, so nothing may be claimed. "no files matched"
+      // under a line that calls the page inconclusive is read as an answer.
+      const header = ['[index still scanning — an empty page here is not an answer; retry]']
+      if (value.note) header.push(`[${value.note}]`)
+      return text(header.join('\n'))
+    }
     const header: string[] = []
-    if (value.warming) header.push('[index still warming — this page is not an answer; retry]')
     // A name search only answers a name question. Say so when the query hit no
     // file name at all, rather than letting one fuzzy coincidence read as a hit
     // — a real session took such a result at face value and dropped the tool
@@ -879,7 +674,7 @@ function renderNamePage(args: unknown, value: FindRenderValue): Array<{ type: 't
     : ''
   // A name search only answers a name question — see core.ts weakNameMatch.
   if (weakNameMatch(pattern, items)) {
-    header.push(`[no file name contains "${pattern}" — fuzzy coincidences only. For file contents, symbols or config values use ffgrep.]`)
+    header.push(`[no file name contains "${pattern}" — fuzzy coincidences only. For file contents, symbols or config values use ff_grep.]`)
   }
   if (/[*?\[]/.test(pattern)) header.push(GLOB_LOOKING_PATTERN_NOTE)
   // The cap is invisible otherwise: the caller cannot tell a complete result
@@ -891,78 +686,39 @@ function renderNamePage(args: unknown, value: FindRenderValue): Array<{ type: 't
   return text(renderFindItems(items, header))
 }
 
-/**
- * The built-in `glob` page: a bare path list, no page cursor.
- *
- * The built-in takes no pagination argument, so a cap here cannot be escaped by
- * asking for the next page — the only honest move is to say the list is capped
- * and name the two arguments that narrow it.
- */
-/**
- * Convert the built-in `glob`'s `{root, paths}` answer into this tool's page.
- *
- * `size`/`modified`/`git` are required by the item schema, and the built-in walk
- * does not stat what it lists. They are reported empty rather than invented: a
- * `size: 0` would be a wrong fact, while `''` reads as "not reported". The page
- * renders paths only.
- *
- * @param value - the built-in's raw value.
- * @returns the page, or `undefined` when the value is not the built-in's shape.
- */
-function nativeGlobFromBuiltin(value: unknown): FindRenderValue | undefined {
-  if (typeof value !== 'object' || value === null) return undefined
-  const paths = (value as { paths?: unknown }).paths
-  if (!Array.isArray(paths)) return undefined
-  const listed = paths.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
-  return {
-    items: listed.map((path) => ({ path, size: 0, modified: '', git: '' })),
-    totalMatched: listed.length,
-  }
-}
-
-function renderNativeGlobPage(value: FindRenderValue): Array<{ type: 'text'; text: string }> {
-  const header: string[] = []
-  if (value.items.length === 0) {
-    if (value.warming) header.push('[index still warming — this page is not an answer; retry]')
-    if (value.note) header.push(`[${value.note}]`)
-    return text([...header, 'no files matched'].join('\n'))
-  }
-  if (value.warming) header.push('[index still warming — results may be partial]')
-  if ((value.totalMatched ?? 0) > value.items.length) {
-    header.push(`[showing ${value.items.length} of ${value.totalMatched} matches — narrow the pattern or pass path=]`)
-  }
-  if (value.note) header.push(`[${value.note}]`)
-  return text([...header, ...value.items.map((item) => item.path)].join('\n'))
-}
-
-function renderGlobPage(value: FindRenderValue): Array<{ type: 'text'; text: string }> {  // The headers are assembled before the empty case returns. Ordering was the
-  // bug: returning on `items.length === 0` first threw away exactly the flag
-  // that explains an empty page ("still warming"), so a finder that had not
-  // finished scanning was indistinguishable from a tree that genuinely holds
-  // nothing.
-  const header: string[] = []
-  if (value.items.length === 0) {
-    if (value.warming) header.push('[index still warming — this page is not an answer; retry]')
-    if (value.note) header.push(`[${value.note}]`)
-    return text([...header, 'no files matched'].join('\n'))
-  }
-  if (value.warming) header.push('[index still warming — results may be partial]')
-  // The cap must be visible: a caller cannot tell a complete list from a
-  // truncated page (same discipline as the name page).
-  if ((value.totalMatched ?? 0) > value.items.length) {
-    header.push(`[showing ${value.items.length} of ${value.totalMatched} glob matches — paginate with page=<n>]`)
-  }
-  if (value.note) header.push(`[${value.note}]`)
-  return text([...header, ...value.items.map((item) => item.path)].join('\n'))
-}
-
-/** `mode=name` — fuzzy file-name search, ranked by match score and frecency. */
-async function nameSearch(pool: FinderPool, args: Record<string, unknown>, pattern: string, exec: ForgeExec | undefined) {
+/** Fuzzy file-name search, ranked by match score and frecency. */
+async function nameSearch(
+  pool: FinderPool,
+  args: Record<string, unknown>,
+  pattern: string,
+  exec: ForgeExec | undefined,
+  globalSearch: typeof everythingSearch,
+) {
   const limit = clampInt(args.limit, FIND_LIMIT_DEFAULT, 1, FIND_LIMIT_MAX)
+  const workdir = workdirOf(exec)
+  // Inside the workspace fff is already warm, and it is the only finder that
+  // honours .gitignore — so the machine index answers first only when the
+  // target root is outside the workspace (where fff has to cold-scan anyway),
+  // or when the caller explicitly opted in.
+  const preferGlobal = outsideWorkspace(args.path, workdir) || globalIndexMode() === 'everything'
+  let fallbackNote: string | undefined
+  if (preferGlobal) {
+    const global = await globalLookup(pattern, args.path, workdir, limit, globalSearch)
+    if (global.status === 'hit') {
+      return {
+        items: global.hits.map((hit) => globalItem(hit, workdir)),
+        totalMatched: global.hits.length,
+      }
+    }
+    fallbackNote = global.status === 'miss'
+      ? 'everything: no literal filename hit'
+      : global.status === 'unavailable' ? `everything unavailable: ${global.reason}` : undefined
+  }
   // fffind used to resolve `path` itself, duplicating resolveScope — including
   // its Windows separator bug. One resolver, one fix.
-  const scope = await resolveScope(pool, workdirOf(exec), typeof args.path === 'string' ? args.path : undefined)
+  const scope = await resolveScope(pool, workdir, typeof args.path === 'string' ? args.path : undefined)
   if (isFailure(scope)) return scope
+  try {
   const lease = scope.lease
   const filter = scope.prefixFilter
   const result = lease.finder.fileSearch(pattern, { pageSize: filter ? FIND_LIMIT_MAX : limit })
@@ -975,18 +731,18 @@ async function nameSearch(pool: FinderPool, args: Record<string, unknown>, patte
   if (filter) {
     items = items.filter((item) => filter(item.path))
     // An explicit file must not disappear merely because other files rank higher.
-    for (let pageIndex = 1; !items.length && pageIndex * FIND_LIMIT_MAX < result.value.totalMatched; pageIndex++) {
+    for (let pageIndex = 1; items.length < limit && pageIndex * FIND_LIMIT_MAX < result.value.totalMatched; pageIndex++) {
       const page = lease.finder.fileSearch(pattern, { pageSize: FIND_LIMIT_MAX, pageIndex })
       if (!page.ok) return failure(`fff file search failed: ${page.error}`)
       offered += page.value.items.length
-      items = page.value.items.map((item, i) => shapeFindItem(item, page.value.scores[i])).filter(item => filter!(item.path))
+      items.push(...page.value.items.map((item, i) => shapeFindItem(item, page.value.scores[i])).filter(item => filter!(item.path)))
       if (!page.value.items.length) break
     }
   }
-  let note: string | undefined
+  let note: string | undefined = fallbackNote
   if (items.length === 0) {
     await waitForWarm(scope)
-    if (scope.lease.warming) {
+    if (items.length === 0) {
       const retry = lease.finder.fileSearch(pattern, { pageSize: filter ? FIND_LIMIT_MAX : limit })
       if (retry.ok) {
         offered = retry.value.items.length
@@ -995,130 +751,215 @@ async function nameSearch(pool: FinderPool, args: Record<string, unknown>, patte
           .filter(item => filter === undefined || filter(item.path))
       }
     }
+    // An empty page can mean the index is *behind* rather than the name being
+    // absent. One disk walk answers both questions: if it names a file, the
+    // index is stale and gets rebuilt; if it names nothing, it is already the
+    // evidence the absence note needs.
+    let rescanned = false
+    let walk: AbsenceWalk | undefined
+    if (items.length === 0 && !lease.warming) {
+      walk = diskProbe(lease, pattern)
+      // Directory hits are not evidence: name search reports files, and the
+      // note already answers a directory with the `path=` that opens it.
+      if (walk !== undefined && walk.hits.some((hit) => !hit.dir)) {
+        rescanned = await pool.rescan(lease)
+        if (rescanned) {
+          const again = lease.finder.fileSearch(pattern, { pageSize: filter ? FIND_LIMIT_MAX : limit })
+          if (again.ok) {
+            offered = again.value.items.length
+            items = again.value.items
+              .map((item, i) => shapeFindItem(item, again.value.scores[i]))
+              .filter(item => filter === undefined || filter(item.path))
+          }
+        }
+      }
+    }
     if (items.length === 0) {
       // Same split as ffgrep: a name the index returned but the constraint
       // dropped is not an absence on disk, and the disk walk would mislabel it.
-      note = filter !== undefined && offered > 0
+      note = joinNotes(fallbackNote, filter !== undefined && offered > 0
         ? `${offered} name match(es) fell outside path="${String(args.path ?? '')}" — widen or drop path to see them`
-        : absenceNote(scope, pattern)
+        // The walk costs up to 400 ms and would explain a page that is not
+        // final yet; a scanning finder gets the retry header instead.
+        : lease.warming ? undefined
+          : absenceNote(scope, pattern, { rescanned, ...(walk === undefined ? {} : { walk }) }))
     }
   }
-  if (!lease.aux) {
+  // A weak fuzzy page is the signal to ask the machine index: this is exactly
+  // the shape (six scattered-subsequence rows, not one of them containing the
+  // query) that made a caller believe a name existed under the wrong root.
+  // Only inside the workspace — the outside-root case already asked first.
+  //
+  // The machine index *annotates* this page, it does not replace it. Replacing
+  // was measured and reverted: a two-letter-off abbreviation is a legitimate
+  // fuzzy query (`utls` → `utils.py`), and a literal backend answers it with
+  // every unrelated path that happens to contain the substring (`gnutls/`),
+  // which buries the file the caller wanted. fff's ranking is the better
+  // answer; what it lacks is the *doubt signal*, so the note carries both.
+  if (!preferGlobal && items.length > 0 && globalIndexMode() !== 'off'
+    && !rootNameMatch(pattern, lease.basePath) && weakNameMatch(pattern, items)) {
+    const escalated = await globalLookup(pattern, args.path, workdir, limit, globalSearch, true)
+    const hint = escalated.status === 'hit'
+      ? `; machine index: ${escalated.hits.slice(0, 2).map((hit) => clipPath(hit.path, 72)).join(', ')}`
+      : ''
+    note = joinNotes(
+      note,
+      `[fuzzy only — none of these names contains "${pattern}"${hint}]`,
+    )
+  }
+  if (!lease.temporary) {
     for (const item of items.slice(0, 20)) {
       noteQueryHit(path.resolve(lease.basePath, item.path), pattern)
     }
   }
   return {
-    items: items.map(item => ({ ...item, path: displayPath(workdirOf(exec), lease.basePath, item.path) })),
+    items: items.slice(0, limit).map(item => ({ ...item, path: displayPath(workdirOf(exec), lease.basePath, item.path) })),
     totalMatched: filter ? items.length : result.value.totalMatched,
     ...(lease.warming ? { warming: true } : {}),
     ...(note ? { note } : {}),
   }
+  } finally { scope.lease.release?.() }
 }
-
 /**
- * The built-in `glob` name, and the only name this branch ever delegates to.
+ * True when the query is (part of) the root's own name.
  *
- * Same rule as {@link NATIVE_GREP_NAME}: the fallback has to address the
- * built-in, and asking for a scoped `glob` would resolve back to ourselves.
+ * `weakNameMatch` decides "no returned path contains the query" from *relative*
+ * paths, and those have the root stripped: asking for `dsh-forge` inside
+ * `D:\AI\dsh-plugins\dsh-forge` returned eleven `docs/forge-*.md` rows reachable
+ * only as fuzzy matches, so the detector called a correct answer a coincidence
+ * and offered a machine-index hint instead. The root name is the one literal
+ * occurrence the page cannot show, so it has to be checked here.
  */
-const NATIVE_GLOB_NAME = 'glob'
+function rootNameMatch(query: string, basePath: string): boolean {
+  const root = path.basename(basePath).toLowerCase()
+  const needle = query.trim().toLowerCase()
+  return root !== '' && needle !== '' && (root.includes(needle) || needle.includes(root))
+}
+
+function joinNotes(...parts: Array<string | undefined>): string | undefined {
+  const kept = parts.filter((part): part is string => typeof part === 'string' && part !== '')
+  return kept.length === 0 ? undefined : kept.join('; ')
+}
 
 /**
- * The built-in `glob` arguments, verbatim: a pattern and a directory, nothing
- * else. Kept as a typed constant so the native branch is checked against the
- * same schema spec as the forge branch instead of collapsing into a union.
+ * Shorten a path for a one-line note, keeping the tail (the part that names the
+ * thing). A note is a hint, not a result row — the full path is one `fffind`
+ * away, and a truncated head is what makes the tail readable.
  */
-const NATIVE_GLOB_PARAMETERS: ParameterSchemaSpec = {
-  pattern: { type: 'string', required: true, description: 'Glob to match paths against, e.g. "**/*.ts" or "src/**/*.test.js". With no "/" it matches the file NAME at any depth, so "*" and "*.ts" both cover the whole tree.' },
-  path: { type: 'string', description: 'Directory to search, absolute or workspace-relative; defaults to the workspace. Point it at a .gitignore\'d directory to search that subtree.' },
+function clipPath(value: string, max: number): string {
+  const flat = value.replace(/[\\/]+/g, '/')
+  if (flat.length <= max) return flat
+  return `…${flat.slice(flat.length - max + 1)}`
 }
 
-const FORGE_FIND_PARAMETERS: ParameterSchemaSpec = {
-  pattern: { type: 'string', required: true, description: 'name: fuzzy query, e.g. "store.js" or "src/ config"; not a glob. glob: path pattern, e.g. "src/**/*.ts" or "*.{js,mjs}"; Case-sensitive — without "/" it matches the file NAME at any depth ("*.md" ≙ "**/*.md").' },
-  mode: { type: 'string', enum: ['name', 'glob'], description: 'Default name: fuzzy file-name match. glob: path-pattern listing.' },
-  path: { type: 'string', description: 'Directory; absolute or workspace-relative, default workspace.' },
-  limit: { type: 'integer', description: `name: max files (default ${FIND_LIMIT_DEFAULT}, max ${FIND_LIMIT_MAX}). glob: paths per page (default ${GLOB_LIMIT_DEFAULT}, max ${GLOB_LIMIT_MAX}).` },
-  page: { type: 'integer', description: 'glob only: 0-based page when totalMatched exceeds limit.' },
+/** `auto` (default) | `everything` (opt-in, announce failures) | `off`. */
+function globalIndexMode(): string {
+  return (process.env.FORGE_GLOBAL_INDEX ?? 'auto').trim().toLowerCase()
 }
 
-/** fffind — fuzzy file-name search, plus glob path listing under `mode=glob`. */
-export function createFindTool(pool: FinderPool, nativeName?: 'glob', delegation?: NativeDelegate) {
-  // Serving as the built-in `glob`: its argument contract is `{pattern, path}`
-  // and nothing else — no mode, no page, no limit — and its answer is a plain
-  // path list. Admitting the rest would let the built-in guidance (which stays
-  // visible under takeover) describe arguments this tool does not have.
-  const native = nativeName === 'glob'
-  const nativeGlob = async (
-    args: Record<string, unknown>,
-    exec: ForgeExec | undefined,
-    raw: ForgeExec | undefined,
-  ) => {
-    const pattern = typeof args.pattern === 'string' ? args.pattern.trim() : ''
-    if (pattern === '') return failure('pattern is required')
-    const rawPath = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
-    // The built-in's own argument shape — never this tool's.
-    const builtin = { pattern, ...(rawPath === undefined ? {} : { path: rawPath }) }
-    const canDelegate = delegation !== undefined && delegation.available(NATIVE_GLOB_NAME)
+/** True when `path` names a directory outside the session workspace. */
+function outsideWorkspace(rawPath: unknown, workdir: string): boolean {
+  if (typeof rawPath !== 'string' || rawPath.trim() === '') return false
+  return !isInsideRoot(workdir, path.resolve(workdir, rawPath.trim()))
+}
 
-    // A glob in `path` is not a path. The built-in answers with an error and so
-    // does this; treating it as a constraint would answer a different question
-    // (the same rule `nativeGrep` applies).
-    if (canDelegate && rawPath !== undefined && /[*?{[]/.test(rawPath)) {
-      const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
-      if (!delegated.ok) return failure(delegated.error)
-      const page = nativeGlobFromBuiltin(delegated.value)
-      if (page !== undefined) return page
-      return failure('glob answered in an unexpected shape')
-    }
-
-    // One page's worth is the whole answer here: there is no `page` argument to
-    // continue with, so asking for the maximum keeps the cap from being the
-    // thing that silently decides what the caller sees.
-    const result = await globSearch(pool, { ...args, limit: GLOB_LIMIT_MAX, page: 0 }, pattern, exec)
-
-    if (isFailure(result)) {
-      if (!canDelegate) return result
-      // A path the index cannot re-root onto (another drive, a bare file, a
-      // directory outside every scope) is exactly where the disk walk answers.
-      const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
-      if (!delegated.ok) return result
-      return nativeGlobFromBuiltin(delegated.value) ?? result
-    }
-
-    if (result.items.length > 0 || !canDelegate) return result
-
-    // Empty page. The index holds no .gitignore'd path and no node_modules —
-    // precisely what the built-in walk does hold — so "nothing in the index"
-    // must not become "nothing at all". This is the one place the takeover can
-    // answer a narrower question than the tool it replaced, and the note says
-    // which side answered.
-    const delegated = await delegation.run(NATIVE_GLOB_NAME, builtin, raw)
-    if (!delegated.ok) {
-      const note = [result.note, `the on-disk check could not run (${delegated.error})`].filter(Boolean).join('; ')
-      return { ...result, ...(note === '' ? {} : { note }) }
-    }
-    const page = nativeGlobFromBuiltin(delegated.value)
-    if (page === undefined) return result
-    if (page.items.length === 0) {
-      return { items: [], totalMatched: 0, note: 'no match in the index and none on disk' }
-    }
-    return {
-      ...page,
-      note: 'the index had no match — these paths come from the built-in walk on disk, so .gitignore\'d paths and node_modules are included',
-    }
+/**
+ * The directory the machine index should be constrained to, or `undefined` for
+ * the workspace. `null` means "do not use the machine index at all" — a `path`
+ * that points at one file is fff's job (it has the exact-name filter).
+ */
+function globalRoot(rawPath: unknown, workdir: string): string | undefined | null {
+  if (typeof rawPath !== 'string' || rawPath.trim() === '') return workdir
+  const absolute = path.resolve(workdir, rawPath.trim())
+  try {
+    return statSync(absolute).isDirectory() ? absolute : null
+  } catch {
+    return null
   }
+}
+
+/** Machine-index hits, shaped like fff's rows so one renderer serves both. */
+function globalItem(hit: GlobalHit, workdir: string): FindItem {
+  const absolute = hit.path.replace(/[\\/]+$/, '')
+  const local = path.relative(workdir, absolute)
+  const shown = (local === '..' || local.startsWith(`..${path.sep}`) || path.isAbsolute(local)
+    ? absolute : local).split(path.sep).join('/')
   return {
-    name: native ? 'glob' : 'fffind',
-    description: native
-      ? 'List files whose paths match a glob pattern. A pattern with no "/" matches the basename at any depth ("*.ts" ≙ "**/*.ts"); include a separator to anchor the depth. ' +
-        'Files only — directories are never returned; descend with "dir/**". ' +
-        'Searches the workspace index, which holds no .gitignore\'d paths and no node_modules; when the index has no match the same pattern is re-run over the disk, and the note says which one answered.'
-      : 'Find files. mode=name (default) fuzzily matches file names and paths, tolerating typos; mode=glob lists files whose paths match a glob and paginates by page. ' +
-        'Both list FILES only — directories are never returned; descend with "dir/**". ' +
-        'Pass path at any directory on the host — node_modules, another drive, another checkout — and the index re-roots onto it, reaching subtrees the workspace excludes. ' +
-        'An empty page names what it found on disk. For contents use ffgrep.',
-    parameters: native ? NATIVE_GLOB_PARAMETERS : FORGE_FIND_PARAMETERS,
+    path: hit.isDirectory ? `${shown}/` : shown,
+    name: path.basename(absolute),
+    score: 0,
+    match: 'everything',
+    git: '',
+    frecency: 0,
+    size: hit.size,
+    modified: hit.modified,
+  }
+}
+
+type GlobalGate = GlobalLookup | { status: 'skip' }
+
+/**
+ * Decide whether the literal backend may answer this query, then ask it.
+ *
+ * Only a **literal name** is eligible: globs and brace lists are fff's, and a
+ * query shorter than two characters would turn a machine-wide index into a
+ * dump. `FORGE_GLOBAL_INDEX=off` disables it; `everything` turns "binary or
+ * service missing" into a visible note instead of a silent fallback.
+ */
+async function globalLookup(
+  pattern: string,
+  rawPath: unknown,
+  workdir: string,
+  limit: number,
+  search: typeof everythingSearch,
+  machineWide = false,
+): Promise<GlobalGate> {
+  const mode = globalIndexMode()
+  if (mode === 'off' || pattern.trim().length < 2) return { status: 'skip' }
+  if (/[*?[\]{}]/.test(pattern)) return { status: 'skip' }
+  // Escalation is the opposite question — "this name is nowhere under this
+  // root, where is it?" — so it must not re-apply the same constraint.
+  const candidate = machineWide ? undefined : globalRoot(rawPath, workdir)
+  if (candidate === null) return { status: 'skip' }
+  const root: string | undefined = candidate
+  const lookup = await search(pattern, {
+    root,
+    limit,
+    mode: mode === 'everything' ? 'everything' : 'auto',
+    esPath: process.env.FORGE_ES_PATH,
+  })
+  if (lookup.status !== 'unavailable') return lookup
+  // Auto mode on a machine without Everything (or off Windows) is the normal
+  // case, not an event worth a note on every single query.
+  return mode === 'everything' ? lookup : { status: 'skip' }
+}
+
+/**
+ * fffind's surface: the typo-tolerant filename query the built-in glob cannot
+ * express. Path patterns, pages and their sort/limit contract belong to the
+ * built-in `glob`, which every host already renders and spills.
+ */
+const FORGE_FIND_PARAMETERS: ParameterSchemaSpec = {
+  pattern: { type: 'string', required: true, description: 'Fuzzy file-name or path query; use this for typos. For path patterns use the built-in glob.' },
+  path: { type: 'string', description: 'Directory; absolute or workspace-relative, default workspace.' },
+  limit: { type: 'integer', description: `Maximum fuzzy name results (default ${FIND_LIMIT_DEFAULT}, max ${FIND_LIMIT_MAX}).` },
+}
+
+export interface FindToolOptions {
+  /** Test seam: production uses the Everything backend from global-index.ts. */
+  globalSearch?: typeof everythingSearch
+}
+
+/** fffind — fuzzy file-name and path search. */
+export function createFindTool(pool: FinderPool, options: FindToolOptions = {}) {
+  const globalSearch = options.globalSearch ?? everythingSearch
+  return {
+    name: 'ff_find',
+    description: 'Find files by fuzzy name or path, tolerating typos. For path-pattern listing use the built-in glob. '
+      + 'Returns a directory too (trailing "/") when the machine index answers, files only from the fuzzy fallback. '
+      + 'Pass path at any directory on the host — node_modules, another drive, another checkout — and the index re-roots onto it, reaching subtrees the workspace excludes. '
+      + 'An empty page names what it found on disk. For contents use ff_grep.',
+    parameters: FORGE_FIND_PARAMETERS,
     output: {
       schema: {
         type: 'object',
@@ -1130,309 +971,17 @@ export function createFindTool(pool: FinderPool, nativeName?: 'glob', delegation
           note: { type: 'string' },
         },
       },
-      render: (args: unknown, value: FindRenderValue) =>
-        native
-          ? renderNativeGlobPage(value)
-          : findModeOf(args) === 'glob' ? renderGlobPage(value) : renderNamePage(args, value),
+      render: (args: unknown, value: FindRenderValue) => renderNamePage(args, value),
     },
     isConcurrencySafe: () => true,
-    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined, raw?: ForgeExec) {
-      if (native) return nativeGlob(args, exec, raw)
-      const explicit = typeof args.mode === 'string' && args.mode.trim() !== '' ? args.mode.trim() : undefined
-      if (explicit !== undefined && !(FIND_MODES as readonly string[]).includes(explicit)) {
-        return failure(`mode must be one of ${FIND_MODES.join(', ')} (or omitted for name) — got: ${args.mode}`)
-      }
+    async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const pattern = typeof args.pattern === 'string' ? args.pattern : ''
-      if (findModeOf(args) === 'name') {
-        if (pattern === '') return failure('pattern is required')
-        // `page` belongs to the glob mode: the name mode pages internally so an
-        // explicitly named file cannot be ranked off the first page.
-        if (args.page !== undefined) return failure('page applies to mode=glob only; mode=name pages internally')
-        return nameSearch(pool, args, pattern, exec)
-      }
-      const globPattern = pattern.trim()
-      if (globPattern === '') return failure('pattern is required')
-      return globSearch(pool, args, globPattern, exec)
+      if (pattern === '') return failure('pattern is required')
+      // `mode`/`page` are not in the schema; refused, not ignored, so a caller
+      // that learned them from an older surface is pointed at the built-in.
+      if (args.mode !== undefined) return failure('no mode: use the built-in glob for path patterns')
+      if (args.page !== undefined) return failure('no page: use the built-in glob for path patterns')
+      return nameSearch(pool, args, pattern, exec, globalSearch)
     },
   } as const
-}
-
-/** `mode=glob` — native SIMD glob file listing, npm-glob compatible. */
-async function globSearch(pool: FinderPool, args: Record<string, unknown>, rawPattern: string, exec: ForgeExec | undefined) {
-  // Built-in glob convenience semantic, kept so the model's habit transfers: a
-  // pattern without a separator matches the basename at any depth ("*.ts" ≙
-  // "**/*.ts"); include a separator to anchor depth.
-  const pattern = rawPattern.includes('/') ? rawPattern : `**/${rawPattern}`
-  const limit = clampInt(args.limit, GLOB_LIMIT_DEFAULT, 1, GLOB_LIMIT_MAX)
-  const page = clampInt(args.page, 0, 0, 10_000)
-  const scope = await resolveScope(pool, workdirOf(exec), typeof args.path === 'string' ? args.path : undefined)
-  if (isFailure(scope)) return scope
-  let result = scope.lease.finder.glob(pattern, { pageSize: limit, pageIndex: page })
-  if (!result.ok) return failure(`fff glob failed: ${result.error}`)
-  // A still-scanning finder answers "nothing" while it is still reading the
-  // tree. Wait once and ask again before reporting an empty page.
-  let note: string | undefined
-  if (result.value.items.length === 0) {
-    await waitForWarm(scope)
-    if (scope.lease.warming) result = scope.lease.finder.glob(pattern, { pageSize: limit, pageIndex: page })
-    if (!result.ok) return failure(`fff glob failed: ${result.error}`)
-    if (result.value.items.length === 0) note = absenceNote(scope, rawPattern)
-  }
-  const value = result.value
-  return {
-    items: value.items.map((item) => ({
-      path: displayPath(workdirOf(exec), scope.lease.basePath, item.relativePath),
-      size: item.size,
-      modified: new Date(item.modified * 1000).toISOString().replace('T', ' ').slice(0, 19),
-      git: item.gitStatus,
-    })),
-    totalMatched: value.totalMatched,
-    ...(scope.lease.warming ? { warming: true } : {}),
-    ...(note ? { note } : {}),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// /forge-status command
-// ---------------------------------------------------------------------------
-
-export interface ForgeStatusInvocation extends ForgeExec {
-  readonly rawInput: string
-}
-
-export interface ForgeStatusResult {
-  readonly kind: 'success' | 'error'
-  readonly text: string
-}
-
-/** /forge-status — engine health in zh-CN (desktop UI convention). */
-export function createStatusCommand(
-  pool: FinderPool,
-  registration?: { mode: string; takenOver: readonly string[]; delegate?: NativeDelegate },
-) {
-  return {
-    name: 'forge-status',
-    description: '查看 dsh-forge 检索引擎状态（索引根、文件数、frecency 库、git 集成）、施工台账与票据统计。',
-    input: { hint: '[rescan] [prune] [purge [confirm=yes]]' },
-    async handler(invocation: ForgeStatusInvocation): Promise<ForgeStatusResult> {
-      const args = invocation.rawInput.trim().split(/\s+/).filter(Boolean)
-      const wantRescan = args.includes('rescan')
-      const wantPrune = args.includes('prune')
-      const wantPurge = args.includes('purge')
-      const purgeConfirmed = args.includes('confirm=yes')
-      const live = pool.live()
-
-      // Ledger + ticket section — shown even before any finder has warmed.
-      const ledgerLines: string[] = []
-      if (wantPrune) {
-        const removed = pruneOrphanedStores()
-        ledgerLines.push(removed.length === 0
-          ? 'prune：没有可清理的孤儿快照库。'
-          : `prune：已清理 ${removed.length} 个孤儿快照库，释放 ${(removed.reduce((sum, r) => sum + r.bytes, 0) / 1024).toFixed(0)} KB。`)
-        let gcBlobs = 0, gcBytes = 0
-        for (const store of allStores()) {
-          if (statsFor(store).orphan) continue
-          for (const freed of gcStoreBlobs(store)) { gcBlobs++; gcBytes += freed.bytes }
-        }
-        ledgerLines.push(gcBlobs === 0
-          ? 'prune：没有可回收的无引用快照 blob。'
-          : `prune：已回收 ${gcBlobs} 个无引用 blob，释放 ${(gcBytes / 1024).toFixed(0)} KB。`)
-      }
-      if (wantPurge) {
-        const cwd = invocation.agent?.session?.header?.cwd
-        if (!cwd) {
-          return { kind: 'error', text: 'purge：缺少当前命令会话的工作区，拒绝清除。' }
-        } else {
-          const target = storeFor(canonicalWorkspace(cwd))
-          await withFileLock(target.dir, () => {
-            invocation.signal?.throwIfAborted()
-            if (!existsSync(target.ledgerFile)) {
-              ledgerLines.push('purge：当前工作区没有施工台账，无可清除内容。')
-            } else if (!purgeConfirmed) {
-              const s = statsFor(target)
-              ledgerLines.push(
-                `purge（预览）：将永久清除 ${s.root} 的施工历史——${s.batches} 个批次、${s.blobs} 个快照（${(s.blobBytes / 1024).toFixed(0)} KB）。` +
-                `工作区磁盘文件不受影响，且无法回退。确认请执行 /forge-status purge confirm=yes`,
-              )
-            } else {
-              try {
-                const purged = purgeStore(target)
-                ledgerLines.push(`purge：已永久清除 ${purged.batches} 个批次与全部快照（释放 ${(purged.bytes / 1024).toFixed(0)} KB）。工作区磁盘文件未改动。`)
-              } catch (cause) {
-                ledgerLines.push(`purge：拒绝执行 — ${cause instanceof Error ? cause.message : String(cause)}`)
-              }
-            }
-          })
-        }
-      }
-      const stores = allStores()
-      if (stores.length === 0) {
-        ledgerLines.push('施工台账：尚无任何工作区快照（ffedit 首次写入后建立）。')
-      } else {
-        for (const store of stores) {
-          const s = statsFor(store)
-          ledgerLines.push(
-            `施工台账 ${s.root}：批次 ${s.batches}，快照 ${s.blobs} 个（${(s.blobBytes / 1024).toFixed(0)} KB），在管文件 ${s.files}` +
-            (s.orphan ? '，⚠ 工作区已不存在（/forge-status prune 可清理）' : '') +
-            (hasPendingTransaction(store) ? '，⚠ 有写入中断的未完成事务（下次写操作将自动恢复；若被外部修改阻塞会显式报错）' : ''),
-          )
-        }
-      }
-      ledgerLines.push(`歧义票据：${countTickets()} 张存活（24h 过期）`)
-      // Trace capability + snapshot section. Passive on purpose: no scan, no
-      // sidecar spawn, no cargo, no network. Everything below is either a
-      // static table, process state, or a directory listing (M0.5).
-      {
-        const traceCwd = invocation.agent?.session?.header?.cwd
-        ledgerLines.push(...describeTraceStatus(traceCwd))
-      }
-      // Knowledge cards (sedimentation): read-only on purpose — this command
-      // runs on the status path, so a stale anchor is reported, never repaired
-      // here (no rebuild, no AST parse; ff_cards owns the repair).
-      {
-        const cardsCwd = invocation.agent?.session?.header?.cwd
-        const cards = cardsCwd !== undefined ? cardsStatusFor(canonicalWorkspace(cardsCwd)) : null
-        if (cards === null) {
-          ledgerLines.push('知识卡片：当前工作区尚无施工台账（ffedit 首次写入后出现）。')
-        } else {
-          const readEntries = Object.entries(cards.reads).filter(([, stat]) => stat.count > 0)
-            .sort((a, b) => b[1].count - a[1].count).slice(0, CARD_NAMES.length)
-          ledgerLines.push(
-            `知识卡片 ${cards.root}：` +
-            (cards.anchor === null
-              ? '未构建（ff_cards 首次调用时生成）'
-              : `锚 batches=${cards.anchor.batches} lastId=${cards.anchor.lastId}${cards.fresh ? '（新鲜）' : '（已过期，ff_cards 调用时自动重建）'}`) +
-            `，润色 ${cards.polished.length}/${CARD_NAMES.length}` +
-            (readEntries.length > 0
-              ? `，读取 ${readEntries.map(([name, stat]) => `${name} ${stat.count}次`).join('、')}`
-              : '，尚未被读取'),
-          )
-        }
-      }
-
-      // Which registration mode this process actually runs in. Without it the
-      // only way to answer "is takeover on?" is to re-read the profile config
-      // and reason about loader layering — and a patch that failed to apply
-      // looks exactly like one that was never written.
-      const modeLine = registration === undefined
-        ? undefined
-        : registration.mode === 'takeover'
-          ? `注册模式：takeover，已接管 ${registration.takenOver.join(', ') || '（无）'}`
-          : '注册模式：additive（ff* 与内置并存）'
-      // Whether the built-in handle actually resolves is not visible from any
-      // config: it depends on which layer the host registered its fs tools in.
-      // Without this line "the takeover silently stopped delegating" and "the
-      // takeover is fine" look identical. Both taken-over search tools report
-      // separately — they fall back on different triggers, and one resolving
-      // says nothing about the other.
-      const delegating = registration?.mode === 'takeover'
-        ? ['grep', 'glob'].filter((name) => registration.takenOver.includes(name))
-        : []
-      const delegationLine = registration === undefined || delegating.length === 0
-        ? undefined
-        : `内置委托：${delegating
-            .map((name) => `${name} ${registration.delegate?.available(name) === true ? '可用' : '不可用（只走索引）'}`)
-            .join('、')}`
-      const statusHead = [modeLine, delegationLine].filter((line): line is string => line !== undefined)
-
-      if (live.length === 0) {
-        return {
-          kind: 'success',
-          text: [
-            'dsh-forge：尚未创建任何索引。',
-            '引擎在首次调用 fffind / ffgrep 时按会话工作区懒启动，会话启动零开销。',
-            ...statusHead,
-            ...ledgerLines,
-            `数据目录：${dataDir()}（frecency 与查询史跨会话累积）`,
-          ].join('\n'),
-        }
-      }
-      const lines: string[] = []
-      lines.push(...statusHead)
-      if (wantRescan) {
-        for (const { finder, basePath, aux } of live) {
-          if (aux) continue
-          finder.scanFiles()
-          lines.push(`已触发重扫：${basePath}`)
-        }
-      }
-      for (const { finder, basePath, aux } of live) {
-        const health = finder.healthCheck()
-        if (!health.ok) {
-          lines.push(`${aux ? '[辅助]' : '[主]'} ${basePath}：healthCheck 失败（${health.error}）`)
-          continue
-        }
-        const h = health.value
-        const pick = h.filePicker
-        lines.push(
-          `${aux ? '[辅助]' : '[主]'} ${pick.basePath ?? basePath}` +
-          `：文件 ${pick.indexedFiles ?? '?'}，${pick.isScanning ? '扫描中' : '就绪'}` +
-          `，git ${h.git.available ? (h.git.repositoryFound ? '已接入' : '未发现仓库') : '不可用'}` +
-          `，frecency 库 ${h.frecency.initialized ? '已启用' : '未启用'}` +
-          `，查询史库 ${h.queryTracker.initialized ? '已启用' : '未启用'}` +
-          (isHomeDir(basePath) ? '（注意：正在索引用户主目录）' : ''),
-        )
-      }
-      lines.push(`引擎版本：fff ${live.length > 0 ? safeVersion(live[0].finder) : '?'}`)
-      lines.push(`数据目录：${dataDir()}`)
-      lines.push('')
-      lines.push(...ledgerLines)
-      return { kind: 'success', text: lines.join('\n') }
-    },
-  } as const
-}
-
-function safeVersion(finder: FileFinderApi): string {
-  const health = finder.healthCheck()
-  return health.ok ? health.value.version : 'unknown'
-}
-
-/**
- * Passive Trace section for `/forge-status` (M0.5).
- *
- * Every line here is either a compile-time table, process state, or a registry
- * count. Nothing spawns the sidecar, runs cargo, executes project code or
- * touches the network — the status path must stay usable precisely when the
- * engine is what is broken. A capability that is merely unproven reads as
- * `not_probed`/`unavailable`, never as "available by default".
- */
-function describeTraceStatus(workspace: string | undefined): string[] {
-  const lines: string[] = []
-  const indexer = peekIndexerStatus()
-  const dependencyLanguages = TRACE_CAPABILITY_MATRIX.filter(row => row.fileDependency !== false).map(row => row.language)
-  // Languages parsed but contributing no dependency edges are named, not just
-  // counted: "13 of 14" leaves the reader to guess which one has no edges.
-  const parseOnly = TRACE_CAPABILITY_MATRIX.filter(row => row.fileDependency === false).map(row => row.language)
-  lines.push(
-    `Trace 覆盖：${TRACE_CAPABILITY_MATRIX.length} 种语言，文件依赖 ${dependencyLanguages.length} 种（${dependencyLanguages.join('、')}）` +
-    `${parseOnly.length ? `；仅解析不计依赖：${parseOnly.join('、')}` : ''}` +
-    `；二进制证据 ${TRACE_BINARY_EVIDENCE.extensions.length} 类扩展名（仅元数据）`,
-  )
-  lines.push(
-    `Trace 原生解析：${indexer.state}${indexer.binary ? `（${indexer.binary}）` : ''} · ${indexer.detail}` +
-    `${indexer.version ? ` · 版本 ${indexer.version}` : ''}；未探测不等于可用`,
-  )
-  const snapshots = traceSnapshotStatus(workspace)
-  lines.push(
-    snapshots.snapshots === 0
-      ? 'Trace 快照：本次进程内尚无（fftrace 首次查询后建立；仅内存，不落盘）'
-      : `Trace 快照：${snapshots.snapshots} 个 · ${snapshots.configurations} 种配置 · 分页游标 ${snapshots.liveCursors} 个 · 最新 ${snapshots.newest}`,
-  )
-  // Stages the roadmap has not delivered yet say so explicitly. Leaving them
-  // out would make "no line" and "supported" indistinguishable.
-  lines.push('Trace 语义引用：unavailable（M2 计划，当前未实现；symbol: 只找定义，不是引用计数）')
-  lines.push('Trace 运行时证据：unavailable（不做动态加载、不执行工程代码）')
-  return lines
-}
-
-/** Tiny helper mirroring dsh-ssh's text() output wrapper. */
-function text(value: string): Array<{ type: 'text'; text: string }> {
-  return [{ type: 'text', text: value }]
-}
-
-function displayPath(workdir: string, root: string, relative: string): string {
-  const absolute = path.resolve(root, relative)
-  const local = path.relative(workdir, absolute)
-  return (local === '..' || local.startsWith(`..${path.sep}`) || path.isAbsolute(local)
-    ? absolute : local).split(path.sep).join('/')
 }

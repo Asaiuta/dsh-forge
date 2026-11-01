@@ -33,6 +33,7 @@ import type {
   Score,
   SearchResult,
 } from '@ff-labs/fff-node'
+import { readdirSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -162,13 +163,37 @@ export function workdirOf(exec: ForgeExec | undefined): string {
 // ---------------------------------------------------------------------------
 
 const MAIN_SCAN_WAIT_MS = 20_000
-const AUX_SCAN_WAIT_MS = 5_000
-// Raised from 4. A single session that scoped into `app`, `app/node_modules`,
-// `.../@deepseek-ai`, `.../dsh-compaction`, `.../dsh-compaction-basic` and
-// `tests` created six distinct aux roots, so roots were evicted and recreated
-// cold mid-run — each rebuild racing a 5 s budget on a 23k-file tree. That race
-// is what made the same call return 3816 matches once and 0 the next time.
-const AUX_POOL_MAX = 8
+/** Cap for the scan of a one-shot root outside the workspace. */
+const TEMP_SCAN_WAIT_MS = 8_000
+/**
+ * Entries a root may hold before a one-shot index is refused outright.
+ *
+ * A root outside the workspace is indexed only to answer one question, and the
+ * cost of that scales with size: measured here, 30,736 files scan in 302 ms
+ * (`D:\AI\云服务器`) while 208,904 scan in 21.3 s (`C:\Users`). Twenty-one
+ * seconds behind a tool call is indistinguishable from a hang, and the caller
+ * can always narrow `path` or use the machine index — so above this ceiling the
+ * index is not built and the call fails with that instruction instead.
+ */
+const TEMP_MAX_ENTRIES = 50_000
+/**
+ * How long a one-shot index survives after it is built.
+ *
+ * It cannot be torn down the moment the query returns: `ffgrep` pages with a
+ * cursor, and every page replays the same query against the same finder —
+ * rebuilding per page would make pagination quadratic. A short TTL covers the
+ * follow-up calls and then releases both the memory and the watch handles,
+ * which is the difference between "borrowed for a query" and "kept forever".
+ */
+const TEMP_TTL_MS = 30_000
+/**
+ * Budget for counting a root's entries before indexing it.
+ *
+ * Bounded by the ceiling itself: the count stops as soon as it proves the root
+ * is too big, so refusing `C:\Users` costs about one fifth of a second instead
+ * of the 21 s a scan would.
+ */
+const TEMP_PROBE_MS = 250
 
 /**
  * Ceiling for a background pre-warm to reach the *fully ready* state.
@@ -182,27 +207,99 @@ const AUX_POOL_MAX = 8
  */
 const PREWARM_READY_WAIT_MS = 120_000
 
+/** How long a self-heal rescan may take before the retry reads what exists. */
+const RESCAN_WAIT_MS = 3_000
+/**
+ * Minimum gap between two evidence-driven rebuilds of the same root.
+ *
+ * An empty page is the trigger, and empty pages are routine, so a rebuild that
+ * ran a moment ago cannot have been invalidated yet. Kept close to the engine's
+ * own watcher round trip (3.4–4.3 s measured here) rather than to a human sense
+ * of "recently": a longer window would swallow the write-then-search sequence
+ * this exists to rescue, which completes in well under a second.
+ */
+const RESCAN_THROTTLE_MS = 3_000
+
+/**
+ * Cheap pre-flight: can this root be indexed without a long scan?
+ *
+ * Counts entries breadth-first, no stat, and stops as soon as the answer is
+ * decided. Two ways to be refused: the count passes the ceiling, or the budget
+ * runs out before the count finished — an unfinished count is not a promise
+ * that the root is small, and the roots that fail to enumerate in a quarter of
+ * a second are exactly the 200k-entry ones this ceiling exists for.
+ *
+ * @returns `over` true when the root must not be indexed.
+ */
+function countEntries(root: string, limit: number, budgetMs: number): { count: number; over: boolean } {
+  const queue: string[] = [root]
+  const started = Date.now()
+  let count = 0
+  while (queue.length > 0) {
+    if (Date.now() - started > budgetMs) return { count, over: true }
+    const dir = queue.shift()
+    if (dir === undefined) break
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (++count > limit) return { count, over: true }
+      if (entry.isDirectory()) queue.push(path.join(dir, entry.name))
+    }
+  }
+  return { count, over: false }
+}
+
 export interface FinderLease {
   finder: FileFinderApi
-  /** Root the engine actually indexed (aux finders re-root at constraints). */
+  /** Root the engine actually indexed. */
   basePath: string
   /** True when still warming up — results may be partial. */
   warming: boolean
-  /** True for LRU aux finders (no frecency persistence). */
-  aux: boolean
+  /**
+   * True for a one-shot index of a root outside the workspace.
+   *
+   * Such a finder learns nothing worth keeping: no frecency rows, no query
+   * history, and an expiry. Only the workspace index is long-lived.
+   */
+  temporary: boolean
+  /**
+   * Epoch ms when this root last finished a scan (creation or rescan).
+   *
+   * The engine's watcher demonstrably loses events (see `rescan`), so "nothing
+   * matched" is only trustworthy relative to how current the scan is. A caller
+   * compares this against directory mtimes to decide whether to rebuild before
+   * claiming a file or a line is absent.
+   */
+  scannedAt: number
+  /** Release an explicitly retained temporary finder after the complete tool call. */
+  release?: () => void
 }
 
 export class FinderPool {
   readonly #main = new Map<string, FileFinderApi>()
-  readonly #aux = new Map<string, FileFinderApi>()
+  /**
+   * The single one-shot finder allowed at a time. There is no pool: a root
+   * outside the workspace is collateral for one question, and a pool of them is
+   * how eight entries used to sit in memory long after anyone asked about them.
+   */
+  #temp: { basePath: string; finder: FileFinderApi; timer: ReturnType<typeof setTimeout>; readers: number } | null = null
   readonly #initing = new Map<string, Promise<FinderLease | ToolFailure>>()
+  #tempIniting: { root: string; promise: Promise<FinderLease | ToolFailure> } | null = null
+  /** `scannedAt` per root — kept beside the finders so leases stay snapshots. */
+  readonly #scannedAt = new Map<string, number>()
+  /** `last rescan` epoch ms per root — the throttle for evidence-driven rebuilds. */
+  readonly #rescannedAt = new Map<string, number>()
   #destroyed = false
 
   /** Diagnostics for /forge-status: every live finder with its root. */
-  live(): Array<{ finder: FileFinderApi; basePath: string; aux: boolean }> {
-    const rows: Array<{ finder: FileFinderApi; basePath: string; aux: boolean }> = []
-    for (const [basePath, finder] of this.#main) rows.push({ finder, basePath, aux: false })
-    for (const [basePath, finder] of this.#aux) rows.push({ finder, basePath, aux: true })
+  live(): Array<{ finder: FileFinderApi; basePath: string; temporary: boolean }> {
+    const rows: Array<{ finder: FileFinderApi; basePath: string; temporary: boolean }> = []
+    for (const [basePath, finder] of this.#main) rows.push({ finder, basePath, temporary: false })
+    if (this.#temp !== null) rows.push({ finder: this.#temp.finder, basePath: this.#temp.basePath, temporary: true })
     return rows
   }
 
@@ -226,10 +323,10 @@ export class FinderPool {
     if (isFsRoot(resolved)) {
       return { error: `refusing to index the filesystem root ${resolved}; open a session in a project directory` }
     }
-    const existing = this.#main.get(resolved)
-    if (existing && !existing.isDestroyed) return this.#lease(existing, resolved, false)
     const inFlight = this.#initing.get(resolved)
     if (inFlight) return inFlight
+    const existing = this.#main.get(resolved)
+    if (existing && !existing.isDestroyed) return this.#lease(existing, resolved, false)
     const created = this.#create(resolved, true, MAIN_SCAN_WAIT_MS)
     this.#initing.set(resolved, created)
     try {
@@ -240,43 +337,155 @@ export class FinderPool {
   }
 
   /**
-   * Auxiliary finder for an explicit constraint root (subdirectory of the
-   * workspace, an out-of-root absolute directory, or a single file's parent).
-   * No frecency DBs: aux finders must not write learning data derived from a
-   * narrowed root. LRU-capped.
+   * One-shot finder for a root outside the workspace.
+   *
+   * Three limits, all of them earned by measurement:
+   *
+   * 1. **Size ceiling.** Indexing cost scales with the tree, and the tail is a
+   *    cliff: 30,736 files scan in 302 ms, 208,904 files in 21.3 s. Above
+   *    `TEMP_MAX_ENTRIES` no index is built — the call fails with an
+   *    instruction ("narrow path / use the machine index") instead of parking
+   *    behind a scan nobody asked to wait for. The refusal itself costs the
+   *    `TEMP_PROBE_MS` budget, not the scan.
+   * 2. **One at a time.** A second root replaces an idle finder; active queries
+   *    retain their lease and a competing root receives a retryable error.
+   * 3. **Expiry.** `TEMP_TTL_MS` after the last touch the finder is destroyed,
+   *    releasing its memory and its watch handles. The window exists because
+   *    `ffgrep` pages with a cursor against the same finder.
+   *
+   * No frecency or history DBs: learning data derived from a narrowed root
+   * would be noise for the workspace index.
    */
-  async aux(constraintRoot: string): Promise<FinderLease | ToolFailure> {
+  async temporary(constraintRoot: string, options: { retain?: boolean } = {}): Promise<FinderLease | ToolFailure> {
     if (this.#destroyed) return { error: 'dsh-forge finder pool was disposed' }
     const resolved = path.resolve(constraintRoot)
     if (isFsRoot(resolved)) return { error: `refusing to index the filesystem root ${resolved}` }
-    const existing = this.#aux.get(resolved)
-    if (existing && !existing.isDestroyed) {
-      // LRU touch
-      this.#aux.delete(resolved)
-      this.#aux.set(resolved, existing)
-      return this.#lease(existing, resolved, true)
+    if (this.#temp !== null && this.#temp.basePath === resolved && !this.#temp.finder.isDestroyed) {
+      this.#touchTemp()
+      return this.#retainTemporary(this.#lease(this.#temp.finder, resolved, true), options.retain)
     }
-    while (this.#aux.size >= AUX_POOL_MAX) {
-      const oldest = this.#aux.keys().next().value
-      if (oldest === undefined) break
-      const evicted = this.#aux.get(oldest)
-      this.#aux.delete(oldest)
-      try {
-        evicted?.destroy()
-      } catch {
-        // eviction is best-effort; a leaked native picker is disposed with the pool
+    if (this.#tempIniting !== null) {
+      if (this.#tempIniting.root !== resolved) return { error: 'another temporary index is initializing; retry after it finishes or narrow path= to the workspace' }
+      return this.#retainTemporary(await this.#tempIniting.promise, options.retain)
+    }
+    const pending = this.#createTemporary(resolved)
+    this.#tempIniting = { root: resolved, promise: pending }
+    try { return this.#retainTemporary(await pending, options.retain) } finally {
+      if (this.#tempIniting?.promise === pending) this.#tempIniting = null
+    }
+  }
+
+  async #createTemporary(resolved: string): Promise<FinderLease | ToolFailure> {
+    if (this.#temp && this.#temp.readers > 0) return { error: 'temporary index has active readers; retry after the current query finishes' }
+    const probe = countEntries(resolved, TEMP_MAX_ENTRIES, TEMP_PROBE_MS)
+    if (probe.over) {
+      return {
+        error: `refusing to index ${resolved}: more than ${TEMP_MAX_ENTRIES.toLocaleString('en-US')} entries`
+          + ` — narrow path= to a subdirectory, or use the machine index (fffind answers names outside the workspace without an index)`,
       }
     }
-    return await this.#create(resolved, false, AUX_SCAN_WAIT_MS, true)
+    this.#dropTemp()
+    const created = await this.#create(resolved, false, TEMP_SCAN_WAIT_MS)
+    if ('error' in created) return created
+    this.#temp = {
+      basePath: resolved,
+      finder: created.finder,
+      readers: 0,
+      timer: setTimeout(() => this.#expireTemp(), TEMP_TTL_MS),
+    }
+    // Never the reason the process stays alive.
+    ;(this.#temp.timer as { unref?: () => void }).unref?.()
+    return created
+  }
+
+  #retainTemporary(lease: FinderLease | ToolFailure, retain = false): FinderLease | ToolFailure {
+    if ('error' in lease || !retain) return lease
+    const entry = this.#temp
+    if (!entry || entry.finder !== lease.finder || entry.finder.isDestroyed) return { error: 'temporary index expired during initialization; retry' }
+    entry.readers++
+    let released = false
+    return { ...lease, release: () => {
+      if (released) return
+      released = true
+      entry.readers--
+      if (this.#temp === entry) this.#touchTemp()
+    } }
+  }
+
+  #expireTemp(): void {
+    if (this.#temp && this.#temp.readers > 0) this.#touchTemp()
+    else this.#dropTemp()
+  }
+
+  /** Restart the expiry clock so a paging cursor keeps its finder. */
+  #touchTemp(): void {
+    if (this.#temp === null) return
+    clearTimeout(this.#temp.timer)
+    this.#temp.timer = setTimeout(() => this.#expireTemp(), TEMP_TTL_MS)
+    ;(this.#temp.timer as { unref?: () => void }).unref?.()
+  }
+
+  #dropTemp(): void {
+    if (this.#temp === null) return
+    clearTimeout(this.#temp.timer)
+    this.#safeDestroy(this.#temp.finder)
+    this.#scannedAt.delete(this.#temp.basePath)
+    this.#rescannedAt.delete(this.#temp.basePath)
+    this.#temp = null
   }
 
   disposeAll(): void {
     this.#destroyed = true
     for (const finder of this.#main.values()) this.#safeDestroy(finder)
-    for (const finder of this.#aux.values()) this.#safeDestroy(finder)
+    this.#dropTemp()
     this.#main.clear()
-    this.#aux.clear()
     this.#initing.clear()
+    this.#scannedAt.clear()
+    this.#rescannedAt.clear()
+  }
+
+  /**
+   * Rebuild a root's index on evidence that it is behind, and say whether the
+   * caller should retry the query.
+   *
+   * The engine watches the tree, but the watch is not a guarantee: measured on
+   * this repo, a file created inside the workspace stayed invisible to
+   * `fileSearch` for the whole 2.5 s probe window (`isScanning()` false, four
+   * retries), while `scanFiles()` listed it 1.2 s later — reproduced with the
+   * engine defaults as well as with `disableMmapCache` /
+   * `disableContentIndexing`, so events are simply lost sometimes. A page that
+   * is silently one file behind reads exactly like "that file does not exist".
+   *
+   * Throttled per root: callers ask on every empty page, and an empty page is
+   * common, so a rebuild that just ran is not repeated until the tree has had
+   * time to change again.
+   *
+   * @returns true when a rebuild actually ran, i.e. a retry is worth it.
+   */
+  async rescan(lease: FinderLease, options: { waitMs?: number; throttleMs?: number } = {}): Promise<boolean> {
+    if (this.#destroyed) return false
+    const throttle = options.throttleMs ?? RESCAN_THROTTLE_MS
+    const previous = this.#rescannedAt.get(lease.basePath) ?? 0
+    if (Date.now() - previous < throttle) return false
+    try {
+      lease.finder.scanFiles()
+    } catch {
+      return false
+    }
+    this.#rescannedAt.set(lease.basePath, Date.now())
+    try {
+      await lease.finder.waitForScan(options.waitMs ?? RESCAN_WAIT_MS)
+    } catch {
+      // A wait cap, not a requirement — the retry reports what the engine has.
+    }
+    lease.warming = true
+    try { lease.warming = lease.finder.isScanning() } catch { /* unknown completion stays partial */ }
+    if (!lease.warming) {
+      const now = Date.now()
+      this.#scannedAt.set(lease.basePath, now)
+      lease.scannedAt = now
+    }
+    return true
   }
 
   /**
@@ -317,18 +526,32 @@ export class FinderPool {
     }
   }
 
-  #lease(finder: FileFinderApi, basePath: string, aux: boolean): FinderLease {
+  #lease(finder: FileFinderApi, basePath: string, temporary: boolean): FinderLease {
     let warming = false
     try {
       warming = finder.isScanning()
     } catch {
       warming = false
     }
-    return { finder, basePath, warming, aux }
+    return { finder, basePath, warming, temporary, scannedAt: this.#scannedAt.get(basePath) ?? 0 }
   }
 
-  async #create(basePath: string, persistent: boolean, waitMs: number, aux = false): Promise<FinderLease | ToolFailure> {
+  async #create(basePath: string, persistent: boolean, waitMs: number): Promise<FinderLease | ToolFailure> {
     let finder: FileFinderApi
+    // Engine defect (fff 0.11.0, measured 2026-10-31): when the **first**
+    // finder in a process runs with the mmap cache + content index enabled,
+    // every later finder never completes its scan — `scannedFilesCount` stays
+    // 0, `isScanning()` stays true, and all queries return empty forever. That
+    // silent empty is worse than an error: it reads as "no such file", and it
+    // is why `fffind path=<outside the workspace>` could look broken while the
+    // workspace index was live. Bisected: disabling either option fixes it,
+    // `disableWatch` does not. Measured on this repo (3.4k files): grep is
+    // 22 ms with both disabled vs 102–139 ms with them on, so the engine's
+    // "content index" is a cost here, not a win. `FORGE_CONTENT_INDEX=1`
+    // restores the old behaviour for single-root users who want it.
+    const engineOptions = process.env.FORGE_CONTENT_INDEX === '1'
+      ? {}
+      : { disableContentIndexing: true, disableMmapCache: true }
     try {
       const created = FileFinder.create({
         basePath,
@@ -336,6 +559,7 @@ export class FinderPool {
         enableFsRootScanning: false,
         enableHomeDirScanning: true,
         followSymlinks: true,
+        ...engineOptions,
         ...(persistent ? { frecencyDbPath: frecencyDbPath(), historyDbPath: historyDbPath() } : {}),
       })
       if (!created.ok) {
@@ -346,15 +570,25 @@ export class FinderPool {
       const message = cause instanceof Error ? cause.message : String(cause)
       return { error: `fff native library failed to load: ${message} — the built-in search tools remain available` }
     }
+    // Only the workspace index is registered here; a one-shot finder is held by
+    // `#temp` instead, which owns its expiry.
     if (persistent) this.#main.set(basePath, finder)
-    else this.#aux.set(basePath, finder)
     try {
       await finder.waitForScan(waitMs)
     } catch {
       // waitForScan is a wait cap, not a success requirement; partial results
       // are surfaced via the `warming` flag on the lease.
     }
-    return this.#lease(finder, basePath, aux)
+    if (this.#destroyed) {
+      this.#safeDestroy(finder)
+      return { error: 'dsh-forge finder pool was disposed during initialization' }
+    }
+    const lease = this.#lease(finder, basePath, !persistent)
+    if (!lease.warming) {
+      lease.scannedAt = Date.now()
+      this.#scannedAt.set(basePath, lease.scannedAt)
+    }
+    return lease
   }
 }
 
@@ -579,8 +813,6 @@ export interface GrepItem {
   text: string
   git: string
   frecency: number
-  /** Enclosing symbol (grep→symbol weld), present when requested + resolvable. */
-  in?: { name: string; startLine: number; endLine: number }
   context?: Array<{ line: number; text: string; before: boolean }>
 }
 
@@ -643,9 +875,26 @@ export function shapeFindItem(item: FileItem, score: Score | undefined): FindIte
 
 export function renderGrepItems(items: GrepItem[], header: string[]): string {
   const lines: string[] = [...header]
+  // Grouping is a byte trade, not a style choice: a path costs its own length on
+  // every row, while a heading costs one line per file. So a file with two or
+  // more hits drops its path from each row after the first, and a lone hit keeps
+  // the inline `path:line: text` form — there a heading would add a line instead
+  // of saving any. Same bytes on a one-hit page, ~30% fewer on a 250-row one.
+  const perFile = new Map<string, number>()
+  for (const item of items) perFile.set(item.file, (perFile.get(item.file) ?? 0) + 1)
+  let heading: string | undefined
   for (const item of items) {
-    const tag = item.in ? `  ⊙ ${item.in.name} L${item.in.startLine}-${item.in.endLine}` : ''
-    lines.push(`${item.file}:${item.line}: ${item.text}${tag}`)
+    const grouped = (perFile.get(item.file) ?? 0) > 1
+    if (!grouped) {
+      heading = undefined
+      lines.push(`${item.file}:${item.line}: ${item.text}`)
+    } else {
+      if (heading !== item.file) {
+        heading = item.file
+        lines.push(item.file)
+      }
+      lines.push(`  ${item.line}: ${item.text}`)
+    }
     for (const ctx of item.context ?? []) {
       lines.push(`  ${ctx.line} | ${ctx.text}`)
     }
@@ -671,31 +920,43 @@ export function renderFindItems(items: FindItem[], header: string[]): string {
  * its best fuzzy coincidences, and a caller that gets one line back has no way
  * to tell "found it" from "nothing here, here is my least-bad guess".
  *
- * Two conditions, both required, both measured rather than tuned:
+ * Three conditions, all measured rather than tuned:
  *
  * 1. **No literal occurrence.** No returned path contains the query (or, for a
  *    multi-term query, every term) as a case-insensitive substring. This is a
  *    fact about the result, not a threshold: a genuine prefix query such as
  *    `guidanc` → `src/guidance.ts` matches literally and stays silent.
  * 2. **A handful of hits at most.** A genuine typo query produces a *ranked
- *    list* — the ranking is the answer, and annotating it is noise. Measured on
- *    this corpus: `stroe` returned 50 candidates, while a query naming a
- *    non-file (`dsh-forge`) returned exactly 1 coincidence at score 70 —
- *    against 116 for a real prefix match and 219 for an exact one.
+ *    list* of dozens of candidates — the ranking is the answer. The window is
+ *    12 rather than 3 because a real session got exactly **6** weak hits for a
+ *    name that exists nowhere in that tree (`reverse-workbench` under a
+ *    Windows user folder): all 6 were scattered-subsequence coincidences at
+ *    score 80–96, and the old 3-item ceiling let them through unlabelled.
+ * 3. **Scores in coincidence territory.** Measured on this corpus: junk hits
+ *    parked at 80–96, while a literal name under the right root scores 220–296
+ *    and an exact filename 610. A floor of 150 separates them with margin, so
+ *    a short ranked list of *plausible* typos is still not annotated.
  *
  * @param query - the raw pattern the caller passed.
  * @param items - the shaped results, in engine rank order.
- * @param maxItems - most hits that can still count as "a couple of coincidences".
  * @returns true when the caller should be told the name surface has no answer.
  */
-export function weakNameMatch(query: string, items: FindItem[], maxItems = 3): boolean {
+export function weakNameMatch(
+  query: string,
+  items: FindItem[],
+  limits: { maxItems?: number; scoreFloor?: number } = {},
+): boolean {
+  const maxItems = limits.maxItems ?? 12
+  const scoreFloor = limits.scoreFloor ?? 150
   if (items.length === 0 || items.length > maxItems) return false
   const terms = query.toLowerCase().split(/\s+/).filter((term) => term !== '')
   if (terms.length === 0) return false
-  return items.every((item) => {
+  const literal = items.some((item) => {
     const path = item.path.toLowerCase()
-    return !terms.every((term) => path.includes(term))
+    return terms.every((term) => path.includes(term))
   })
+  if (literal) return false
+  return Math.max(...items.map((item) => item.score)) < scoreFloor
 }
 
 // ---------------------------------------------------------------------------

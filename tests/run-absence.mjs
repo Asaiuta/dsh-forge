@@ -7,7 +7,7 @@
  * tool calls returned "no files matched"; four were tool blindness, not
  * missing data.
  *
- *  1. `ffgrep`/`fffind` with `path` naming ONE FILE matched nothing when the
+ *  1. `ff_grep`/`ff_find` with `path` naming ONE FILE matched nothing when the
  *     path used forward slashes — the resolved path was compared against the
  *     caller's un-normalized string. Measured 8/8 deterministic.
  *  2. An empty page discarded the `warming` flag, so a finder that had not
@@ -26,7 +26,6 @@ import { FinderPool } from '../lib/core.js'
 import { createGrepTool, createFindTool } from '../lib/tools.js'
 import { explainAbsence, literalNeedle, walkForName } from '../lib/absence.js'
 import { buildFixture, FIXTURE_DIR } from './make-fixture.mjs'
-import { globMode } from './lib/find-modes.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PROBE_DIR = path.join(HERE, '.absence-probe')
@@ -55,7 +54,6 @@ const truth = buildFixture()
 const pool = new FinderPool()
 const fixtureExec = { agent: { session: { header: { cwd: FIXTURE_DIR } } } }
 const find = createFindTool(pool)
-const glob = globMode(find) // the former ffglob is now fffind's mode=glob
 const grep = createGrepTool(pool)
 
 async function main() {
@@ -79,50 +77,56 @@ async function main() {
   assert.deepEqual(walkForName(PROBE_DIR, 'nothing-here-at-all').hits, [])
   ok('walkForName finds names the index cannot hold, skipping nothing')
 
-  // --- explainAbsence: the two visibility limits have different wording -----
+  // --- explainAbsence: one actionable clause, not a debug dump -------------
+  // `*widget*` matches only the nested directory, so the two visibility limits
+  // are decided by `canList` alone (no dependence on walk order).
   const nestedHidden = explainAbsence({
     scopeRoot: PROBE_DIR,
-    query: '*compactor*',
+    query: '*widget*',
     canList: () => false,
   })
-  assert.ok(nestedHidden !== undefined && nestedHidden.includes('not indexed at this scope'), nestedHidden)
-  assert.ok(nestedHidden.includes('"vendor" is not indexed at this scope — point path inside it'), nestedHidden)
-  assert.ok(nestedHidden.includes('plain-compactor'), nestedHidden)
+  assert.ok(nestedHidden !== undefined && nestedHidden.includes('not visible at this scope'), nestedHidden)
+  assert.ok(nestedHidden.includes('search inside it with path="vendor/@scope/widget-compactor"'), nestedHidden)
+  assert.equal(nestedHidden.match(/\[/g).length, 1, 'exactly one bracket: the note is a single clause')
   assert.ok(nestedHidden.length <= 360, `note must stay short, got ${nestedHidden.length}`)
 
   const nestedVisible = explainAbsence({
     scopeRoot: PROBE_DIR,
-    query: '*compactor*',
+    query: '*widget*',
     canList: () => true,
   })
-  assert.ok(nestedVisible !== undefined && nestedVisible.includes('these tools list files only'), nestedVisible)
-  assert.ok(!nestedVisible.includes('point path inside it'), 'no exclusion may be claimed when the engine can list it')
+  assert.ok(nestedVisible !== undefined && nestedVisible.includes('ffind lists files only'), nestedVisible)
+  assert.ok(!nestedVisible.includes('not visible'), 'no exclusion may be claimed when the engine can list it')
+
+  const bothHits = explainAbsence({ scopeRoot: PROBE_DIR, query: '*compactor*', canList: () => true })
+  assert.ok(bothHits !== undefined && bothHits.includes('more'), `two directory hits must collapse into one clause + count: ${bothHits}`)
+  assert.equal(bothHits.match(/\[/g).length, 1, 'still one clause with two hits')
 
   assert.equal(explainAbsence({ scopeRoot: PROBE_DIR, query: '*absent*', canList: () => false }), undefined, 'silent when the disk agrees')
   assert.equal(explainAbsence({ scopeRoot: PROBE_DIR, query: '**/*', canList: () => false }), undefined, 'silent for a bare wildcard')
-  ok('explainAbsence names the directory, states the exclusion, and stays silent when there is nothing to say')
+  ok('explainAbsence states one actionable reason, never a list of examples')
 
-  // --- render: warming survives an empty page ------------------------------
+  // --- render: a scanning page makes no claim ------------------------------
   for (const [tool, args, empty] of [
-    [glob, { pattern: '*.ts' }, 'no files matched'],
     [find, { pattern: 'store' }, 'no files matched'],
     [grep, { pattern: 'zzz' }, 'no matches'],
   ]) {
     const warm = renderOf(tool, args, { items: [], totalMatched: 0, warming: true })
-    assert.ok(warm.includes('still warming'), `${tool.name}: warming flag must survive an empty page`)
-    assert.ok(warm.includes(empty), `${tool.name}: the empty marker must still be present`)
-    assert.ok(warm.indexOf('still warming') < warm.indexOf(empty), `${tool.name}: header must precede the empty marker`)
+    assert.ok(warm.includes('still scanning'), `${tool.name}: warming flag must survive an empty page`)
+    assert.ok(!warm.includes(empty), `${tool.name}: a page that is not an answer must not also say "${empty}"`)
+    const done = renderOf(tool, args, { items: [], totalMatched: 0 })
+    assert.ok(done.includes(empty), `${tool.name}: a finished empty page still reports "${empty}"`)
     const noted = renderOf(tool, args, { items: [], totalMatched: 0, note: 'DISK HINT' })
     assert.ok(noted.includes('[DISK HINT]'), `${tool.name}: an absence note must reach the caller`)
   }
-  ok('an empty page keeps the warming flag and the absence note, header first')
+  ok('an empty page either reports a result or reports that it has none yet')
 
   // --- regression: EOFB — path naming one file, both separator spellings ---
   const target = path.join(FIXTURE_DIR, 'src', 'store.js')
   const forward = target.split(path.sep).join('/')
   for (const [tool, args, label] of [
-    [grep, { pattern: 'putBlob' }, 'ffgrep'],
-    [find, { pattern: 'store.js' }, 'fffind'],
+    [grep, { pattern: 'putBlob' }, 'ff_grep'],
+    [find, { pattern: 'store.js' }, 'ff_find'],
   ]) {
     const asForward = await tool.execute({ ...args, path: forward }, fixtureExec)
     const asNative = await tool.execute({ ...args, path: target }, fixtureExec)
@@ -132,16 +136,17 @@ async function main() {
   }
   ok('a path naming one file matches under both forward and native separators')
 
-  // --- regression: the glob surface states what it cannot see --------------
-  // (asserted on the merged tool, since ffglob now lives inside fffind)
-  assert.ok(/FILES/.test(glob.description), 'fffind must say it lists files')
-  assert.ok(/never returned|Directories are never returned/.test(glob.description), 'fffind must warn that directories are invisible')
-  assert.ok(!/npm-glob semantics/.test(glob.description), 'the "npm-glob semantics" claim was over-broad: npm glob returns directories')
-  assert.ok(/Case-sensitive/.test(glob.parameters.pattern.description), 'the pattern param must state case sensitivity')
-  ok('fffind (mode=glob) advertises its two visibility limits instead of over-promising')
+  // --- regression: the find surface states what it cannot see --------------
+  // Path patterns moved to the built-in glob; what ff_find must still admit is
+  // that a fuzzy name can answer with a directory (a skill folder has no file
+  // carrying its own name), and that globs are not its question.
+  assert.ok(/directory too/.test(find.description), 'ff_find must say a fuzzy name can return a directory')
+  assert.ok(/built-in glob/.test(find.description), 'ff_find must point path patterns at the built-in glob')
+  assert.ok(/built-in glob/.test(find.parameters.pattern.description), 'the pattern param must name the tool that answers path patterns')
+  ok('ff_find advertises its visibility limits instead of over-promising')
 
   // --- non-regression: real hits are untouched ----------------------------
-  const hits = await glob.execute({ path: FIXTURE_DIR, pattern: '**/*.js' }, fixtureExec)
+  const hits = await find.execute({ path: FIXTURE_DIR, pattern: 'store.js' }, fixtureExec)
   assert.ok(hits.items.length > 0 && hits.note === undefined, 'a non-empty page must carry no absence note')
   ok('a non-empty page is unaffected')
 

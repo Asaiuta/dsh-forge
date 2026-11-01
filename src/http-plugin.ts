@@ -10,9 +10,8 @@
  *
  * ## Why `configEditor.edit()` and not `dsh-settings`
  *
- * The page has to change `registration`/`takeover`, and those decide which tools
- * exist at all: `apply()` calls `planRegistration` once and registers from the
- * result. `dsh-settings`' volatile form commits a change into the *running* fiber
+ * The page changes `surface`, which decides which tools register. `dsh-settings`'
+ * volatile form commits a change into the *running* fiber
  * instead of remounting it, so the names would change on the page and not in the
  * registry. `configEditor.edit()` takes the other path on purpose — it validates
  * the candidate config, writes it to the current profile's patch, and hands it to
@@ -21,15 +20,16 @@
  *
  * ## What it does not do
  *
- * It writes only the row's `config` node. `cards` — including an endpoint
- * credential — is copied through untouched by `nextConfig`, and resetting a value
- * to what the row already inherits lets `edit()` drop the override entirely
- * instead of pinning it.
+ * It writes only the row's `config` node. A key this page does not own is copied
+ * through untouched by `nextConfig`, and resetting a value to what the row
+ * already inherits lets `edit()` drop the override entirely instead of pinning
+ * it.
  *
  * @module dsh-forge/http-plugin
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   CONFIG_PATH,
@@ -38,6 +38,10 @@ import {
   nextConfig,
   readSettings,
 } from './config-api.ts'
+import { ledgerBatchDetail, ledgerList, LedgerApiError } from './ledger-api.ts'
+import { createLedgerRollbackService, type LedgerRollbackOptions } from './ledger-rollback.ts'
+import { createExecutionGuard, type ForgeFileSystem, type ForgePolicyService } from './execution.ts'
+import { getProject, listProjects, projectAction, projectOverview } from './projects.ts'
 
 export const name = 'dsh-forge-http'
 
@@ -50,6 +54,16 @@ export const inject = ['webServer', 'configEditor'] as const
 
 /** Upper bound on a save body. The real one is a few hundred bytes. */
 const MAX_BODY_BYTES = 64 * 1024
+
+/**
+ * Route served for the sidebar ledger tab.
+ *
+ * Separate from {@link CONFIG_PATH} because the two pages have different
+ * lifetimes: the ledger is read on every tab mount and after every write, while
+ * the settings page is read once. Both live on this row because both need the
+ * host's web server, and that is the row's only reason to exist.
+ */
+const LEDGER_PATH = '/forge-ledger'
 
 /** The route surface this plugin registers into. */
 export interface WebServerService {
@@ -77,6 +91,7 @@ export interface ConfigEditorService {
 interface HttpHostContext {
   webServer: WebServerService
   configEditor: ConfigEditorService
+  get?(name: string): unknown
   effect(setup: () => Generator<unknown>, label?: string): unknown
   logger?: { warn(message: string): void }
 }
@@ -95,12 +110,38 @@ function send(response: ServerResponse, status: number, payload: unknown): void 
   response.end(body)
 }
 
+function optionalHostService<T>(host: HttpHostContext, name: string): T | undefined {
+  try { return host.get?.(name) as T | undefined } catch { return undefined }
+}
+
+/** Reject cross-site form/fetch requests and DNS-rebinding Host values. */
+export function assertMutationRequest(request: IncomingMessage): void {
+  const host = request.headers?.host
+  const origin = request.headers?.origin
+  if (typeof host !== 'string' || typeof origin !== 'string') throw new LedgerApiError('同源 Origin 与 Host 是必需的')
+  let target: URL
+  let source: URL
+  try { target = new URL(`http://${host}`); source = new URL(origin) }
+  catch { throw new LedgerApiError('Origin 或 Host 无效') }
+  const address = request.socket?.localAddress?.replace(/^::ffff:/, '')
+  const allowed = new Set(['localhost', '127.0.0.1', '[::1]', ...(address ? [address, `[${address}]`] : [])])
+  if (!allowed.has(target.hostname) || target.username || target.password || target.pathname !== '/' || target.search || target.hash
+    || source.host !== target.host || !['http:', 'https:'].includes(source.protocol) || source.origin !== origin) throw new LedgerApiError('拒绝非同源请求或不受信任 Host')
+  const encrypted = Boolean((request.socket as { encrypted?: boolean } | undefined)?.encrypted)
+  if (source.protocol !== (encrypted ? 'https:' : 'http:')) throw new LedgerApiError('Origin 协议不匹配')
+  const localPort = request.socket?.localPort
+  if (localPort !== undefined && Number(target.port || (encrypted ? 443 : 80)) !== localPort) throw new LedgerApiError('Host 端口不匹配')
+  const media = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase()
+  if (media !== 'application/json') throw new LedgerApiError('Content-Type 必须为 application/json')
+}
+
+
 /** Read and parse one JSON request body, refusing anything oversized. */
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of request) {
-    const buffer = chunk as Buffer
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     size += buffer.length
     if (size > MAX_BODY_BYTES) throw new ConfigEditError('请求体过大')
     chunks.push(buffer)
@@ -135,8 +176,8 @@ function findEntry(editor: ConfigEditorService): ProfileEntryLike {
  * The editor is looked up per request rather than captured: services can be
  * replaced under a running plugin (an HMR reload of the settings stack, a fiber
  * that re-provides `configEditor`), and a captured handle would keep writing
- * through the old one. Same rule `./delegate.ts` follows for tool lookups — one
- * registry read per call is cheap, a stale handle is a bug.
+ * through the old one. One registry read per call is cheap; a stale handle is
+ * a bug.
  *
  * @param editor - reads the host's config editor from the live context.
  * @returns the request handler.
@@ -178,6 +219,95 @@ export function createConfigHandler(editor: () => ConfigEditorService | undefine
 }
 
 /**
+ * GET lists batches with keyword/pathContains/actor/kind filters and an opaque
+ * nextCursor, or opens one batch via ?batch=<positive id>. Cursors pin the
+ * workspace, filters, page size and ledger prefix while allowing new appends.
+ * POST accepts preview/confirm actions. Only the live host fs/sandboxPolicy
+ * guard can authorize writes; a preview never grants recovery permission.
+ * Workspaces must be absolute. POST requires same-origin JSON, a nonempty
+ * reason, and confirmation of a short-lived, single-use preview token.
+ *
+ * @returns the request handler.
+ */
+export function createLedgerHandler(options: LedgerRollbackOptions = {}) {
+  const rollback = createLedgerRollbackService(options)
+  return async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      send(response, 405, { ok: false, error: '只支持 GET 与 POST' })
+      return
+    }
+    try {
+      if (request.method === 'POST') {
+        assertMutationRequest(request)
+        const body = await readJson(request)
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new LedgerApiError('请求体必须是 JSON 对象')
+        send(response, 200, { ok: true, ...await rollback(body as Record<string, unknown>) })
+        return
+      }
+      const url = new URL(request.url ?? '/', 'http://localhost')
+      const workspace = url.searchParams.get('workspace') ?? ''
+      if (!path.isAbsolute(workspace)) {
+        send(response, 400, { ok: false, error: 'workspace 必须是绝对路径' })
+        return
+      }
+      const rawBatch = url.searchParams.get('batch')
+      if (rawBatch !== null) {
+        const id = Number(rawBatch)
+        if (!Number.isSafeInteger(id) || id < 1) {
+          send(response, 400, { ok: false, error: 'batch 必须是正整数' })
+          return
+        }
+        const detail = ledgerBatchDetail(workspace, id)
+        if (detail === undefined) {
+          send(response, 404, { ok: false, error: `没有批次 #${id}` })
+          return
+        }
+        send(response, 200, { ok: true, ...detail })
+        return
+      }
+      const rawLimit = Number(url.searchParams.get('limit') ?? '50')
+      if (!Number.isSafeInteger(rawLimit) || rawLimit < 1 || rawLimit > 200) throw new LedgerApiError('limit 必须是 1–200 的整数')
+      const filters = Object.fromEntries(['keyword', 'pathContains', 'actor', 'kind', 'cursor'].flatMap(key => url.searchParams.has(key) ? [[key, url.searchParams.get(key)!]] : []))
+      send(response, 200, { ok: true, ...ledgerList(workspace, { limit: rawLimit, ...filters }) })
+    } catch (error) {
+      send(response, error instanceof LedgerApiError ? error.status : error instanceof ConfigEditError ? 400 : 503, { ok: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+}
+
+
+/** Projects live only in forge's private store; actions retain the shared service validation. */
+export function createProjectsHandler() {
+  return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    try {
+      if (request.method === 'GET') {
+        const url = new URL(request.url ?? '/', 'http://localhost')
+        const workspace = url.searchParams.get('workspace') ?? undefined
+        if (workspace !== undefined && !path.isAbsolute(workspace)) throw new LedgerApiError('workspace 必须是绝对路径')
+        const projectId = url.searchParams.get('projectId')
+        if (projectId !== null) {
+          if (!workspace) throw new LedgerApiError('workspace 是必需的')
+          send(response, 200, { ok: true, project: getProject(workspace, projectId), overview: projectOverview(workspace, projectId) })
+        } else {
+          send(response, 200, { ok: true, projects: listProjects({ workspace, query: url.searchParams.get('query') ?? undefined }) })
+        }
+        return
+      }
+      if (request.method !== 'POST') { send(response, 405, { ok: false, error: '只支持 GET 与 POST' }); return }
+      assertMutationRequest(request)
+      const body = await readJson(request)
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new LedgerApiError('请求体必须是 JSON 对象')
+      const result = await projectAction(body)
+      const action = (body as Record<string, unknown>).action
+      send(response, 200, { ok: true, ...(action === 'list' ? { projects: result } : action === 'overview' ? { overview: result } : { project: result }) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      send(response, error instanceof LedgerApiError ? error.status : /revision conflict/i.test(message) ? 409 : 400, { ok: false, error: message })
+    }
+  }
+}
+
+/**
  * Mount the route for as long as this row is active.
  *
  * @param ctx - the browser-serving host context.
@@ -190,5 +320,16 @@ export function apply(ctx: Context): void {
       path: CONFIG_PATH,
       handler: createConfigHandler(() => host.configEditor),
     })
-  }, 'dsh-forge: config routes')
+    yield host.webServer.register({
+      kind: 'exact',
+      path: LEDGER_PATH,
+      handler: createLedgerHandler({ guard: async (exec, args, tool) => {
+        const provider = optionalHostService<ForgeFileSystem>(host, 'fs')
+        if (!provider) throw new LedgerApiError('宿主没有提供 DSH 文件系统', 503)
+        const policy = optionalHostService<ForgePolicyService>(host, 'sandboxPolicy')
+        return createExecutionGuard(provider, {}, policy)(exec, args, tool)
+      } }),
+    })
+    yield host.webServer.register({ kind: 'exact', path: '/forge-projects', handler: createProjectsHandler() })
+  }, 'dsh-forge: config and ledger routes')
 }

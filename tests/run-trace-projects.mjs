@@ -334,10 +334,10 @@ try {
 
   const definitions = [], disposers = []
   for (const dispose of apply({ fs: { resolve: async file => ({ targetKey: file, displayPath: file }), processPath: target => target.targetKey, processPathFromHostPath: file => file },
-    tools: { register: definition => { definitions.push(definition) } }, commands: { register() {} } }, { prewarm: false })) if (typeof dispose === 'function') disposers.push(dispose)
+    tools: { register: definition => { definitions.push(definition) } }, commands: { register() {} } }, { surface: 'full' })) if (typeof dispose === 'function') disposers.push(dispose)
   try {
     assert.equal(definitions.length, 10)
-    const definition = definitions.find(tool => tool.name === 'fftrace'), runtime = Object.create(ToolRuntime.prototype)
+    const definition = definitions.find(tool => tool.name === 'ff_trace'), runtime = Object.create(ToolRuntime.prototype)
     runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
     for (const args of [{ target: 'file:diagnostics.js' }, { target: 'path:app/src/main.ts -> alternate/lib/core.ts', edgeMode: 'certain' }]) {
       const context = { ...exec, arguments: args, token: {} }, value = await definition.execute(args, context)
@@ -345,7 +345,7 @@ try {
       assert.ok(runtime.createSuccessResult(context, definition, value).content.some(item => item.type === 'text' && item.text.includes('Trace')))
     }
   } finally { for (const dispose of disposers.reverse()) await dispose() }
-  ok('the installed SDK accepts new nested evidence/diagnostics and still registers exactly nine tools')
+  ok('the installed SDK accepts nested evidence/diagnostics and registers exactly ten tools')
 } finally {
   await pool.dispose()
   if (previousWorkers === undefined) delete process.env.DSH_FORGE_AST_WORKERS; else process.env.DSH_FORGE_AST_WORKERS = previousWorkers

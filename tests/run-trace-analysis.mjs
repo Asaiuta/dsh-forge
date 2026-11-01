@@ -321,8 +321,8 @@ try {
   for (const dispose of apply({
     fs: { resolve: async file => ({ targetKey: file, displayPath: file }), processPath: target => target.targetKey, processPathFromHostPath: file => file },
     tools: { register: definition => { definitions.push(definition) } }, commands: { register() {} },
-  }, { prewarm: false })) if (typeof dispose === 'function') disposers.push(dispose)
-  const definition = definitions.find(tool => tool.name === 'fftrace')
+  }, { surface: 'full' })) if (typeof dispose === 'function') disposers.push(dispose)
+  const definition = definitions.find(tool => tool.name === 'ff_trace')
   const runtime = Object.create(ToolRuntime.prototype)
   runtime.canonicalResults = new WeakMap()
   runtime.concludingExecutions = new WeakSet()

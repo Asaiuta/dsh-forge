@@ -3,7 +3,7 @@
  *
  * ## What this page is, and what it is not
  *
- * It edits `registration`, `takeover` and `prewarm` — the fields whose change
+ * It edits `surface` — the field whose change
  * alters which tools exist. It deliberately does **not** edit `cards`: that block
  * carries an endpoint URL and a credential, it changes behaviour nobody touches
  * twice, and keeping it in the profile patch is the honest home for a secret.
@@ -11,10 +11,10 @@
  * ## Why the page owns its own form
  *
  * Every control here is a shape the shared form model cannot express — a two-value
- * enum, a set of native tool names, and a boolean. `SettingsFormModel` takes
+ * enum. `SettingsFormModel` takes
  * `{ format, parse }` specs over a *string*, so a form built on it would ask the
- * user to type `takeover` and `true`. The page therefore draws the host's own
- * `SegmentedControl` / `Checkbox` / `Switch` and stages the three values itself,
+ * user to type the value. The page therefore draws the host's own
+ * `SegmentedControl` and stages the value itself,
  * and the host side (`src/http-plugin.ts`) persists them through
  * `configEditor.edit()`, which remounts the plugin row so the new tool surface
  * really is the registered one.
@@ -37,9 +37,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
-import { Button, Checkbox, SegmentedControl, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, SegmentedControl } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS, en, zh, type ForgeKey } from './locales.ts'
 import { mountStyles } from './styles.ts'
+import { LedgerTab, type LedgerTabProps } from './ledger-tab.tsx'
 
 /** Required services: the slot registry and the dictionary the labels live in. */
 export const inject = ['slots', 'locale']
@@ -62,22 +63,33 @@ const SECTION_ID = 'dsh-forge'
 /** Nav position after dsh-market (40), dsh-custom-header (50) and dsh-blackhole (55). */
 const SECTION_ORDER = 60
 
-/** Native names the takeover control offers, in display order. */
-const CAPABILITY = ['read', 'glob', 'grep'] as const
+/** `betterSidebar.registerTab` id; also the tab type the sidebar keys tabs by. */
+const LEDGER_TAB_ID = 'forge:ledger'
 
 /** Route served by `src/http-plugin.ts`. */
 const CONFIG_PATH = '/forge-config'
 
-type Mode = 'additive' | 'takeover'
-
-/** The three values, as both ends of the wire agree on them. */
-interface Settings {
-  registration: Mode
-  takeover: string[]
-  prewarm: boolean
-}
+interface Settings { surface: 'retrieval' | 'full' }
 
 type Translate = (key: ForgeKey) => string
+
+/**
+ * The slice of `dsh-better-sidebar`'s client service this plugin registers into.
+ *
+ * Restated structurally rather than imported: better-sidebar is an optional
+ * neighbour, and importing its types would make this bundle unloadable — not
+ * just unreachable — on every profile that does not have it installed.
+ */
+interface BetterSidebarService {
+  registerTab(descriptor: {
+    id: string
+    title: () => string
+    description: () => string
+    order: number
+    single: boolean
+    component: (props: LedgerTabProps) => unknown
+  }): () => void
+}
 
 /**
  * Resolve a route against the page's own base.
@@ -115,15 +127,8 @@ async function request(init?: RequestInit): Promise<Settings> {
 /** Compare only what this page writes; a reordered array is not an edit. */
 function signature(settings: Settings): string {
   return JSON.stringify({
-    registration: settings.registration,
-    takeover: [...settings.takeover].sort(),
-    prewarm: settings.prewarm,
+    surface: settings.surface,
   })
-}
-
-/** Keep the persisted order stable whatever order the boxes were ticked in. */
-function ordered(names: string[]): string[] {
-  return CAPABILITY.filter((name) => names.includes(name))
 }
 
 /**
@@ -177,9 +182,7 @@ function ForgeSettingsPage(props: { view?: string; t: Translate; close?: () => v
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          registration: draft.registration,
-          takeover: ordered(draft.takeover),
-          prewarm: draft.prewarm,
+          surface: draft.surface,
         }),
       })
       setSaved(state)
@@ -209,52 +212,22 @@ function ForgeSettingsPage(props: { view?: string; t: Translate; close?: () => v
     )
   }
 
-  const takingOver = draft.registration === 'takeover'
-
   return (
     <div className="dfg-root">
       {head}
       <section className="dfg-card">
         <div className="dfg-field">
-          <span className="dfg-label">{t('registration')}</span>
+          <span className="dfg-label">{t('surface')}</span>
           <SegmentedControl
-            id="dfg-registration"
-            label={t('registration')}
-            value={draft.registration}
+            id="dfg-surface"
+            label={t('surface')}
+            value={draft.surface}
             options={[
-              { value: 'additive', label: t('modeAdditive') },
-              { value: 'takeover', label: t('modeTakeover') },
+              { value: 'retrieval', label: t('surfaceRetrieval') },
+              { value: 'full', label: t('surfaceFull') },
             ]}
             disabled={busy}
-            onChange={(next: string) => { patch({ registration: next as Mode }) }}
-          />
-        </div>
-
-        <div className="dfg-field">
-          <span className="dfg-label">{t('scope')}</span>
-          <div className="dfg-checks">
-            {CAPABILITY.map((name) => (
-              <Checkbox
-                key={name}
-                label={name}
-                checked={draft.takeover.includes(name)}
-                disabled={busy || !takingOver}
-                onChange={(next: boolean) => {
-                  const rest = draft.takeover.filter((entry) => entry !== name)
-                  patch({ takeover: next ? [...rest, name] : rest })
-                }}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div className="dfg-field">
-          <span className="dfg-label">{t('prewarm')}</span>
-          <Switch
-            checked={draft.prewarm}
-            label={t('prewarm')}
-            disabled={busy}
-            onChange={(next: boolean) => { patch({ prewarm: next }) }}
+            onChange={(next: string) => { patch({ surface: next as Settings['surface'] }) }}
           />
         </div>
 
@@ -308,4 +281,23 @@ export function apply(ctx: Context): void {
     locale: NS,
     inject: () => ({}),
   }, ForgeSettingsPage)), 'dsh-forge: row configuration page')
+
+  // The ledger tab belongs to better-sidebar, not to this plugin's own seat:
+  // it appears only where that plugin is mounted, and a profile without it
+  // loses nothing but the tab. `inject` waits for the service instead of
+  // declaring it required, which would keep the settings page from mounting on
+  // every profile that does not run a sidebar.
+  ctx.inject(['betterSidebar'], (scoped) => {
+    const sidebar = (scoped as unknown as { betterSidebar?: BetterSidebarService }).betterSidebar
+    if (sidebar === undefined) return
+    scoped.effect(() => sidebar.registerTab({
+      id: LEDGER_TAB_ID,
+      title: () => t('ledgerTitle'),
+      description: () => t('ledgerSummary'),
+      // After the builtin explorer/editor/changes rows (100 is the default).
+      order: 70,
+      single: true,
+      component: (props: LedgerTabProps) => <LedgerTab {...props} />,
+    }), 'dsh-forge: ledger tab')
+  })
 }

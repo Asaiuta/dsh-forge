@@ -22,32 +22,30 @@ const zh = {
   // `dsh-blackhole` does — a slot label that differs from the heading it opens
   // reads as two different pages). `summary` is the row's one-liner, not a name.
   title: 'DSH-Forge',
-  summary: '工具接管与索引预热',
-  registration: '接管方式',
-  modeAdditive: '并存',
-  modeTakeover: '接管',
-  scope: '接管范围',
-  prewarm: '启动预热',
+  summary: '检索工具与内置工具增强',
+  surface: '工具面',
+  surfaceRetrieval: '检索',
+  surfaceFull: '完整',
   save: '保存',
   discard: '放弃',
   saved: '已保存',
   loading: '读取中…',
-  empty: '无',
+  ledgerTitle: '台账',
+  ledgerSummary: '施工批次、快照 diff 与检查记录',
 }
 
 const en = {
   title: 'DSH-Forge',
-  summary: 'Tool takeover and index prewarm',
-  registration: 'Takeover',
-  modeAdditive: 'Side by side',
-  modeTakeover: 'Replace',
-  scope: 'Replace which tools',
-  prewarm: 'Prewarm on start',
+  summary: 'Retrieval tools and built-in augmentation',
+  surface: 'Tool surface',
+  surfaceRetrieval: 'Retrieval',
+  surfaceFull: 'Full',
   save: 'Save',
   discard: 'Discard',
   saved: 'Saved',
   loading: 'Loading…',
-  empty: 'None',
+  ledgerTitle: 'Ledger',
+  ledgerSummary: 'Batches, snapshot diffs and check records',
 }
 
 export type ForgeKey = keyof typeof zh
