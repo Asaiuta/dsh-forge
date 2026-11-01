@@ -1,6 +1,6 @@
 # Trace 参考
 
-`fftrace` 的扫描范围、语言支持与查询语义。README 只列能力，具体边界在这里。
+`ff_trace` 的扫描范围、语言支持与查询语义。README 只列能力，具体边界在这里。
 
 ## 扫描范围与缓存
 
@@ -30,7 +30,7 @@
 
 ## 编辑门槛：snapshotId
 
-`ffedit` 与 `ff_file` 接受可选 `snapshotId`，把“这次写入对象就是基线记录的那份内容”作为写入前提，校验在写锁内完成：
+`ff_edit` 与 `ff_file` 接受可选 `snapshotId`，把“这次写入对象就是基线记录的那份内容”作为写入前提，校验在写锁内完成：
 
 | 结果 | 含义 | 行为 |
 |---|---|---|
@@ -51,7 +51,7 @@
 `file:` / `impact:` / `exposes:` 的答复可能超过一页。行来自结构化结果（`src/trace-rows.ts`），不是把已截断的文本重新切段：查询过滤只裁剪结果，不改变依赖发现范围；扫描范围若变，必须进入 `configKey` 并反映在覆盖度里。
 
 - 默认每页 100 行，`limit` 可设 1–500；显式给 `limit` 表示“要行”，即使结果会落在一页内也走行视图（概览是摘要，不是行清单）。
-- 行数超过页大小时，第一页输出行视图；`page.nextCursor` 指向下一页。后续页只带 `cursor`，偏移保存在进程内，不接受客户端任意偏移。
+- 行数超过页大小时，第一页输出行视图；`page.nextCursor` 指向下一页。后续请求仍给相同 `target`，携带 `cursor`，沿用同一 `edgeMode`（若适用）与 `limit`；不接受客户端任意偏移。
 - 同一游标固定查询、工作区与页大小：换 `target`/`edgeMode` 或改 `limit` 都会被拒绝并要求重查。
 - 后续页读取创建游标时的同一快照；工作区已变化时 `page.stale=true`，文本明确标注“旧快照、不可作为当前修改计划依据”，且不附带当前 `analysis`。快照被淘汰或游标超过 30 分钟则返回错误，要求重新查询。
 - `page.traversalComplete` 表示图遍历是否在预算内完成，`page.resultComplete` 表示行集是否完整；遍历不完整时分页也不会声称完整。显式 `format=summary` 保留折叠视图（这是“只要计数”的指令），不强行替换成行。
@@ -75,7 +75,7 @@
 | Lua | 支持 | 支持 | 无（package.path 属源码级） | 未支持 | 未支持 |
 | C# | 支持（仅定义） | 无（不扫描 `.cs`） | 无 | 未支持 | 未支持 |
 
-`symbolReferences` 与 `runtime` 两列在本路线图 M2 之前保持未支持：`symbol:` 只是按名称找定义，不能当引用计数；任何“被引用/会调用”的结论都不来自 Trace。
+`symbolReferences` 与 `runtime` 两列在本路线图 M2 之前保持未支持。`ff_trace` 不再接受重复的 `symbol:` 定义查询（含 `capture=true` 也拒绝）；名称定义用 `ff_symbols view=definitions symbol=<name>`，不能当引用计数或调用证据。
 
 PE/ELF/WASM 二进制不占语言行：只按魔数读取导出/导入元数据，不加载、不实例化、不反汇编，因此同名不算调用链。
 
@@ -96,7 +96,7 @@ PE/ELF/WASM 二进制不占语言行：只按魔数读取导出/导入元数据�
 ### 组件与二进制
 
 - `.vue` / `.svelte` 只提取 `<script src>` 或 `<script>` 正文里的依赖，各 script 块作用域分开；模板、样式和编译产物映射都不分析，所以模板里的事件绑定既不成边也不进 `exposes:`。
-- `.cs` 可被 `ff_read` 与符号查询解析，但不在扫描集合内：`file:/impact:/path:` 不会为它返回工程边。把“没找到引用者”读成“没人依赖”是错误结论。
+- `.cs` 可被 `ff_symbols` 与符号查询解析，但不在扫描集合内：`file:/impact:/path:` 不会为它返回工程边。把“没找到引用者”读成“没人依赖”是错误结论。
 - 二进制（`.exe/.dll/.node/.so/.elf/.wasm`）进入扫描集合只为 `ffi:` 的导出/导入证据和 `file:` 的依赖库列表，不产生语言依赖边。
 
 ## JS/TS 工程解析
@@ -116,6 +116,17 @@ PE/ELF/WASM 二进制不占语言行：只按魔数读取导出/导入元数据�
 单个工程元数据上限 256 KiB，总上限 2,000 文件 / 8 MiB；元数据内容和相关路径链接身份变化使图缓存失效。
 
 ## 查询语义
+
+当前 target 仅 `file:`、`impact:`、`path:`、`ipc:`、`api:`、`global:`、`page:`、`exposes:`、`ffi:`；未知参数拒绝，不静默忽略。
+
+| 参数 | 允许的 target | 边界 |
+|---|---|---|
+| `edgeMode` | `file:` / `impact:` / `path:` | 包括显式传 `all` 也不能用于其它 target。 |
+| `format` | `exposes:` | 包括显式传 `auto` 也不能用于其它 target。 |
+| `limit` / `cursor` | `file:` / `impact:` / `exposes:` | `path:` 不分页；游标须绑定原查询。 |
+| `capture` | 上述受支持 target | 捕获内容基线，不恢复已移除的 `symbol:` 入口。 |
+
+公开名与基线检查入口迁移见[接口迁移说明](forge-interface-migration-2026-11-01.md)。
 
 `impact:` 沿反向文件依赖递归查找引用者，给出距离、受影响的 HTML 页面和引用行号；`path:` 沿正向文件依赖及 HTML script 引用查找一条最短路径。
 

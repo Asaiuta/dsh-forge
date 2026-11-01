@@ -1,6 +1,6 @@
 # dsh-forge 能力补齐与工具闭环路线图
 
-日期：2026-10-28。状态：M0 已实施（M0.1–M0.7 均落地并进入 `pnpm test`，实施记录见[实施手册](forge-plan-m0-m1.md#m0-实施记录)）；M1.1 已实施（内容基线捕获与 `snapshotId` 编辑门槛）；M1.2 及之后仍为规划。基线为当天工作树，包含尚未提交的改动；不代表已发布版本。
+文档起草于 2026-10-28；当前接口于 2026-11-01 复核：当前 `retrieval` 为 3 个工具，`full` 为 10 个，见[接口迁移说明](forge-interface-migration-2026-11-01.md)。M0/M1 的主要静态实现进入工作树；原 `ffcheck plan/run` 宿主执行层与 `ff_cards` 已下线，历史设计保留但不可调用。M2 及之后仍为规划。源码状态不代表发布、部署或真实 GUI 验收；现有 URL 返回 `403 Browser access disabled`，未完成浏览器 E2E。
 
 本文只管理未来阶段、依赖和验收，不承载逐次实现日志。历史 Trace 重构见 [旧路线图](trace-roadmap-2026-10-26.md)，语义后端选型依据见 [语义引擎研究](semantics-engine-research-2026-10-26.md)，现有接口见 [Trace 参考](trace-reference.md)。历史文档中的“计划”和“已完成”均不能代替当前源码验证。
 
@@ -36,61 +36,64 @@
 
 | 环节 | 当前底座 | 本路线需要补齐的断点 |
 |---|---|---|
-| 发现 | `fffind` 文件查找；`ffgrep` 文本搜索、符号上下文和分页 | 文本命中不是语义引用；不同工具的范围、截断与位置身份尚未统一衔接 |
-| 理解 | `ff_read` 的正文、大纲、定义视图；`fftrace` 文件图、影响、路径、Electron、FFI | 定义名称不是唯一符号；缺少接收者绑定、通用 references 和符号级影响 |
-| 修改 | `ffedit` 单文件多步原子计划、歧义票据、写前哈希复核、可选语法拒绝；`ff_file` 文件与代码迁移 | 通用语义重命名及跨文件引用更新尚未形成统一计划/应用协议 |
-| 局部反馈 | 普通 `ffedit` 成功后调用桥接审计；搜索来源可回馈检索热度 | 审计依赖已有 Trace 缓存；冷态、未知与无发现都可能没有输出；票据确认路径未接同一审计 |
-| 治理 | 台账、快照、历史 diff、回滚、卡片 | “写入成功”和“验证通过”没有统一的、绑定版本的证据关联 |
-| 验证 | tree-sitter 语法检查；可由 Agent 使用宿主其它工具执行检查 | 插件当前没有自己的类型诊断/测试执行与证据归档闭环；文件权限守卫不是命令执行器 |
+| 发现 | `ff_find` 文件查找；`ff_grep` 模糊内容、多字面量和分页 | 文本命中不是语义引用；不同工具的范围、截断与位置身份仍需显式衔接 |
+| 理解 | `ff_symbols` 大纲/定义；正文走内置 `read`（含 `file#Symbol`）；`ff_trace` 文件图、影响、路径、Electron、FFI | 无 `symbol:` 重复入口；缺少接收者绑定、通用 references 和符号级影响 |
+| 修改 | `ff_edit` 原子文本/符号编辑、歧义票据、写前复核及可选 verify；`ff_file` 文件/代码迁移 | 通用语义重命名及跨文件引用更新仍属规划 |
+| 局部反馈 | 编辑/票据/文件操作共用 post-commit 审计 | 快路径不授予 passed；显式静态验证由 `ff_edit verify` 或 `ff_verify` 承担 |
+| 治理 | 台账、快照、历史 diff、回滚；工程/任务/批次关联与报告快照 | 人工 accepted 不等于机器 passed；GUI 加载需 build + 宿主重载，仍待真实验收 |
+| 验证 | `ff_verify` 对既有 batch 或单文件 path 独立静态验证；记录按内容重算适用性 | path 仅 syntax 可实际检查，bridge/ipc 为 no_baseline/not_run；不执行项目命令、没有 ffcheck host-run |
 
 关键源码接点：
 
-- 工具注册：[src/index.ts](../src/index.ts#L147)；按作用域生成指导：[src/guidance.ts](../src/guidance.ts#L26)。
-- 写前内容复核与提交：[src/tools-edit.ts](../src/tools-edit.ts#L249)；普通编辑审计：[同文件](../src/tools-edit.ts#L494)；票据确认：[同文件](../src/tools-edit.ts#L545)。
-- 桥接审计：[src/edit-audit.ts](../src/edit-audit.ts#L131)；无新鲜度检查的缓存读取：[src/tools-trace.ts](../src/tools-trace.ts#L447)。
-- 当前审计以缓存消费者和新文本中的名称出现情况判断，不是新 AST 上的对象成员绑定；不能据此断言运行时调用必失败，也不能把沉默解释成通过。
-- 读取结果目前没有原始字节哈希：[src/tools-read.ts](../src/tools-read.ts#L491)；文件迁移有版本复核和多文件提交，但不自动修引用：[src/tools-files.ts](../src/tools-files.ts#L238)。
-- 账本模型记录字节变更，不记录测试结果：[src/ledger.ts](../src/ledger.ts#L153)；卡片以有限候选文件的 size/mtime 参与失效，不是全仓内容证据：[src/cards.ts](../src/cards.ts#L332)。
+- 注册与作用域：[src/index.ts](../src/index.ts)、[src/guidance.ts](../src/guidance.ts)。仅注册新名，无旧名运行时 alias。
+- 编辑/历史/回滚：[src/tools-edit.ts](../src/tools-edit.ts)；文件/代码迁移：[src/tools-files.ts](../src/tools-files.ts)。
+- 内容基线与依赖：[src/tools-trace.ts](../src/tools-trace.ts)；静态验证：[src/tools-verify.ts](../src/tools-verify.ts)、[src/check-static.ts](../src/check-static.ts)。
+- 账本与不可变验证记录：[src/ledger.ts](../src/ledger.ts)、[src/verification.ts](../src/verification.ts)。卡片引擎已删除，不再以 size/mtime 卡片宣称当前证据。
+- 工程、GUI 台账与预览确认：[src/projects.ts](../src/projects.ts)、[src/ledger-api.ts](../src/ledger-api.ts)、[src/ledger-rollback.ts](../src/ledger-rollback.ts)。
 
 ## 三、闭环形态：复用工具，不建立第二套施工系统
 
 ```text
-ff_cards / ffhistory ──提供带出处的历史线索──┐
-fffind / ffgrep ──定位候选─────────────────┤
+ff_history ──提供带出处的历史线索──────────┐
+ff_find / ff_grep ──定位候选───────────────┤
                                          v
-                           ff_read：读取当前内容与目标
+                     ff_symbols + 内置 read：定位/读取当前目标
                                          |
-                           fftrace：范围、关系、影响
+                           ff_trace：范围、关系、影响
                                          |
                            变更计划：目标 + 基线 + 检查项
                                          |
-                           ffedit / ff_file：受控应用
+                           ff_edit / ff_file：受控应用
                                          |
                            改后审计：前后证据比较
                                          |
-                           显式验证：静态检查 + 宿主检查
+                           显式验证：ff_verify 静态检查
                                   /                \
                     未通过 / 未完成                  按约定范围通过
                     修正后重查，或                   历史关联验证证据
-                    ffrollback 预览并确认            卡片生成可追溯摘要
+                    ff_rollback 预览并确认           工程报告保留人工结论
                                   \                /
                                   下一次读取重新校验版本
 ```
 
 ### 3.1 工具分工
 
+下表中语义引用、语义变更计划、引用更新预览与后续/外部修改冲突保护属于 **planned**；当前实现以第二节与迁移说明为准。特别是普通 `ff_rollback` 会按快照覆盖后续内容，GUI token 复核不等于通用语义恢复保护。
+
+
 | 工具 | 联动后的职责 | 明确不做 |
 |---|---|---|
-| `fffind` / `ffgrep` | 找候选，附可读取的位置和范围信息；在无语义后端时保留文本兜底 | 把同名文本批量当成同一符号改掉 |
-| `ff_read` | 读取当前版本；从位置选择真实目标；提供可复核内容锚 | 仅凭旧行号授权写入 |
-| `fftrace` | 保留快图；新增按位置的语义引用/调用层次查询；给影响和检查建议 | 把文件依赖、语义引用、静态调用、运行时观察混成一种边 |
-| `ffedit` | 应用经确认的文本或语义变更计划，所有入口统一返回批次与审计状态 | 边写边隐式启动全仓类型检查；失败后自动扩大修改范围 |
+| `ff_find` / `ff_grep` | 找候选，附可读取的位置和范围信息；在无语义后端时保留文本兜底 | 把同名文本批量当成同一符号改掉 |
+| `ff_symbols` + 内置 `read` | 结构定位与当前内容读取分工，提供可复核内容锚 | 仅凭旧行号授权写入 |
+| `ff_trace` | 保留快图；新增按位置的语义引用/调用层次查询；给影响和检查建议 | 把文件依赖、语义引用、静态调用、运行时观察混成一种边 |
+| `ff_edit` | 应用经确认的文本或语义变更计划，所有入口统一返回批次与审计状态 | 边写边隐式启动全仓类型检查；失败后自动扩大修改范围 |
 | `ff_file` | 文件/符号迁移先预览引用更新，支持时转成同一变更计划 | 仅搬文本却宣称已完成语义重构 |
-| `ffhistory` | 将写入批次、检查结果、回滚关系连起来，保留原始快照与出处 | 将“执行过命令”显示成“改动已验收” |
-| `ffrollback` | 预览恢复范围，检测后续/外部修改，确认后产生新批次，再重查 | 因一次测试失败自动回滚；承诺撤销测试产生的数据库/网络副作用 |
-| `ff_cards` | 汇总改了什么、检查了什么、哪些仍未知，引用批次与检查记录 | 将模型润色内容当测试结果；将历史通过当当前通过 |
+| `ff_history` | 将写入批次、检查结果、回滚关系连起来，保留原始快照与出处 | 将“执行过命令”显示成“改动已验收” |
+| `ff_rollback` | 预览恢复范围，检测后续/外部修改，确认后产生新批次，再重查 | 因一次测试失败自动回滚；承诺撤销测试产生的数据库/网络副作用 |
+| `ff_verify` | 对已有 batch 或单文件 path 归档静态检查，不写源码、不创建伪编辑批次 | path 无 before 基线时伪造 bridge/ipc 通过；执行宿主命令 |
+| `ff_project` | 工程/四态任务/批次关联/人工报告；revision 乐观锁 | 将人工 accepted 当机器 passed；把 note 当第五种任务状态 |
 
-验证入口拟增加一个薄的 `ffcheck`，这是本文唯一建议新增的公开工具；名称和 schema 的具体草案见[公共契约](forge-plan-contracts.md)，M1 核验后定稿，当前不可调用。它负责静态复查、检查计划、已授权宿主执行的结果归集，不复制终端或成为通用 shell。若宿主没有可用、可关联执行结果的接口，明确返回 `unavailable`，由 Agent 手动执行并作为外部证据展示，不能伪装成自动核验。
+历史 `ffcheck action=plan/run` 的冻结计划、宿主审批/执行层及 `ff_cards` 已移除，不能调用。当前 `ff_edit verify` 与 `ff_verify` 只负责静态检查；执行测试使用用户授权的宿主终端，不存在可调用的 forge host-run。后续命令证据关联仍属规划，历史设计见[吸收记录](forge-check-absorption.md)。
 
 ### 3.2 只增加三种必要关联
 
@@ -149,7 +152,10 @@ fffind / ffgrep ──定位候选───────────────�
 
 工作项：
 
-- ~~M1.1 修改前显式查询 `exposes:` / `ipc:` / `impact:`，保存本次操作的基线范围；不要求所有普通编辑自动构图。~~ 已实施：`fftrace capture=true` 逐文件读字节、按同一份内容提取事实并落盘内容基线（24 小时 TTL、每工作区 20 条/128 MiB、末尾原子重命名）；`ffedit`/`ff_file` 的 `snapshotId` 在写锁内校验同一工作区、文件被覆盖且字节未变，`drift`/`not_covered`/`observed_only` 各自拒绝而不是暗示通过。不完整捕获降级为 `observed` 且不保存。
+**历史/规划标记**：以下 M1 条目保存原阶段设计，不是当前可调用接口。出现的 `ffcheck`、cards/卡片和宿主 plan/run 均为 historical（已下线）或 planned（未来需重新设计验收）；当前替代入口为 `ff_edit verify`、`ff_verify`、`ff_history` 与 `ff_project`。不把历史勾选/退出条件读成现有运行时承诺。
+
+
+- ~~M1.1 修改前显式查询 `exposes:` / `ipc:` / `impact:`，保存本次操作的基线范围；不要求所有普通编辑自动构图。~~ 已实施：`ff_trace capture=true` 逐文件读字节、按同一份内容提取事实并落盘内容基线（24 小时 TTL、每工作区 20 条/128 MiB、末尾原子重命名）；`ff_edit`/`ff_file` 的 `snapshotId` 在写锁内校验同一工作区、文件被覆盖且字节未变，`drift`/`not_covered`/`observed_only` 各自拒绝而不是暗示通过。不完整捕获降级为 `observed` 且不保存。
 - M1.2 用当前 AST 事实比较 expose 对象/成员、IPC 注册与消费者；按实际变更范围复查受影响消费者，区分新增破坏与基线已有问题。文本名字只作为预筛，不能作为通过或“调用必失败”的最终依据。
 - M1.3 冷态正式检查可以显式构图；写后即时建议仍使用有界快路径。完整前后核查放在 `ffcheck`，不让一次保存隐式承担全仓延迟。
 - M1.4 `ffcheck` 先支持静态复查及验证计划；若宿主支持可审计的命令调用，再加入显式执行。返回每项状态、范围与证据，不只返回一个总布尔值。
@@ -168,7 +174,7 @@ fffind / ffgrep ──定位候选───────────────�
 - M2.1 在代表性项目上比较 TypeScript Language Service 的按需引用查询与 `createProgram + TypeChecker` 索引路径，固定版本、配置、查询和输入集合，先测冷/热延迟、内存、更新与取消。
 - M2.2 首选交互式 Language Service 适配，隔离在可终止的工作进程；只用受支持接口，不自行重写 binding/type checker。若最小试验否决该方案，再依据证据采用批索引，不能同时先建设两套完整引擎。
 - M2.3 首批操作为“位置→符号/定义”“符号→引用”和项目诊断；区分声明、读写引用、类型引用、调用位置。调用层次按后端真实能力接入，不把每条 reference 都标为 call。
-- M2.4 给 `fftrace` 增加结构化位置选择参数和 references 操作；`ff_read` 可消费同一位置引用。现有 `symbol:` 名称查询保持定义检索定位，不偷偷改变语义；名称歧义时列候选，不能默认选第一个。
+- M2.4（planned）给 `ff_trace` 增加结构化位置选择参数和 references 操作，由 `ff_symbols` 消费同一位置引用。当前按名称定义检索归 `ff_symbols view=definitions`，`ff_trace symbol:` 已移除；未来语义查询不得偷偷复用已移除的入口。
 - M2.5 处理 tsconfig 多项目归属、项目引用、包 exports/imports、声明文件和依赖缺失。解析用的外部声明不必全部展现在结果里，但其版本/缺失必须影响覆盖与新鲜度。
 - M2.6 后端不存在、崩溃、超时或只返回部分结果时，静态快图照常可用；文本兜底明确标成文本，不继续以“语义引用”名义输出。
 
@@ -271,14 +277,14 @@ M4.10 的 FFI 扩展先增加明确的构建/链接产物关联、导出名与�
 
 ## 七、首个可验收切片与后续决策
 
-首批只承诺 M0 + M1，不等所有语言补齐。验收切片是“Electron 桥接成员改名，漏改被识别，补改后检查，历史可追溯，失败可预览恢复”。它直接复用现有 Trace、编辑、台账和卡片，收益不依赖新语言服务器。
+首批验收切片仍是 M0 + M1：“Electron 桥接成员改名，漏改被识别，补改后检查，历史可追溯，失败可预览恢复”。当前复用 Trace、编辑、台账、独立静态验证与工程报告；原卡片退出条件保留为历史，不依赖已删除的工具，也不承诺宿主命令执行。
 
 建议拆成四个可独立评审的实现批次：
 
 1. 审计状态、配置/版本身份、普通与票据入口一致性及负例。
 2. 基于前后 AST 的桥接契约复查与新增/既存问题区分。
 3. 薄检查入口和可核验的宿主执行结果关联；宿主接口不可用时如实降级。
-4. history/cards/guidance 联动及真实 DSH 全链路验收。
+4. `ff_history` / `ff_project` / guidance 联动及真实 DSH 全链路验收（原 history/cards 联动为 historical，卡片已下线）。
 
 随后根据 M2 最小试验决定 TS 后端，交付首个符号级闭环；再建设跨文件重构与其它语言适配。暂不建设通用图数据库、自动修复代理、全仓常驻预计算、多后端共识系统或万能工作流调度器。
 
