@@ -1,6 +1,7 @@
 /** The SDK boundary: failures use its exception channel, successful values are lossless JSON. */
 import { defineTool, type ParameterSchemaSpec, type ValueSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ForgeExec } from './core.ts'
+import { cleanArgs, type ArgHygiene } from './param-hygiene.ts'
 import { freezePresentation } from './presentation.ts'
 import type { ForgeFileSystem, ForgeFsEvents } from './execution.ts'
 
@@ -18,6 +19,8 @@ interface Factory<V, O extends ValueSchemaSpec> {
   parameters: ParameterSchemaSpec
   output: { schema: O; render(args: unknown, value: V): Array<{ type: 'text'; text: string }> }
   isConcurrencySafe(): boolean
+  /** 参数卫生声明；省略即只吃通用规则（见 param-hygiene.ts）。 */
+  hygiene?: ArgHygiene
   /**
    * @param args - validated arguments.
    * @param exec - the guarded context (sandbox authorisation attached).
@@ -55,7 +58,10 @@ export function defineForgeTool<V, O extends ValueSchemaSpec>(factory: Factory<V
     parameters: factory.parameters,
     isConcurrencySafe: () => factory.isConcurrencySafe(),
     output: { schema: outputSchema, render: (args, value) => factory.output.render(args, value as unknown as V) },
-    async execute(args, exec) {
+    async execute(input, exec) {
+      // 补全产物在进入业务前归一回「未提供」；render 仍拿原始参数，`args.view`
+      // 这类渲染依据不能因为归一变空而消失。
+      const args = cleanArgs(input, factory.hygiene)
       const guarded: ForgeExec = guard ? await guard(exec, args, factory.name) : exec
       const value = await factory.execute(args, guarded, exec as unknown as ForgeExec)
       if (typeof value === 'object' && value !== null && 'error' in value && typeof value.error === 'string') {

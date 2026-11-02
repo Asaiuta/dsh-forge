@@ -173,6 +173,22 @@ export function createFileTool() {
       if (value.audit) lines.push(...renderAudit(value.audit))
       return [{ type: 'text' as const, text: lines.join('\n') }]
     } },
+    // create 的空 content 是合法的空文件；其余空串由通用层清掉。
+    // 缺省形态（0 / true / false / 'auto'）只在本 action 用得上时才留：
+    // 别的 action 下它们不携带意图，非缺省值仍是误用。
+    hygiene: {
+      keepEmpty: ['content'],
+      modeField: 'action',
+      defaultOnlyIn: {
+        content: ['create'],
+        overwrite: ['create', 'move'],
+        includeLeadingComment: ['copy_code', 'move_code'],
+        after: ['copy_code', 'move_code'],
+        before: ['copy_code', 'move_code'],
+        indent: ['copy_code', 'move_code'],
+      },
+      defaults: { content: '', overwrite: false, includeLeadingComment: true, after: 0, before: 0, indent: 'auto' },
+    },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {

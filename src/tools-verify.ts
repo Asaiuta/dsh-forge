@@ -19,6 +19,8 @@ export function createVerifyTool() {
       checks: { type: 'array', items: { type: 'string', enum: ['bridge', 'ipc', 'syntax'] }, description: 'Nonempty static check list. Defaults to bridge and syntax.' },
     },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args: unknown, value: { text: string }) => [{ type: 'text' as const, text: value.text }] },
+    // batch 补成 0 与「没选」同义，否则会和 path 撞成「二选一」冲突。
+    hygiene: { zeroMeansAbsent: ['batch'] },
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {

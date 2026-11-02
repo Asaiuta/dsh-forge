@@ -565,6 +565,20 @@ export function createEditTool(pool: FinderPool) {
         return text(lines.join('\n'))
       },
     },
+    // 空串语义不能删；symbol 编辑的三个字段只在给了 sourceSymbol 时成立，
+    // 缺失时它们只可能是补全产物——按缺省形态删，非缺省值仍是误用。
+    hygiene: {
+      keepEmpty: ['content', 'replaceWith'],
+      requires: {
+        edit: 'sourceSymbol',
+        content: 'sourceSymbol',
+        includeLeadingComment: 'sourceSymbol',
+        // 空 replaceWith 只有在 find 成立时才是「删除匹配块」；没有 find 时它
+        // 只是补全产物，留着会和 steps 抢同一批参数。
+        replaceWith: 'find',
+      },
+      defaults: { edit: 'replace', content: '', includeLeadingComment: true, replaceWith: '' },
+    },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const allowed = new Set(['path', 'find', 'replaceWith', 'steps', 'reason', 'revertOnSyntaxError', 'ticket', 'choice', 'snapshotId', 'verify', 'sourceSymbol', 'includeLeadingComment', 'edit', 'content'])
@@ -1151,6 +1165,8 @@ export function createRollbackTool(pool: FinderPool) {
         return text(lines.join('\n'))
       },
     },
+    // 两个选择器补成 0 与「没选」同义；宁可要求重选，也不拿 0 去回滚。
+    hygiene: { zeroMeansAbsent: ['batch', 'throughBatch'] },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const reason = typeof args.reason === 'string' ? args.reason.trim() : ''

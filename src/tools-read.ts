@@ -86,8 +86,16 @@ export function createReadTool(workers?: AstWorkerPool) {
         return text(lines.join('\n'))
       },
     },
+    // 两个视图的参数必须互斥：另一个视图的字段在本视图下只是补全产物，
+    // 值是什么都不改变这一点；视图里根本没有的名字仍由 argumentProblem 拒绝。
+    hygiene: {
+      modeField: 'view',
+      onlyIn: { symbol: ['definitions'], glob: ['definitions'], limit: ['definitions'], depth: ['outline'] },
+    },
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
+      // 视图专属字段的剔除在 defineForgeTool 的 hygiene 层完成；这里仍负责
+      // 「视图里根本没有这个名字」的拒绝。
       const view = args.view
       if (typeof view !== 'string' || !(VIEWS as readonly string[]).includes(view)) {
         return failure('view must be outline or definitions')

@@ -1161,6 +1161,13 @@ export function createTraceTool(workers?: AstWorkerPool) {
       },
       render: (_args: unknown, value: { text: string }) => text(value.text),
     },
+    // 三条限制与 execute 里的判断同源：edgeMode 只认文件依赖类查询，format 只影响
+    // exposes，limit 只对可分页的查询有意义。模式由 target 前缀决定，没有独立字段。
+    hygiene: {
+      modeFrom: (args: Record<string, unknown>): string =>
+        /^\s*([a-z]+)\s*:/i.exec(String(args.target ?? ''))?.[1]?.toLowerCase() ?? '',
+      onlyIn: { edgeMode: ['file', 'impact', 'path'], format: ['exposes'], limit: ['file', 'impact', 'exposes'] },
+    },
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       const raw = typeof args.target === 'string' ? args.target : ''
