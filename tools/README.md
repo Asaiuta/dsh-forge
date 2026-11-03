@@ -10,7 +10,7 @@ and augmentation tests. The desktop app ships its dependency tree inside
 Extracting the entire archive or adding `npx asar` is unnecessary for a small read.
 
 ```sh
-python tools/asar-read.py "F:/DSH-NEXT/DSH NEXT/resources/app.asar" ls
+python tools/asar-read.py "D:/Programs/DSH/resources/app.asar" ls
 python tools/asar-read.py ".../app.asar" cat node_modules/@deepseek-ai/dsh-tools/package.json
 python tools/asar-read.py ".../app.asar" find dsh-user-approval
 ```

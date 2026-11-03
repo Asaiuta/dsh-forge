@@ -19,7 +19,7 @@
  *
  * Usage:
  *   pnpm bench:takeover
- *   BENCH_CORPUS=D:/AI/VCPChat pnpm bench:takeover
+ *   BENCH_CORPUS=D:/corpus/vcpchat pnpm bench:takeover
  *
  * @module dsh-forge/tests/bench-takeover
  */
