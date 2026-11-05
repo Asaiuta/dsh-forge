@@ -67,3 +67,8 @@ __pycache__/
 # Design-context notes written by the assistant's UI tooling. Reusable content
 # belongs in docs/, not in this file.
 /.impeccable.md
+
+# Acceptance reports measured on one machine. They carry the local evidence
+# root and OS account name, so the conclusions live in README and the tests
+# instead of in a distributed file.
+/docs/2026-11-05_*-report.md
