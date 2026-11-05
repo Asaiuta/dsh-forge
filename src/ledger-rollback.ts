@@ -28,13 +28,14 @@ function ledgerVersion(workspace: string): string {
 function selectionOf(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new LedgerApiError('selection is required')
   const source = value as Record<string, unknown>
-  if (Object.keys(source).some(key => !['batch', 'latest', 'throughBatch', 'node', 'pathContains'].includes(key))) throw new LedgerApiError('invalid selection field')
+  if (Object.keys(source).some(key => !['batch', 'latest', 'throughBatch', 'node', 'pathContains', 'version'].includes(key))) throw new LedgerApiError('invalid selection field')
   if ([source.batch !== undefined, source.latest === true, source.throughBatch !== undefined].filter(Boolean).length !== 1) throw new LedgerApiError('provide exactly one of batch, latest=true or throughBatch')
   if (source.latest !== undefined && source.latest !== true) throw new LedgerApiError('latest must be true or omitted')
   if (source.batch !== undefined && (!Number.isSafeInteger(source.batch) || Number(source.batch) < 1)) throw new LedgerApiError('batch must be a positive integer')
   if (source.throughBatch !== undefined && (!Number.isSafeInteger(source.throughBatch) || Number(source.throughBatch) < 0)) throw new LedgerApiError('throughBatch must be a nonnegative integer')
   if (source.node !== undefined && (typeof source.node !== 'string' || !/^b\d+:n\d+$/.test(source.node) || source.batch === undefined)) throw new LedgerApiError('node requires a specific batch')
   if (source.pathContains !== undefined && (typeof source.pathContains !== 'string' || !source.pathContains.trim())) throw new LedgerApiError('pathContains must be a nonempty string')
+  if (source.version !== undefined && (!['before', 'after'].includes(String(source.version)) || source.batch === undefined || source.node === undefined || source.pathContains !== undefined)) throw new LedgerApiError('version requires explicit batch + node and before|after')
   const { pathContains, ...selection } = source
   return { ...selection, ...(pathContains === undefined ? {} : { path: pathContains }) }
 }

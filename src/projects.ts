@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { dataDir, withFileLock } from './core.ts'
 import { canonicalWorkspace } from './fs-paths.ts'
-import { atomicWrite, getBlob, readLedgerTail, storeFor, type LedgerBatch } from './ledger.ts'
+import { atomicWrite, getBlob, readLedgerTail, storeFor, type LedgerBatch, type BatchAttribution } from './ledger.ts'
+import { listRecords, applicabilityOf, type VerificationRecord } from './verification.ts'
 
 export type ProjectStatus = 'active' | 'review' | 'accepted' | 'archived'
 export type TaskStatus = 'pending' | 'doing' | 'done' | 'blocked'
@@ -14,8 +15,23 @@ export interface ProjectOverview {
   actors: Array<{ actor: string; batches: number }>; files: Array<{ file: string; count: number }>
   lineChanges: { added: number; deleted: number; unavailable: number; method: string }
 }
-export interface ProjectReport { id: string; createdAt: number; status: 'draft' | 'review' | 'accepted'; conclusion: string; issues: string[]; summary: ProjectOverview }
-export interface Project { id: string; name: string; workspace: string; status: ProjectStatus; createdAt: number; updatedAt: number; revision: number; tasks: ProjectTask[]; links: ProjectLink[]; reports: ProjectReport[] }
+export interface ReportEvidence {
+ version: 1; projectRevision: number; capturedAt: number
+ batches: Array<{ id: number; actor: string; reason: string; ts: number; membership: 'direct' | 'linked'; attribution?: BatchAttribution; taskIds: string[]; nodes: Array<{ node: string; file: string; before: string | null; after: string | null }> }>
+ verification: Array<{ id: string; sha256: string; batchIds: number[]; recorded: string; effective: string; applicable: boolean; drifted: string[]; record: VerificationRecord }>
+}
+export interface ProjectReport { id: string; createdAt: number; status: 'draft' | 'review' | 'accepted'; conclusion: string; issues: string[]; summary: ProjectOverview; evidence?: ReportEvidence; submittedBy?: string }
+export interface TodoSource {
+ sessionId: string; callId: string; capturedAt: number
+ /** Turn number from `turn/start`; null when the host gave no turn information. */
+ turn: number | null
+ /** Every captured call for this plan, newest last; replay of any of them is a no-op. */
+ callIds: string[]
+ /** How many writes folded into this plan. */
+ writes: number
+ todos: Array<{content: string; status: 'pending' | 'in_progress' | 'completed'}>
+}
+export interface Project { id: string; name: string; workspace: string; status: ProjectStatus; createdAt: number; updatedAt: number; revision: number; tasks: ProjectTask[]; links: ProjectLink[]; reports: ProjectReport[]; todoSource?: TodoSource }
 interface ProjectStore { version: 1; workspace: string; projects: Project[] }
 const projectStatuses = ['active', 'review', 'accepted', 'archived'] as const
 const taskStatuses = ['pending', 'doing', 'done', 'blocked'] as const
@@ -52,6 +68,15 @@ function complete(p: Project): void {
 }
 function validateProject(p: Project, workspace: string): void {
  object(p); text(p.id,'id'); text(p.name,'name'); integer(p.revision,'revision'); choice(p.status,projectStatuses,'status')
+ if (p.todoSource !== undefined) {
+  object(p.todoSource); text(p.todoSource.sessionId,'Todo sessionId'); text(p.todoSource.callId,'Todo callId')
+  if (!Number.isFinite(p.todoSource.capturedAt) || !Array.isArray(p.todoSource.todos)) throw new Error('invalid Todo source storage')
+  if (p.todoSource.turn !== null && p.todoSource.turn !== undefined && !Number.isSafeInteger(p.todoSource.turn)) throw new Error('invalid Todo turn')
+  // Records written before turn tracking lack these fields; they are defaults, not corruption.
+  if (p.todoSource.callIds !== undefined && (!Array.isArray(p.todoSource.callIds) || p.todoSource.callIds.some(id => typeof id !== 'string' || !id))) throw new Error('invalid Todo call history')
+  if (p.todoSource.writes !== undefined && (!Number.isSafeInteger(p.todoSource.writes) || p.todoSource.writes < 1)) throw new Error('invalid Todo write count')
+  for (const todo of p.todoSource.todos) { object(todo); if (typeof todo.content !== 'string' || !todo.content.trim()) throw new Error('invalid Todo content'); choice(todo.status,['pending','in_progress','completed'],'Todo status') }
+ }
  if (p.workspace !== workspace || !Number.isFinite(p.createdAt) || !Number.isFinite(p.updatedAt) || !Array.isArray(p.tasks) || !Array.isArray(p.links) || !Array.isArray(p.reports)) throw new Error('invalid project storage')
  const ids = new Set<string>()
  for (const t of p.tasks) {
@@ -91,6 +116,81 @@ function location(workspace: string) {
  const root = canonicalWorkspace(requested); const store = storeFor(root)
  return { root, store, file: path.join(store.dir,'projects.json') }
 }
+
+/**
+ * Capture one successful Todo write into the plan it belongs to.
+ *
+ * A plan is identified the way the host itself scopes todos: by session and
+ * turn (`turn/start` resets the projection). A real session log shows four
+ * writes in one turn for one three-item plan, so keying a project per write
+ * duplicated that plan. Two rules, no text similarity:
+ *
+ * 1. Same session and turn — always the same plan.
+ * 2. Otherwise, the title sets are nested (`A ⊆ B` or `B ⊆ A`): the plan was
+ *    extended, narrowed, or its statuses changed, so it continues. Wholly
+ *    different titles replaced the plan, so a new project opens.
+ *
+ * Replaying an already-captured call is a no-op. Task ids are preserved across
+ * merges so batch links keep pointing at the same task. `revision` counts human
+ * mutations only: this mirror follows the agent, and bumping it on every status
+ * tick would turn an open task editor into a conflict loop.
+ */
+export async function captureTodoProject(
+ workspace: string, identity: { sessionId: string; turn: number | null; callId: string }, todos: unknown,
+): Promise<Project> {
+ const sessionId = text(identity.sessionId,'sessionId'); const callId = text(identity.callId,'callId')
+ const turn = identity.turn === null ? null : integer(identity.turn,'turn')
+ if (!Array.isArray(todos)) throw new Error('todos must be an array')
+ const snapshot = todos.map(item => {
+  object(item)
+  if (typeof item.content !== 'string' || !item.content.trim()) throw new Error('invalid todo content')
+  return {content: item.content, status: choice(item.status,['pending','in_progress','completed'] as const,'todo status')}
+ })
+ const loc=location(workspace)
+ return withFileLock(loc.store.dir,()=>{
+  const state=load(loc.file,loc.root)
+  const mine=state.projects.filter(p=>p.todoSource?.sessionId===sessionId)
+  const callsOf=(p: Project) => p.todoSource!.callIds ?? [p.todoSource!.callId]
+  const replayed=mine.find(p=>callsOf(p).includes(callId))
+  if(replayed) return replayed
+  const incoming=new Set(snapshot.map(t=>t.content))
+  const newestFirst=[...mine].sort((a,b)=>b.createdAt-a.createdAt || b.id.localeCompare(a.id))
+  const target=newestFirst.find(p=>{
+   if(p.status==='archived') return false
+   const source=p.todoSource!
+   if(turn!==null && (source.turn ?? null)===turn) return true
+   // An empty set is a subset of everything, so it must not decide: with no
+   // titles on one side there is no evidence of continuation.
+   if(incoming.size===0) return false
+   const known=new Set(source.todos.map(t=>t.content))
+   if(known.size===0) return false
+   const nested=[...incoming].every(t=>known.has(t)) || [...known].every(t=>incoming.has(t))
+   return nested
+  })
+  const now=Date.now()
+  if(target){
+   const byTitle=new Map(target.tasks.map(t=>[t.title,t]))
+   for(const todo of snapshot){
+    const title=todo.content.slice(0,20000)
+    const status=todo.status==='in_progress'?'doing':todo.status==='completed'?'done':'pending'
+    const found=byTitle.get(title) ?? target.tasks.find(t=>t.title===todo.content)
+    if(found){ found.status=status; found.updatedAt=now }
+    else target.tasks.push({id:randomUUID(),title,note:'',status,archived:false,createdAt:now,updatedAt:now})
+   }
+   target.todoSource={...target.todoSource!,turn,callId,capturedAt:now,callIds:[...callsOf(target),callId],writes:(target.todoSource!.writes ?? 1)+1,todos:snapshot}
+   target.updatedAt=now
+   mkdirSync(loc.store.dir,{recursive:true}); atomicWrite(loc.file,JSON.stringify(state))
+   return target
+  }
+  const p: Project={id:randomUUID(), name:`Todo · ${(snapshot[0]?.content ?? '空计划').slice(0,100)}`,workspace:loc.root,status:'active',createdAt:now,updatedAt:now,revision:1,
+   tasks:snapshot.map(t=>({id:randomUUID(),title:t.content.slice(0,20000),note:'',status:t.status==='in_progress'?'doing':t.status==='completed'?'done':'pending',archived:false,createdAt:now,updatedAt:now})),links:[],reports:[],
+   todoSource:{sessionId,callId,capturedAt:now,turn,callIds:[callId],writes:1,todos:snapshot}}
+  state.projects.push(p)
+  mkdirSync(loc.store.dir,{recursive:true}); atomicWrite(loc.file,JSON.stringify(state))
+  return p
+ })
+}
+
 export function getProject(workspace: string, projectId: string): Project {
  const loc = location(workspace); const p = load(loc.file,loc.root).projects.find(p => p.id === text(projectId,'projectId'))
  if (!p) throw new Error('project not found')
@@ -111,11 +211,47 @@ export function listProjects(filter: { workspace?: string; query?: string } = {}
  }
  return projects.filter(p => !query || `${p.id} ${p.name} ${p.workspace} ${p.tasks.map(t=>t.title).join(' ')}`.toLocaleLowerCase().includes(query)).sort((a,b)=>b.updatedAt-a.updatedAt || a.id.localeCompare(b.id))
 }
+export function projectBatchMembership(p: Project, batch: LedgerBatch, taskId?: string): 'direct' | 'linked' | undefined {
+ if (batch.attribution?.projectId === p.id && (!taskId || batch.attribution.taskId === taskId)) return 'direct'
+ if (p.links.some(link => link.batchId === batch.id && (!taskId || link.taskId === taskId))) return 'linked'
+ return undefined
+}
+export function isUnassignedBatch(workspace: string, batch: LedgerBatch): boolean {
+ return !batch.attribution && !listProjects({ workspace }).some(p => p.links.some(l => l.batchId === batch.id))
+}
+/** Explicit attribution is checked under the workspace lock, including at the mutation fence. */
+export function validateAttribution(workspace: string, input: { projectId?: unknown; taskId?: unknown }): BatchAttribution | undefined {
+ if (input.projectId === undefined) {
+  if (input.taskId !== undefined) throw new Error('taskId requires projectId')
+  return undefined
+ }
+ const projectId = text(input.projectId, 'projectId'), p = getProject(workspace, projectId)
+ if (p.status === 'archived') throw new Error('cannot construct in an archived project')
+ if (input.taskId === undefined) return { projectId }
+ const taskId = text(input.taskId, 'taskId'), task = p.tasks.find(t => t.id === taskId)
+ if (!task || task.archived) throw new Error('task not found or archived in project')
+ return { projectId, taskId }
+}
 function linkedBatches(p: Project): LedgerBatch[] {
- const ids = new Set(p.links.map(l=>l.batchId)); const all = readLedgerTail(storeFor(p.workspace),Number.MAX_SAFE_INTEGER)
- const selected = all.filter(b=>ids.has(b.id))
- if (selected.length !== ids.size) throw new Error('linked batch no longer exists')
- return selected
+ const all = readLedgerTail(storeFor(p.workspace), Number.MAX_SAFE_INTEGER), ids = new Set(all.map(b => b.id))
+ if (p.links.some(l => !ids.has(l.batchId))) throw new Error('linked batch no longer exists')
+ return all.filter(batch => projectBatchMembership(p, batch))
+}
+function captureEvidence(p: Project, capturedAt: number): ReportEvidence {
+ const store = storeFor(p.workspace), batches = linkedBatches(p), ids = batches.map(b => b.id)
+ const history = ids.length ? listRecords(store, { batchIds: ids }) : { records: [], unreadable: 0 }
+ if (history.unreadable) throw new Error(`cannot freeze evidence: ${history.unreadable} unreadable verification record(s)`)
+ const records = history.records
+ return { version: 1, projectRevision: p.revision, capturedAt,
+  batches: batches.map(b => ({ id: b.id, actor: b.actor, reason: b.reason, ts: b.ts, membership: projectBatchMembership(p, b)!,
+   ...(b.attribution ? { attribution: { ...b.attribution } } : {}),
+   taskIds: [...new Set([...(b.attribution?.projectId === p.id && b.attribution.taskId ? [b.attribution.taskId] : []), ...p.links.filter(l => l.batchId === b.id).map(l => l.taskId)])],
+   nodes: b.nodes.map((n, i) => ({ node: `b${b.id}:n${i}`, file: n.file, before: n.before, after: n.after })) })),
+  verification: records.map(record => { const view = applicabilityOf(record, store.root); return {
+   id: record.id, sha256: createHash('sha256').update(JSON.stringify(record)).digest('hex'), batchIds: [...record.batchIds],
+   recorded: view.verdict.status, effective: view.effective, applicable: view.applicable, drifted: [...view.drifted], record,
+  } }),
+ }
 }
 /** Exact line LCS under a bounded work budget; binary/missing/large pairs are explicitly unavailable. */
 function lineDelta(before: Buffer | null, after: Buffer | null): { added: number; deleted: number } | null {
@@ -151,7 +287,7 @@ export function projectOverview(workspace: string, projectId: string): ProjectOv
  * Unknown fields fail before IO. Returned records are detached disk snapshots. Human states are not machine checks.
  * Locking shares forge's workspace lock (single host process); each successful mutation replaces one JSON atomically.
  */
-export async function projectAction(input: unknown, defaultWorkspace?: string): Promise<Project | Project[] | ProjectOverview> {
+export async function projectAction(input: unknown, defaultWorkspace?: string, actor = 'unknown'): Promise<Project | Project[] | ProjectOverview> {
  object(input)
  const action=text(input.action,'action'); const allowed=fields[action]
  if(!allowed) throw new Error(`unknown action: ${action}`)
@@ -183,7 +319,7 @@ export async function projectAction(input: unknown, defaultWorkspace?: string): 
     if(!Array.isArray(input.issues)) throw new Error('issues must be a string array')
     const issues=input.issues.map(i=>text(i,'issue')); const conclusion=text(input.conclusion,'conclusion')
     if(status==='accepted') complete(p)
-    p.reports.push({id:randomUUID(),createdAt:now,status,conclusion,issues,summary:overview(p)})
+    p.reports.push({id:randomUUID(),createdAt:now,status,conclusion,issues,summary:overview(p),evidence:captureEvidence(p,now),submittedBy:actor})
     if(status!=='draft') p.status=status
    } else {
     const taskId=text(input.taskId,'taskId'); const task=p.tasks.find(t=>t.id===taskId)

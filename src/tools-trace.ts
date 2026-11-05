@@ -1046,13 +1046,13 @@ export function createTraceTool(workers?: AstWorkerPool) {
       'ffi:<name> reports source declarations and PE/ELF/WASM exports as separate evidence, never a verified call chain. Optional compile_commands.json supplies C/C++ include flags, never running commands.',
     parameters: {
       target: { type: 'string', required: true, description: 'file:<path>, impact:<path>, path:<a> -> <b>, ipc:<channel>, api:<name>, global:<name>, page:<file.html>, exposes:<global-or-file> (empty = all), ffi:<name>. Definitions belong to ff_symbols.' },
-      declarations: { type: 'string', description: 'Absolute or workspace-relative JSON file, ≤256KiB: {apis:[{name,channel,kind,roles}],roleGlobals?:{role:global}}; kind=query/command/subscription.' },
-      compileCommands: { type: 'string', description: 'Compilation database JSON (≤8MiB); defaults to workspace compile_commands.json for C/C++. Reads include flags without executing commands.' },
-      edgeMode: { type: 'string', enum: ['all', 'certain'], description: 'File dependency edges for file:/impact:/path:. all (default) includes labelled candidates; certain excludes them. Static certainty does not prove runtime execution.' },
-      format: { type: 'string', enum: ['auto', 'summary', 'detail'], description: 'exposes: 视图：auto（默认）按规模分档，survey 折叠为每个 expose 一行，小桥接保留逐键站点；detail 展开全部逐键站点。' },
-      limit: { type: 'integer', description: 'file:/impact:/exposes: 每页行数（1-500，默认 100）；其他查询不接受。' },
-      cursor: { type: 'string', description: 'file:/impact:/exposes: 的后续页游标，取自上一页的 nextCursor；只能与同一 target/edgeMode 和同一 limit 一起使用，过期或换查询需重新发起。' },
-      capture: { type: 'boolean', description: '正式捕获路径：逐文件读取字节、按同一份内容提取事实并保存内容基线（跨进程可用于改动前后比较）。绕过缓存与 sidecar，比普通查询慢；不完整时明确报错而不谎称基线。' },
+      declarations: { type: 'string', description: 'ipc: JSON file, <=256KiB: {apis:[{name,channel,kind,roles}],roleGlobals?:{role:global}}. kind=query/command/subscription.' },
+      compileCommands: { type: 'string', description: 'C/C++ compile_commands.json for include flags; defaults to the workspace file. Never executes anything.' },
+      edgeMode: { type: 'string', enum: ['all', 'certain'], description: 'File dependency edges for file:/impact:/path:; all (default) includes labelled candidates, certain excludes them. Certainty is static, not proof of execution.' },
+      format: { type: 'string', enum: ['auto', 'summary', 'detail'], description: 'exposes: auto (default) folds by size, detail expands every site.' },
+      limit: { type: 'integer', description: 'file:/impact:/exposes page size, 1-500, default 100.' },
+      cursor: { type: 'string', description: 'nextCursor from the previous page; same target/edgeMode/limit only.' },
+      capture: { type: 'boolean', description: 'Read bytes file by file and persist a content baseline, usable across processes as the before-side of a comparison. Slower: bypasses cache. Fails loudly rather than claim a partial baseline.' },
     },
     output: {
       schema: {

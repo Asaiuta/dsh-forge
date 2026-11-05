@@ -20,6 +20,8 @@
  */
 
 import { createHash } from 'node:crypto'
+import { boundedOutput, jsonBytes, outputPreview, OUTPUT_PAGE_BYTES } from './output-budget.ts'
+import { archiveOutputReceipt, readOutputReceipt } from './output-receipts.ts'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import type { EditOptions, EditStep, StepReport, StepCandidate } from './edit-engine.ts'
@@ -44,12 +46,15 @@ import {
 } from './ledger.ts'
 import { createTicket, deleteTicket, loadTicket } from './tickets.ts'
 import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
-import { historyContentMatches, nodeId, readNode, snapshot, snapshotDiff } from './history.ts'
+import { historyContentMatches, nodeId, readNode, snapshot } from './history.ts'
+import { DIFF_PAGE_FIELDS, DIFF_PAGE_SCHEMA, NODE_DIFF_SCHEMA, historyDiffOutput, renderDiffPage, type DiffPage } from './history-output.ts'
 import { applicabilityOf, listRecords, readRevision } from './verification.ts'
 import { detectLanguage, enclosingSymbol, findSymbol, normalizeText, parseFile, symbolSpan, syntaxValid } from './ast.ts'
 import { AUDIT_REASONS, AUDIT_STATUSES, auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { runStaticCheck, type CheckSelector } from './check-static.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
+import { validateAttribution, getProject, listProjects, projectBatchMembership } from './projects.ts'
+import type { BatchAttribution } from './ledger.ts'
 
 /** The refusal half of {@link resolveBeforeEvidence}: only failures reach the reply. */
 type BeforeRejection = Extract<Awaited<ReturnType<typeof resolveBeforeEvidence>>, { ok: false }>
@@ -147,6 +152,7 @@ export function normalizeLegacyRollbackArgs(args: Record<string, unknown>): Reco
 // ---------------------------------------------------------------------------
 
 interface ApplyParams {
+  attribution?: BatchAttribution
   exec?: ForgeExec
   abs: string
   workdir: string
@@ -217,6 +223,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   const { abs, workdir, steps, reason, actor, mode } = params
   const store = storeFor(workspaceForFile(abs, workdir))
   const workspace = store.root
+  validateAttribution(workspace, params.attribution ?? {})
   await prepareWorkspace(store, params.exec)
   const rel = relForward(workspace, abs)
   const exists = existsSync(abs)
@@ -273,6 +280,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
         ...(params.revertOnSyntaxError ? { revertOnSyntaxError: true } : {}),
         ...(params.verify?.length ? { verify: [...params.verify] } : {}),
         sourceHash: hash,
+        ...(params.attribution ? { attribution: params.attribution } : {}),
         workdir,
         decisions: params.pinned ?? [],
       })
@@ -336,6 +344,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   let batch: ReturnType<typeof recordBatch>
   try {
     batch = await withNativeWrite(params.exec, [abs], () => {
+      validateAttribution(workspace, params.attribution ?? {})
       if ((existsSync(abs) ? sha256(readFileSync(abs)) : '') !== hash) throw new Error('file changed while planning; nothing written')
       if (rawBuf) {
         const known = readKnownState(store, rel)
@@ -343,7 +352,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
       }
       const after = putBlob(store, newRaw).id
       return commitFiles(store, {
-        kind: 'edit', reason, actor,
+        kind: 'edit', reason, actor, ...(params.attribution ? { attribution: params.attribution } : {}),
         nodes: [{ file: rel, op, before, after, bytes: newRaw.length, eol: enc.eol, bom: enc.bom }],
       }, [{ file: abs, before: rawBuf, after: newRaw }])
     })
@@ -424,24 +433,27 @@ export function createEditTool(pool: FinderPool) {
   return {
     name: 'ff_edit',
     description:
-      'Edit text after reading it. For one literal replacement pass find/replaceWith directly; multi-step edits use steps. All steps use ORIGINAL snapshot lines; overlaps fail. Prefer expect anchors or target matching. An ambiguous target writes nothing: it returns a ticket, and you apply the saved batch by resending ff_edit with that ticket plus choice (never steps). ' +
+      'Edit text after reading it. receipt=diff includes snapshot-bound local hunks; continue incomplete output through ff_history. For one literal replacement pass find/replaceWith directly; multi-step edits use steps. All steps use ORIGINAL snapshot lines; overlaps fail. Prefer expect anchors or target matching. An ambiguous target writes nothing: it returns a ticket, and you apply the saved batch by resending ff_edit with that ticket plus choice (never steps). ' +
       'Replacement text quoting the range\'s first and last lines keeps them. Create files with insert after=0. ' +
       'Preserves UTF-8 CRLF/LF/BOM; refuses binary files. Exact sourceSymbol edits share this commit, audit and verify pipeline; code transfers use ff_file.',
     parameters: {
       path: { type: 'string', description: 'File path (absolute or workspace-relative). Required unless answering a ticket.' },
+      receipt: { type: 'string', enum: ['summary', 'diff'], description: 'Default summary; diff appends the committed snapshot patch. Also allowed on ticket replies.' },
       sourceSymbol: { type: 'string', description: 'Exact symbol name or qualified name. Exclusive with steps and find/replaceWith.' },
-      includeLeadingComment: { type: 'boolean', description: 'Include leading comment in selected symbol span. Default true; requires sourceSymbol.' },
+      includeLeadingComment: { type: 'boolean', description: 'Keep the symbol leading comment. Default true.' },
       edit: { type: 'string', enum: ['replace', 'delete', 'insert_before', 'insert_after'], description: 'Required with sourceSymbol.' },
       content: { type: 'string', description: 'Required for symbol edit except delete; literal UTF-8 text.' },
       find: { type: 'string', description: 'Shorthand for one step: literal block to locate (whole-line match).' },
       replaceWith: { type: 'string', description: 'Replacement for find; empty deletes the block.' },
       steps: { type: 'array', items: STEP_ITEM_SCHEMA, description: '1–50 steps; omit with the find/replaceWith shorthand.' },
       reason: { type: 'string', description: 'Why this change; recorded in history. Required unless answering a ticket.' },
+      projectId: { type: 'string', description: 'Optional explicit project attribution in this workspace; never inferred from GUI selection.' },
+      taskId: { type: 'string', description: 'Optional task in projectId. Requires projectId; archived tasks/projects refuse construction.' },
       revertOnSyntaxError: { type: 'boolean', description: 'Default false: reject introduced syntax errors in a clean file; dirty files stay report-only.' },
       ticket: { type: 'string', description: 'Ticket id from an ambiguous ff_edit. Applies that saved batch; requires a path-less resend carrying choice.' },
-      choice: { type: 'string', description: 'Ticket only: one candidate index ("2"), several unique indexes ("2,3" or "#2 #3"), or "all" for every candidate.' },
-      snapshotId: { type: 'string', description: 'Optional: a content-bound baseline from ff_trace capture=true. Validated (same workspace, file covered, bytes unchanged); a mismatch refuses the write instead of editing a file that is no longer what the baseline saw. Omit for an ordinary edit.' },
-      verify: { type: 'array', items: { type: 'string', enum: ['bridge', 'ipc', 'syntax'] }, description: 'After this batch lands, run these static checks over it and append a verdict with coverage (bridge: expose/IPC member surface compared by identity; syntax: the changed files parse; ipc: endpoint pairing). The verdict is archived, so ff_history checks=true can show it later. Costs a workspace scan — the [audit] line already covers the changed files, so ask for this when a formal verdict for the whole batch is wanted.' },
+      choice: { type: 'string', description: 'Ticket only: one index, "2,3", or "all".' },
+      snapshotId: { type: 'string', description: 'Baseline from ff_trace capture=true; the write is refused if those bytes moved.' },
+      verify: { type: 'array', items: { type: 'string', enum: ['bridge', 'ipc', 'syntax'] }, description: 'Run static checks over it once the batch lands; the verdict is archived for ff_history checks=true. Costs a workspace scan — the [audit] line already covers the changed files.' },
     },
     output: {
       schema: {
@@ -451,6 +463,9 @@ export function createEditTool(pool: FinderPool) {
           status: { type: 'string', required: true },
           workspace: { type: 'string' },
           batch: { type: 'integer' },
+          diff: DIFF_PAGE_SCHEMA,
+          receiptComplete: { type: 'boolean' },
+          receiptRef: { type: 'string' },
           file: { type: 'string' },
           applied: { type: 'integer' },
           skipped: { type: 'integer' },
@@ -536,7 +551,7 @@ export function createEditTool(pool: FinderPool) {
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { status: string; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; audit?: EditAudit; beforeEvidence?: { snapshotId: string; verified: boolean }; verification?: { status: string; text: string; id?: string; persisted?: boolean }; note?: string }) => {
+      render: (_args: unknown, value: { status: string; diff?: DiffPage; batch?: number; applied?: number; skipped?: number; created?: boolean; externalBatch?: number; syntaxWarning?: string; ticket?: string; candidates?: Array<{ index: number; start: number; end: number; symbol?: string | null; preview: string }>; reports?: StepReport[]; audit?: EditAudit; beforeEvidence?: { snapshotId: string; verified: boolean }; verification?: { status: string; text: string; id?: string; persisted?: boolean }; note?: string }) => {
         const lines: string[] = []
         if (value.status === 'ticket') {
           lines.push(`ambiguous target — nothing written; ticket ${value.ticket} signed. Apply it with ff_edit {ticket: "${value.ticket}", choice: <index>} (no path, no steps)`)
@@ -547,6 +562,9 @@ export function createEditTool(pool: FinderPool) {
           lines.push(`applied ${value.applied ?? 0} step(s)${value.skipped ? `, skipped ${value.skipped}` : ''}${value.created ? ' (file created)' : ''}${value.batch ? ` — batch #${value.batch} in the ledger` : ''}${value.externalBatch ? ` (external change snapshotted as batch #${value.externalBatch} first)` : ''}`)
           for (const r of value.reports ?? []) {
             if (r.status === 'skipped' && !r.reason) continue
+            // The patch already shows successful ranges. Preserve exceptional
+            // resolution details; avoid repeating ordinary applied coordinates.
+            if (value.diff && r.status === 'applied' && !r.reason && !r.drift && !r.anchorsPreserved && !r.indentShifted && !r.symbol) continue
             const bits: string[] = [r.op, r.status]
             if (r.drift) bits.push(`drift ${r.drift > 0 ? '+' : ''}${r.drift}`)
             if (r.anchorsPreserved) bits.push('anchors kept')
@@ -562,6 +580,7 @@ export function createEditTool(pool: FinderPool) {
         if (value.audit) lines.push(...renderAudit(value.audit as Parameters<typeof renderAudit>[0]))
         if (value.verification) lines.push(value.verification.text)
         if (value.note) lines.push(`[${value.note}]`)
+        if (value.diff) lines.push(...renderDiffPage(value.diff))
         return text(lines.join('\n'))
       },
     },
@@ -581,10 +600,11 @@ export function createEditTool(pool: FinderPool) {
     },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const allowed = new Set(['path', 'find', 'replaceWith', 'steps', 'reason', 'revertOnSyntaxError', 'ticket', 'choice', 'snapshotId', 'verify', 'sourceSymbol', 'includeLeadingComment', 'edit', 'content'])
+      const allowed = new Set(['receipt', 'path', 'find', 'replaceWith', 'steps', 'reason', 'revertOnSyntaxError', 'ticket', 'choice', 'snapshotId', 'verify', 'sourceSymbol', 'includeLeadingComment', 'edit', 'content', 'projectId', 'taskId'])
       for (const key of Object.keys(args)) if (!allowed.has(key)) return failure(`${key} is not a parameter of ff_edit`)
       for (const key of ['revertOnSyntaxError', 'includeLeadingComment']) if (args[key] !== undefined && typeof args[key] !== 'boolean') return failure(`${key} must be boolean`)
       for (const key of ['path', 'reason', 'snapshotId']) if (args[key] !== undefined && typeof args[key] !== 'string') return failure(`${key} must be a string`)
+      if (args.receipt !== undefined && !['summary', 'diff'].includes(String(args.receipt))) return failure('receipt must be summary or diff')
       const ticketId = typeof args.ticket === 'string' ? args.ticket.trim() : ''
       if (ticketId !== '') {
         // Answering a ticket is the same tool, a different job: the saved batch
@@ -592,9 +612,9 @@ export function createEditTool(pool: FinderPool) {
         // carries steps would apply two intents at once. Any other argument is
         // refused by name — a silently ignored `all` is how a caller ends up
         // believing it answered a question it did not answer.
-        const foreign = Object.keys(args).filter((key) => args[key] !== undefined && key !== 'ticket' && key !== 'choice')
+        const foreign = Object.keys(args).filter((key) => args[key] !== undefined && key !== 'ticket' && key !== 'choice' && key !== 'receipt')
         if (foreign.length > 0) {
-          return failure(`a ticket reply takes only {ticket, choice} — drop ${foreign.map((key) => `"${key}"`).join(', ')}`)
+          return failure(`a ticket reply takes only {ticket, choice, receipt?} — drop ${foreign.map((key) => `"${key}"`).join(', ')}`)
         }
         return decideTicket(pool, ticketId, args, exec)
       }
@@ -653,12 +673,13 @@ export function createEditTool(pool: FinderPool) {
       // exactly the window the check exists to close.
       const committed: ApplyResult | { throwable: string } | { beforeRejected: BeforeRejection } = await withFileLock(storeFor(workdir).dir, () => withFileLock(abs, async () => {
         try {
+          const attribution = validateAttribution(workdir, args)
           if (snapshotId !== '') {
             await prepareWorkspace(storeFor(workspaceForFile(abs, workdir)), exec)
             const before = resolveBeforeEvidence(workdir, snapshotId, abs)
             if (!before.ok) return { beforeRejected: before }
           }
-          return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), mode: 'atomic', exec, verify: verify.checks, symbolEdit, revertOnSyntaxError: symbolEdit !== undefined || args.revertOnSyntaxError === true })
+          return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), attribution, mode: 'atomic', exec, verify: verify.checks, symbolEdit, revertOnSyntaxError: symbolEdit !== undefined || args.revertOnSyntaxError === true })
         } catch (cause) { return { throwable: causeMessage(cause) } }
       }))
       if ('throwable' in committed) return failure(committed.throwable)
@@ -669,7 +690,7 @@ export function createEditTool(pool: FinderPool) {
         // not read as "this edit is forbidden".
         return failure(`snapshot ${snapshotId} rejected before writing (${before.reason}): ${before.detail}`)
       }
-      return await shapeCommitted(committed, { workdir, abs, steps, exec, verify: verify.checks, ...(snapshotId !== '' ? { beforeSnapshot: snapshotId } : {}) })
+      return await shapeCommitted(committed, { workdir, abs, steps, exec, receipt: args.receipt === 'diff', verify: verify.checks, ...(snapshotId !== '' ? { beforeSnapshot: snapshotId } : {}) })
     },
   } as const
 }
@@ -731,6 +752,7 @@ async function decideTicket(pool: FinderPool, id: string, args: Record<string, u
     try {
       const live = loadTicket(id)
       if ('error' in live) return { throwable: live.error }
+      validateAttribution(workdir, ticket.attribution ?? {})
       await prepareWorkspace(storeFor(workspaceForFile(abs, workdir)), exec)
       // All choices refer to one original snapshot; any drift requires a new decision.
       const stillThere = existsSync(abs) && sha256(readFileSync(abs)) === ticket.sourceHash
@@ -746,6 +768,7 @@ async function decideTicket(pool: FinderPool, id: string, args: Record<string, u
           mode: 'atomic',
           ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}),
           verify: ticket.verify,
+          attribution: ticket.attribution,
           exec,
           pinned: [...ticket.decisions, ...chosen.map(candidate => ({ ...candidate, stepIndex: ticket.stepIndex }))],
         })
@@ -759,7 +782,7 @@ async function decideTicket(pool: FinderPool, id: string, args: Record<string, u
       // Invalidated — re-plan against current content.
       deleteTicket(id)
       const fresh = await applyBatch(pool, { abs, workdir, steps: ticket.steps, reason: ticket.reason,
-        actor: actorOf(exec), mode: 'atomic', noWrite: true, exec, verify: ticket.verify,
+        actor: actorOf(exec), attribution: ticket.attribution, mode: 'atomic', noWrite: true, exec, verify: ticket.verify,
         ...(ticket.revertOnSyntaxError === true ? { revertOnSyntaxError: true } : {}) })
       return { fresh }
     } catch (cause) { return { throwable: causeMessage(cause) } }
@@ -767,10 +790,10 @@ async function decideTicket(pool: FinderPool, id: string, args: Record<string, u
   if ('throwable' in committed) return failure(committed.throwable)
   if ('fresh' in committed) {
     return 'ticket' in committed.fresh
-      ? shapeCommitted(committed.fresh, { workdir, abs, steps: ticket.steps, kind: 'ticket', verify: ticket.verify, exec })
+      ? shapeCommitted(committed.fresh, { workdir, abs, steps: ticket.steps, kind: 'ticket', verify: ticket.verify, exec, receipt: args.receipt === 'diff' })
       : failure(!committed.fresh.ok && 'error' in committed.fresh ? committed.fresh.error : 'ticket invalidated; re-send ff_edit against current content')
   }
-  return shapeCommitted(committed.result, { workdir, abs, steps: ticket.steps, kind: 'ticket', verify: ticket.verify, exec })
+  return shapeCommitted(committed.result, { workdir, abs, steps: ticket.steps, kind: 'ticket', verify: ticket.verify, exec, receipt: args.receipt === 'diff' })
 }
 
 /** Project the engine result onto the tool output shape. Hard failures keep
@@ -823,7 +846,7 @@ function shapeApplyResult(result: ApplyResult): Record<string, unknown> {
  * carry no audit at all: pretending to recheck untouched bytes is exactly the
  * "unrun looks like passed" failure the audit status vocabulary exists to stop.
  */
-async function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket'; beforeSnapshot?: string; verify?: readonly CheckSelector[]; exec?: ForgeExec }): Promise<Record<string, unknown>> {
+async function shapeCommitted(result: ApplyResult, context: { workdir: string; abs: string; steps: readonly EditStep[]; kind?: 'edit' | 'ticket'; receipt?: boolean; beforeSnapshot?: string; verify?: readonly CheckSelector[]; exec?: ForgeExec }): Promise<Record<string, unknown>> {
   const shaped = shapeApplyResult(result)
   // Reported even when nothing changed: the caller asked "was this file still
   // the one the baseline described", and that answer is independent of whether
@@ -848,7 +871,37 @@ async function shapeCommitted(result: ApplyResult, context: { workdir: string; a
     syntaxWarning: result.syntaxWarning !== undefined,
   })
   const verification = checks.length > 0 ? await verifyBatch(result.batchId, checks, context.exec) : undefined
-  return { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), audit, ...(verification ? { verification } : {}) }
+  let diff: DiffPage | undefined, diffNote: string | undefined
+  if (context.receipt && result.batchId) {
+    try {
+      const store = storeFor(result.workspace ?? context.workdir)
+      const batch = readLedgerTail(store, Number.MAX_SAFE_INTEGER).find(b => b.id === result.batchId)
+      if (!batch) throw new Error('committed batch unavailable')
+      diff = historyDiffOutput.read(store, batch, batch.nodes.map((node, index) => ({ node, index })), `batch:${batch.id}`)
+    } catch (cause) { diffNote = `edit committed; diff unavailable: ${causeMessage(cause)}. Retrieve ff_history batch=${result.batchId}` }
+  }
+  const receipt = { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), audit, ...(verification ? { verification } : {}),
+    ...(diff ? { diff } : {}), ...(diffNote ? { note: diffNote } : {}) }
+  if (!context.receipt || jsonBytes(receipt) <= OUTPUT_PAGE_BYTES) return receipt
+  let receiptRef: string | undefined
+  try { receiptRef = archiveOutputReceipt(storeFor(result.workspace ?? context.workdir), receipt) }
+  catch { /* A snapshot storage failure cannot undo the already committed edit. */ }
+  // Never turn a committed edit into an error because its optional receipt is
+  // large. Preserve identity/counts/verdicts; explicitly defer the patch.
+  return {
+    status: 'applied', workspace: result.workspace ?? context.workdir, batch: result.batchId,
+    hash: result.hash, applied: result.applied, skipped: result.skipped, receiptComplete: false,
+    ...(receiptRef ? { receiptRef } : {}),
+    ...(result.externalBatchId ? { externalBatch: result.externalBatchId } : {}),
+    ...(result.syntaxWarning ? { syntaxWarning: outputPreview(result.syntaxWarning) } : {}),
+    audit: { status: audit.status, reason: audit.reason },
+    ...(evidence ? { beforeEvidence: evidence } : {}),
+    ...(verification ? { verification: { ...verification, text: outputPreview(verification.text) } } : {}),
+    note: receiptRef
+      ? `edit committed; receipt abbreviated. Read ff_history batch=${result.batchId} detail=receipt receiptRef=${receiptRef} for the complete frozen receipt; diff pages remain available by batch.`
+      : `edit committed; receipt omitted by budget and could not be archived. Step diagnostics are unavailable; ff_history batch=${result.batchId} retrieves the committed patch.`,
+  }
+
 }
 
 /** Which static checks `verify` accepts. The order is the report order. */
@@ -909,10 +962,13 @@ export function createHistoryTool() {
     description:
       'Search persistent change history, newest first: what changed, when, by which actor and why. ' +
       'Pass batch or node for that batch\'s immutable snapshot diffs instead of a listing (independent of the files and of Git). ' +
-      'Returns IDs for ff_rollback. Filters combine; narrow project/path if content scanning is truncated.',
+      'Diffs use 3 context lines and whole-hunk pages. Repeat selection with cursor to continue. For oversized hunks use node + detail=patch and concatenate diff fragments. Returns IDs for ff_rollback. Filters combine; narrow project/path if content scanning is truncated.',
     parameters: {
       batch: { type: 'integer', description: 'Positive batch ID from a previous call: return its nodes\' snapshot diffs, not a listing.' },
       node: { type: 'string', description: 'One node address, e.g. b12:n0: return just that node\'s diff. Mutually exclusive with batch.' },
+      detail: { type: 'string', enum: ['hunks', 'patch', 'record', 'receipt'], description: 'Default hunks. patch requires node; record reads full batch JSON; receipt reads an archived edit receipt using batch + receiptRef. Concatenate fragment strings.' },
+      cursor: { type: 'string', description: 'Diff continuation from the same batch/node/detail; 30 minute TTL. Live file edits do not change frozen snapshots.' },
+      receiptRef: { type: 'string', description: 'Full receipt hash from an abbreviated ff_edit result; requires batch and detail=receipt.' },
       pathContains: { type: 'string', description: 'Substring filter on file paths; not a filesystem path.' },
       keyword: { type: 'string', description: 'Case-insensitive substring filter on reasons.' },
       actor: { type: 'string', description: 'Exact actor (session id) filter.' },
@@ -920,6 +976,10 @@ export function createHistoryTool() {
       content: { type: 'string', description: 'Case-insensitive literal in UTF-8 before/after snapshots; 32MB scan budget.' },
       limit: { type: 'integer', description: 'Max batches (default 20, max 100).' },
       checks: { type: 'boolean', description: 'Attach the archived verification records and their CURRENT applicability. A record that no longer matches its inputs is shown as stale; the recorded verdict itself never changes.' },
+      projectId: { type: 'string', description: 'Filter direct and manually linked batches of this project in the current workspace.' },
+      taskId: { type: 'string', description: 'Task membership filter; requires projectId.' },
+      file: { type: 'string', description: 'Exact workspace-relative file path.' },
+      unassigned: { type: 'boolean', description: 'Only batches without direct project attribution or any manual link; exclusive with projectId.' },
     },
     output: {
       schema: {
@@ -939,22 +999,7 @@ export function createHistoryTool() {
                 actor: { type: 'string', required: true },
                 reason: { type: 'string', required: true },
                 files: { type: 'array', required: true, items: { type: 'string' } },
-                diffs: {
-                  type: 'array',
-                  items: {
-                    type: 'object',
-                    additionalProperties: false,
-                    properties: {
-                      node: { type: 'string', required: true },
-                      file: { type: 'string', required: true },
-                      before: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
-                      after: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
-                      diff: { type: 'string', required: true },
-                      binary: { type: 'boolean', required: true },
-                      truncated: { type: 'boolean', required: true },
-                    },
-                  },
-                },
+                diffs: { type: 'array', items: NODE_DIFF_SCHEMA },
                 checks: {
                   type: 'array',
                   items: {
@@ -973,11 +1018,12 @@ export function createHistoryTool() {
               },
             },
           },
+          page: { type: 'object', additionalProperties: false, properties: DIFF_PAGE_FIELDS },
           checksNote: { type: 'string' },
           note: { type: 'string' },
         },
       },
-      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: Array<{ node: string; diff: string; truncated: boolean }>; checks?: Array<{ id: string; recorded: string; applicable: boolean; effective: string; provenance: string; finishedAt: string; drifted?: string[]; detail?: string }> }>; note?: string; checksNote?: string }) => {
+      render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: DiffPage['diffs']; checks?: Array<{ id: string; recorded: string; applicable: boolean; effective: string; provenance: string; finishedAt: string; drifted?: string[]; detail?: string }> }>; note?: string; checksNote?: string; page?: Omit<DiffPage, 'diffs'> }) => {
         if (value.items.length === 0) return text('no ledger entries matched')
         const lines = value.items.map((b) => {
           const head = `#${b.batch} ${b.ts} ${b.kind} by ${b.actor.slice(0, 12)}… — ${b.reason}\n    ${b.files.join(', ')}`
@@ -988,7 +1034,7 @@ export function createHistoryTool() {
             const drift = c.drifted?.length ? ` — drifted: ${c.drifted.join(', ')}` : ''
             return `    [check ${c.id}] recorded ${c.recorded} (${c.provenance}, ${c.finishedAt}); now: ${c.effective}${c.applicable ? '' : ' (not applicable)'}${drift}${c.detail ? ` — ${c.detail}` : ''}`
           })
-          const body = b.diffs?.length ? b.diffs.map((d) => `${d.node}${d.truncated ? ' [truncated]' : ''}\n${d.diff}`) : []
+          const body = b.diffs?.length || value.page?.record !== undefined ? renderDiffPage({ diffs: b.diffs ?? [], complete: true, total: 0, returned: 0, ...value.page }) : []
           return [head, ...checks, ...body].join('\n')
         })
         if (value.note) lines.push(`[${value.note}]`)
@@ -997,14 +1043,21 @@ export function createHistoryTool() {
     },
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const allowed = new Set(['batch', 'node', 'pathContains', 'keyword', 'actor', 'kind', 'content', 'limit', 'checks'])
+      const allowed = new Set(['detail', 'cursor', 'receiptRef', 'batch', 'node', 'pathContains', 'keyword', 'actor', 'kind', 'content', 'limit', 'checks', 'projectId', 'taskId', 'file', 'unassigned'])
       for (const key of Object.keys(args)) if (!allowed.has(key)) return failure(`${key} is not a parameter of ff_history`)
       for (const key of ['node', 'pathContains', 'keyword', 'actor', 'content']) if (args[key] !== undefined && typeof args[key] !== 'string') return failure(`${key} must be a string`)
       if (args.checks !== undefined && typeof args.checks !== 'boolean') return failure('checks must be boolean')
       if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) return failure('limit must be an integer between 1 and 100')
       if (args.kind !== undefined && !['edit', 'rollback', 'external', 'project'].includes(String(args.kind))) return failure('invalid history kind')
-      if ((args.batch !== undefined || args.node !== undefined) && ['pathContains', 'keyword', 'actor', 'kind', 'content', 'limit'].some(key => args[key] !== undefined)) return failure('batch/node diff selection is exclusive with listing filters')
-      const store = storeFor(canonicalWorkspace(workdirOf(exec)))
+      if ((args.batch !== undefined || args.node !== undefined) && ['pathContains', 'keyword', 'actor', 'kind', 'content', 'limit', 'projectId', 'taskId', 'file', 'unassigned'].some(key => args[key] !== undefined)) return failure('batch/node diff selection is exclusive with listing filters')
+      if (args.detail !== undefined && !['hunks', 'patch', 'record', 'receipt'].includes(String(args.detail))) return failure('detail must be hunks, patch, record or receipt')
+      if (args.cursor !== undefined && (typeof args.cursor !== 'string' || !args.cursor)) return failure('cursor must be a nonempty string')
+      if ((args.detail !== undefined || args.cursor !== undefined) && args.batch === undefined && args.node === undefined) return failure('detail/cursor require batch or node')
+      if (args.detail === 'patch' && args.node === undefined) return failure('detail=patch requires node')
+      if (args.detail === 'receipt' && (args.batch === undefined || typeof args.receiptRef !== 'string' || !/^[a-f0-9]{64}$/.test(args.receiptRef))) return failure('detail=receipt requires batch and a full receiptRef hash')
+      if (args.receiptRef !== undefined && args.detail !== 'receipt') return failure('receiptRef requires detail=receipt')
+      const workdir = canonicalWorkspace(workdirOf(exec))
+      const store = storeFor(workdir)
       const wantChecks = args.checks === true
       const checksFor = (batchId: number) => {
         if (!wantChecks) return undefined
@@ -1040,43 +1093,63 @@ export function createHistoryTool() {
             if (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1) return failure('batch must be a positive integer')
             const found = readLedgerTail(store, Number.MAX_SAFE_INTEGER).find((b) => b.id === args.batch)
             if (!found) return failure(`batch ${String(args.batch)} not found`)
-            if (found.nodes.length > 50) return failure('batch has more than 50 nodes; query individual nodes')
+            if (!['record', 'receipt'].includes(String(args.detail)) && found.nodes.length > 50) return failure('batch has more than 50 nodes; query individual nodes')
             return { batch: found, picks: found.nodes.map((node, index) => ({ node, index })) }
           }
           const selected = pick()
           if ('error' in selected) return selected
           const b = selected.batch
-          return {
-            items: [{
-              batch: b.id,
-              ts: new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19),
-              kind: b.kind,
-              actor: b.actor,
-              reason: b.reason,
-              files: b.nodes.map((n) => `${n.file} (${n.op}, ${n.bytes}B)`),
-              diffs: selected.picks.map(({ node, index }) => ({
-                node: nodeId(b.id, index),
-                file: node.file,
-                before: node.before,
-                after: node.after,
-                ...snapshotDiff(snapshot(store, node.before), snapshot(store, node.after), node.file),
-              })),
+          let archived: string | undefined
+          if (args.detail === 'receipt') {
+            archived = readOutputReceipt(store, args.receiptRef as string)
+            const parsed = JSON.parse(archived)
+            if (parsed.batch !== b.id || parsed.status !== 'applied') throw new Error('receiptRef does not identify a receipt for this batch')
+          }
+          const { diffs, ...page } = archived !== undefined
+            ? historyDiffOutput.record(archived, JSON.stringify([store.root, b.id, 'receipt', args.receiptRef]), args.cursor as string | undefined)
+            : historyDiffOutput.read(store, b, selected.picks,
+            args.node !== undefined ? `node:${args.node}` : `batch:${b.id}`,
+            { detail: args.detail as 'hunks' | 'patch' | 'record' | undefined, cursor: args.cursor as string | undefined })
+          const record = args.detail === 'record' || args.detail === 'receipt'
+          const result = {
+            page,
+            items: [{ batch: b.id, ts: new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19), kind: b.kind,
+              actor: record ? '' : b.actor, reason: record ? '' : outputPreview(b.reason),
+              files: diffs.map(d => d.file), diffs,
               ...(wantChecks ? { checks: checksFor(b.id) ?? [] } : {}),
             }],
+            ...(!record && outputPreview(b.reason) !== b.reason ? { note: `reason preview truncated; ff_history batch=${b.id} detail=record reads complete batch metadata` } : {}),
             ...(checksNote === undefined ? {} : { checksNote }),
           }
+          return boundedOutput(result, `read ff_history batch=${b.id} detail=record without checks, or select one node`)
+
         } catch (cause) { return failure(causeMessage(cause)) }
       }
       const limit = clampInt(args.limit, 20, 1, 100)
       const content = typeof args.content === 'string' && args.content.trim() ? args.content : undefined
       const budget = { remaining: 32 * 1024 * 1024 }
+      const scoped = args.projectId !== undefined || args.taskId !== undefined || args.file !== undefined || args.unassigned !== undefined
+      let scopeMatch: ((batch: ReturnType<typeof readLedgerTail>[number]) => boolean) | undefined
+      try {
+        for (const key of ['projectId', 'taskId', 'file']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !String(args[key]).trim())) throw new Error(`${key} must be nonempty`)
+        if (args.unassigned !== undefined && typeof args.unassigned !== 'boolean') throw new Error('unassigned must be boolean')
+        if (args.taskId && !args.projectId) throw new Error('taskId requires projectId')
+        if (args.projectId && args.unassigned) throw new Error('projectId and unassigned are exclusive')
+        const project = args.projectId ? getProject(workdir, String(args.projectId)) : undefined
+        const projects = args.unassigned ? listProjects({ workspace: workdir }) : []
+        scopeMatch = batch => (!project || !!projectBatchMembership(project, batch, args.taskId as string | undefined))
+          && (!args.file || batch.nodes.some(n => n.file === args.file))
+          && (!args.unassigned || !batch.attribution && !projects.some(p => p.links.some(l => l.batchId === batch.id)))
+      } catch (cause) { return failure(causeMessage(cause)) }
       let batches = searchHistory(store, {
         path: typeof args.pathContains === 'string' && args.pathContains.trim() !== '' ? args.pathContains.trim() : undefined,
         keyword: typeof args.keyword === 'string' && args.keyword.trim() !== '' ? args.keyword.trim() : undefined,
         actor: typeof args.actor === 'string' && args.actor.trim() !== '' ? args.actor.trim() : undefined,
         kind: args.kind === 'edit' || args.kind === 'rollback' || args.kind === 'external' || args.kind === 'project' ? args.kind : undefined,
-        limit: content ? Number.MAX_SAFE_INTEGER : limit,
+        limit: content || scoped ? Number.MAX_SAFE_INTEGER : limit,
       })
+      if (scopeMatch) batches = batches.filter(scopeMatch)
+      if (!content) batches = batches.slice(0, limit)
       if (content) {
         try { batches = batches.filter(batch => historyContentMatches(store, batch, content, budget)).slice(0, limit) }
         catch (cause) { return failure(causeMessage(cause)) }
@@ -1130,6 +1203,7 @@ export function createRollbackTool(pool: FinderPool) {
       dryRun: { type: 'boolean', description: 'Default true (plan only); false writes the rollback.' },
       reason: { type: 'string', required: true, description: 'Why this rollback; recorded in history.' },
       node: { type: 'string', description: 'With batch only: one node (e.g. b12:n0) that belongs to that batch.' },
+      version: { type: 'string', enum: ['before', 'after'], description: 'With explicit batch + node only: restore this file to the node before/after snapshot. Does not affect other files.' },
     },
     output: {
       schema: {
@@ -1173,7 +1247,7 @@ export function createRollbackTool(pool: FinderPool) {
       if (reason === '') {
         return failure('reason is required for every construction step (development-history ledger). Re-send with e.g. {"batch": "last", "dryRun": false, "reason": "revert: approach X broke login"}')
       }
-      const allowed = new Set(['batch', 'latest', 'throughBatch', 'path', 'dryRun', 'reason', 'node'])
+      const allowed = new Set(['batch', 'latest', 'throughBatch', 'path', 'dryRun', 'reason', 'node', 'version'])
       for (const key of Object.keys(args)) if (!allowed.has(key)) return failure(`${key} is not a parameter of ff_rollback`)
       for (const key of ['latest', 'dryRun']) if (args[key] !== undefined && typeof args[key] !== 'boolean') return failure(`${key} must be boolean`)
       if (args.batch !== undefined && (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1)) return failure('batch must be a positive integer')
@@ -1181,6 +1255,7 @@ export function createRollbackTool(pool: FinderPool) {
       if ([args.batch !== undefined, args.latest === true, args.throughBatch !== undefined].filter(Boolean).length !== 1) return failure('provide exactly one of batch, latest=true or throughBatch')
       if (args.latest !== undefined && args.latest !== true && (args.batch !== undefined || args.throughBatch !== undefined)) return failure('omit latest when selecting batch or throughBatch')
       for (const key of ['path', 'node']) if (args[key] !== undefined && typeof args[key] !== 'string') return failure(`${key} must be a string`)
+      if (args.version !== undefined && (args.version !== 'before' && args.version !== 'after' || args.batch === undefined || args.node === undefined || args.path !== undefined)) return failure('version requires explicit batch + node, before|after, and no path filter')
       const dryRun = args.dryRun !== false
       const pathFilter = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
       const workdir = canonicalWorkspace(workdirOf(exec))
@@ -1246,7 +1321,8 @@ export function createRollbackTool(pool: FinderPool) {
             const abs = path.resolve(store.root, node.file)
             if (isSymbolicLink(abs)) return failure(`rollback refuses symbolic link identity: ${abs}`)
             const exists = existsSync(abs)
-            if (node.op === 'external') {
+            if (node.op === 'external' && args.version === 'before') return failure('external marker has no known before snapshot')
+            if (node.op === 'external' && args.version === undefined) {
               plan.push({ rel: node.file, abs, action: 'skip', targetBlob: null, currentBlob: null, bytes: 0, eol: 'LF', bom: false, detail: 'external marker — nothing to restore' })
               continue
             }
@@ -1265,11 +1341,12 @@ export function createRollbackTool(pool: FinderPool) {
                 return failure(`cannot read ${abs}: ${causeMessage(cause)}`)
               }
             }
-            if (node.before === null) {
-              plan.push({ rel: node.file, abs, action: 'delete', targetBlob: null, currentBlob, bytes: 0, eol: curEol, bom: curBom, detail: `file was created by batch #${target.id}` })
+            const targetBlob = args.version === 'after' ? node.after : node.before
+            if (targetBlob === null) {
+              plan.push({ rel: node.file, abs, action: 'delete', targetBlob: null, currentBlob, bytes: 0, eol: curEol, bom: curBom, detail: `file absent in ${args.version ?? 'before'} snapshot of batch #${target.id}` })
               continue
             }
-            const restored = getBlob(store, node.before)
+            const restored = getBlob(store, targetBlob)
             if (!restored) {
               return failure(`snapshot blob for ${node.file} (batch #${target.id}) is missing — was the store pruned?`)
             }
@@ -1277,12 +1354,12 @@ export function createRollbackTool(pool: FinderPool) {
             plan.push({
               rel: node.file, abs,
               action: 'restore',
-              targetBlob: node.before,
+              targetBlob,
               currentBlob,
               bytes: restored.length,
               eol: targetEnc.eol,
               bom: targetEnc.bom,
-              detail: `restore ${restored.length}B snapshot`,
+              detail: `restore ${restored.length}B ${args.version ?? 'before'} snapshot`,
             })
           }
     

@@ -65,7 +65,7 @@ async function mount(config) {
   const host = await mount(undefined)
   // Wiring remains full-only; the default surface registers exactly three retrieval tools.
   assert.deepEqual(host.definitions.map((definition) => definition.name), ['ff_find', 'ff_grep', 'ff_symbols'])
-  assert.deepEqual(host.listeners, ['tools/execute'])
+  assert.deepEqual(host.listeners, ['tools/execute', 'session/event', 'tools/result'])
   assert.deepEqual(host.definitions.find((definition) => definition.name === 'ff_find').parameters.properties, {
     pattern: host.definitions.find((definition) => definition.name === 'ff_find').parameters.properties.pattern,
     path: host.definitions.find((definition) => definition.name === 'ff_find').parameters.properties.path,

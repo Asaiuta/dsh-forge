@@ -16,8 +16,15 @@ export function symbolReader(createReadTool) {
       }
       if (typeof file !== 'string' || typeof wanted !== 'string' || wanted.trim() === '') return { error: 'path and symbol are required' }
 
-      const parsed = await outline.execute({ path: file }, exec)
+      const parsed = await outline.execute({ path: file, scope: 'all' }, exec)
       if (parsed.error) return { error: parsed.error }
+      let cursor = parsed.page.nextCursor
+      while (cursor) {
+        const next = await outline.execute({ path: file, scope: 'all', cursor }, exec)
+        if (next.error) return { error: next.error }
+        parsed.items.push(...next.items)
+        cursor = next.page.nextCursor
+      }
       const query = wanted.trim().replace(/::/g, '.')
       // Exact qualified addresses win outright: only when nothing carries the
       // full address does a bare simple name act as a filter. A union here

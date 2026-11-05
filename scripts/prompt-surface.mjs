@@ -3,6 +3,17 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 
+/** SDK rc.2 kept projections on ToolRuntime; installed 0.2.2 splits PTC out. */
+export async function promptSdk() {
+  const modules = process.env.DSH_FORGE_DSH_MODULES
+  const sdk = modules ? await import(pathToFileURL(path.join(modules, 'dsh-tools/lib/index.js')).href) : await import('@deepseek-ai/dsh-tools')
+  const ptc = typeof sdk.renderToolsSdk === 'function' ? sdk
+    : modules ? await import(pathToFileURL(path.join(modules, 'dsh-tool-executor-ptc/lib/index.js')).href) : await import('@deepseek-ai/dsh-tool-executor-ptc')
+  const project = typeof sdk.projectToolSchema === 'function' ? definition => sdk.projectToolSchema(definition, true)
+    : definition => sdk.ToolRuntime.prototype.schemaOf.call({}, definition, true)
+  return { project, renderToolsSdk: ptc.renderToolsSdk, renderToolsSdkPy: ptc.renderToolsSdkPy }
+}
+
 export async function promptSurface({ config, plugin, visibleNames } = {}) {
   const { apply } = await import(plugin ? pathToFileURL(path.resolve(plugin)).href : new URL('../lib/index.js', import.meta.url).href)
   const definitions = [], scoped = [], commands = [], disposers = [], sections = []
@@ -30,10 +41,8 @@ export async function promptSurface({ config, plugin, visibleNames } = {}) {
   try {
     for (const dispose of apply(host, config)) if (typeof dispose === 'function') disposers.push(dispose)
     const visible = [...definitions, ...scoped].filter(d => !allowed || allowed.has(d.name))
-    const sdk = process.env.DSH_FORGE_DSH_MODULES
-      ? await import(pathToFileURL(`${process.env.DSH_FORGE_DSH_MODULES}/dsh-tools/lib/index.js`).href)
-      : await import('@deepseek-ai/dsh-tools')
-    const schemas = visible.map(definition => sdk.ToolRuntime.prototype.schemaOf.call({}, definition, true))
+    const sdk = await promptSdk()
+    const schemas = visible.map(sdk.project)
     const outputs = schemas.map((schema, index) => ({ ...schema, output: visible[index].output.schema }))
     const native = JSON.stringify(schemas)
     // Subtract the renderer's empty preamble: only this plugin's contribution.
@@ -42,9 +51,8 @@ export async function promptSurface({ config, plugin, visibleNames } = {}) {
     const emptyTypescript = sdk.renderToolsSdk([])
     const emptyPython = sdk.renderToolsSdkPy([])
     const require = createRequire(import.meta.url)
-    let getEncoding
-    try { ({ getEncoding } = require('js-tiktoken')) } catch { /* optional tokenizer */ }
-    const tokenizers = getEncoding ? Object.fromEntries(['cl100k_base', 'o200k_base'].map(name => [name, getEncoding(name)])) : {}
+    const { getEncoding } = require('js-tiktoken')
+    const tokenizers = Object.fromEntries(['cl100k_base', 'o200k_base'].map(name => [name, getEncoding(name)]))
     const renderedSections = sections.map(section => ({ name: section.name, order: section.order,
       text: typeof section.text === 'function' ? section.text({ scope: agent.ctx }) : section.text }))
     const guidance = renderedSections.map(section => section.text).filter(Boolean).join('\n\n')
@@ -52,12 +60,12 @@ export async function promptSurface({ config, plugin, visibleNames } = {}) {
     const metrics = Object.fromEntries(Object.entries(texts).map(([name, value]) => {
       const empty = name === 'ptcTypescript' ? emptyTypescript : name === 'ptcPython' ? emptyPython : ''
       const bytes = Buffer.byteLength(value) - Buffer.byteLength(empty)
-      return [name, { bytes, estTokens: Math.ceil(bytes / 4), ...Object.fromEntries(
+      return [name, { bytes, ...Object.fromEntries(
         Object.entries(tokenizers).map(([name, tokenizer]) => [name, tokenizer.encode(value).length - tokenizer.encode(empty).length]),
       ) }]
     }))
-    return { registration: config?.registration ?? 'additive', sdk: process.env.DSH_FORGE_DSH_MODULES ?? 'development dependency',
-      schemas, sections: renderedSections, commands: commands.map(({ name, description }) => ({ name, description })), texts, metrics }
+    return { surface: config?.surface ?? 'retrieval', sdk: process.env.DSH_FORGE_DSH_MODULES ?? 'development dependency',
+      schemas, outputs, sections: renderedSections, commands: commands.map(({ name, description }) => ({ name, description })), texts, metrics }
   } finally {
     for (const dispose of disposers.reverse()) await dispose()
   }

@@ -9,6 +9,7 @@ import { resolveBeforeEvidence } from './tools-trace.ts'
 import { findSymbol, parseFile, normalizeText, symbolSpan, syntaxValid, detectLanguage } from './ast.ts'
 import { applyEditSteps } from './edit-engine.ts'
 import { isSymbolicLink } from './fs-paths.ts'
+import { validateAttribution } from './projects.ts'
 
 /** Leading spaces of the nearest usable line at/after the insertion point (then before),
  *  skipping the moved range in same-file moves and tab-indented lines — space re-indent only.
@@ -107,7 +108,7 @@ function validateFileArgs(args: Record<string, unknown>): void {
   const action = required(args, 'action')
   const fields = FILE_FIELDS[action]
   if (!fields) throw new Error(`unknown file action: ${action}; symbol editing belongs to ff_edit`)
-  const allowed = new Set(['action', 'path', 'reason', 'snapshotId', ...fields])
+  const allowed = new Set(['action', 'path', 'reason', 'snapshotId', 'projectId', 'taskId', ...fields])
   for (const key of Object.keys(args)) {
     if (!allowed.has(key)) throw new Error(`${key} is not allowed for action=${action}`)
     if (args[key] === undefined) continue
@@ -133,23 +134,25 @@ function validateFileArgs(args: Record<string, unknown>): void {
 export function createFileTool() {
   return {
     name: 'ff_file',
-    description: 'Create/remove/move files or transfer exact symbols/line ranges in an atomic recoverable batch. Paths stay inside the workspace; parents must exist. Read before writing. Every action strictly rejects unrelated parameters. Symbol editing belongs to ff_edit.',
+    description: 'Create/remove/move files or transfer a symbol/line range atomically. Paths stay inside the workspace; parents must exist. Read before writing. create takes content; move takes destination; copy_code/move_code take sourceSymbol|fromLines plus one of after|before|afterSymbol|beforeSymbol. Every other field is rejected by name. Symbol editing belongs to ff_edit.',
     parameters: {
       action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code'], description: 'File operation. Unrelated fields are rejected.' },
       path: { type: 'string', required: true, description: 'File path, absolute or workspace-relative; source for move/transfers.' },
       destination: { type: 'string', description: 'Required for move/transfers.' },
       content: { type: 'string', description: 'Required for create: literal UTF-8 text.' },
       overwrite: { type: 'boolean', description: 'create/move: allow overwriting the destination. Default false.' },
-      sourceSymbol: { type: 'string', description: 'Transfer source: exact name or qualified name; exclusive with fromLines.' },
-      includeLeadingComment: { type: 'boolean', description: 'Symbol transfer: include the leading comment. Default true; requires sourceSymbol.' },
-      fromLines: { type: 'string', description: 'Transfer source range (L10-20); exclusive with sourceSymbol.' },
-      after: { type: 'integer', description: 'Transfer: insert after the original destination line; 0 = file start.' },
-      before: { type: 'integer', description: 'Transfer: insert before the original destination line, 1-based.' },
-      afterSymbol: { type: 'string', description: 'Transfer: insert after this unique destination symbol.' },
-      beforeSymbol: { type: 'string', description: 'Transfer: insert before this unique symbol and its leading comment.' },
-      indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfer: auto (default) fits space indentation; none preserves it.' },
+      sourceSymbol: { type: 'string', description: 'Source symbol, exact or qualified.' },
+      includeLeadingComment: { type: 'boolean', description: 'Keep the source leading comment. Default true.' },
+      fromLines: { type: 'string', description: 'Source lines, e.g. L10-20.' },
+      after: { type: 'integer', description: 'Insert after this destination line; 0 = start.' },
+      before: { type: 'integer', description: 'Insert before this destination line.' },
+      afterSymbol: { type: 'string', description: 'Insert after this destination symbol.' },
+      beforeSymbol: { type: 'string', description: 'Insert before this destination symbol.' },
+      indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfers only: auto (default) re-indents, none keeps block bytes.' },
       reason: { type: 'string', required: true, description: 'Why this change; recorded in history.' },
-      snapshotId: { type: 'string', description: 'Optional: a content-bound baseline from ff_trace capture=true. The files this operation reads must be covered with unchanged bytes; a mismatch refuses the batch. A create is expected to be absent from the baseline (a file that does not exist has no before state). Omit for an ordinary operation.' },
+      projectId: { type: 'string', description: 'Optional explicit project attribution in this workspace; not inferred from GUI selection.' },
+      taskId: { type: 'string', description: 'Optional non-archived task; requires projectId.' },
+      snapshotId: { type: 'string', description: 'Baseline from ff_trace capture=true: reads must match those bytes, a create must be absent from it.' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: {
       batch: { type: 'integer', required: true }, files: { type: 'array', items: { type: 'string' }, required: true },
@@ -208,6 +211,7 @@ export function createFileTool() {
         }
         const snapshotId = typeof args.snapshotId === 'string' ? args.snapshotId.trim() : ''
         const committed = await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
+          const attribution = validateAttribution(workspace, args)
           await prepareWorkspace(store, exec)
           exec?.signal?.throwIfAborted()
           // Checked inside the locks, for the same reason ff_edit checks inside
@@ -366,6 +370,7 @@ export function createFileTool() {
           }
           exec?.signal?.throwIfAborted()
           return await withNativeWrite(exec, changes.map(change => change.file), () => {
+            validateAttribution(workspace, attribution ?? {})
             for (const change of changes) {
               const current = read(change.file)
               if ((current === null) !== (change.before === null) || current && change.before && !current.equals(change.before)) throw new Error('file changed during planning; nothing written')
@@ -378,7 +383,7 @@ export function createFileTool() {
               return { file, op: change.after === null ? 'delete' : change.before === null ? 'create' : 'update', before: change.before === null ? null : putBlob(store, change.before).id,
                 after: change.after === null ? null : putBlob(store, change.after).id, bytes: change.after?.length ?? 0, eol: enc.eol, bom: enc.bom }
             })
-            const batch = commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, nodes }, changes)
+            const batch = commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, nodes, ...(attribution ? { attribution } : {}) }, changes)
             return { batch: batch.id, files: nodes.map(node => node.file), ...(transferNote ? { note: transferNote } : {}) }
           })
         }))

@@ -7,8 +7,8 @@
  * These were two separate tools (`ff_outline` / `ff_find_symbol`) until the
  * 2026-10-15 surface merge. They shared `./ast.ts`, `path` and `symbol`
  * addresses, and `ff_outline`'s output *was* `ff_read`'s address format — so
- * they are now views of one read tool. The item shapes below are unchanged,
- * which keeps the model-facing text and the test assertions identical.
+ * they are now views of one symbol tool. Outline selection and pagination
+ * project this tree without changing exact definition or source addressing.
  *
  * Editing stays stage 3.
  *
@@ -16,6 +16,7 @@
  */
 
 import path from 'node:path'
+import type { OutlineFilters, OutlineSource } from './outline-output.ts'
 import { astWorkerAuto, astWorkerCount, parallelFind, type AstWorkerPool } from './ast-pool.ts'
 import { indexerCanParse, indexerFindSymbols, indexerReady } from './indexer-client.ts'
 import ignore, { type Ignore } from 'ignore'
@@ -151,18 +152,14 @@ function* walkFiles(root: string, ignores: Ignore | null, deadline: number, base
 // ---------------------------------------------------------------------------
 
 /**
- * `ff_read view=outline`: definitions of ONE file, with current line ranges
- * and qualifiedName addresses that the built-in `read` accepts through
- * `file#Symbol`. The item shape is
- * the one the former `ff_outline` tool returned, so the rendered text and the
- * existing assertions are unchanged.
+ * Content-bound outline selection before paging. Parser symbols remain intact;
+ * declarations scope changes only which descendants the view traverses.
  */
 export async function outlineOf(
   exec: ForgeExec | undefined,
   rawPath: unknown,
-  depthArg: unknown,
-  kindArg: unknown,
-): Promise<{ items: Array<Record<string, unknown>>; lang: string; partial?: boolean } | ToolFailure> {
+  filters: OutlineFilters,
+): Promise<OutlineSource | ToolFailure> {
   const raw = typeof rawPath === 'string' ? rawPath : ''
   if (raw.trim() === '') return failure('view=outline requires path')
   const abs = resolveFilePath(exec, raw)
@@ -170,12 +167,14 @@ export async function outlineOf(
   const parsed = await parseFile(abs, { readPath: observed?.path })
   if (parsed.error) return failure(parsed.error)
   const value = parsed.value!
-  const depth = depthArg === undefined ? undefined : clampInt(depthArg, 99, 1, 20)
-  const kind = typeof kindArg === 'string' && kindArg.trim() !== '' ? kindArg : undefined
-  const items: Array<Record<string, unknown>> = outlineView(value.symbols, { depth, kind })
-    .map(({ children, startOffset, endOffset, sharedDeclaration, listMember, commentStartOffset, ...item }) => item)
+  const occurrences = symbolOccurrences(value.symbols)
+  const identities = new Map([...occurrences].map(([s, n]) => [JSON.stringify([s.qualifiedName, s.startOffset]), n]))
+  const items = outlineView(value.symbols, filters)
+    .map(({ children, startOffset, endOffset, sharedDeclaration, listMember, commentStartOffset, ...item }) => ({
+      ...item, occurrence: identities.get(JSON.stringify([item.qualifiedName, startOffset]))!,
+    }))
   await observed?.finish()
-  return { items, lang: value.lang, ...(value.partial ? { partial: true } : {}) }
+  return { items, lang: value.lang, partial: value.partial, path: abs, snapshot: value.hash, available: occurrences.size }
 }
 
 // ---------------------------------------------------------------------------

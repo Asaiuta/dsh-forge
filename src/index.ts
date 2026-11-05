@@ -26,6 +26,7 @@ import { createStatusCommand } from './status.ts'
 import { createEditTool, createHistoryTool, createRollbackTool } from './tools-edit.ts'
 import { createExecutionGuard, type ForgeFileSystem, type ForgeFsEvents, type ForgePolicyService } from './execution.ts'
 import { AUGMENTED_BUILTINS, installAugmentation, type AugmentHost } from './augment.ts'
+import { installTodoProjects, type TodoProjectHost } from './todo-projects.ts'
 import { createFileTool } from './tools-files.ts'
 import { createReadTool } from './tools-read.ts'
 import { createTraceTool } from './tools-trace.ts'
@@ -114,6 +115,7 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
     typeof host.tools.get === 'function' ? { get: (toolName, scope) => host.tools.get?.(toolName, scope) } : undefined
   const augmentation = installAugmentation(host as unknown as AugmentHost, { names: AUGMENTED_BUILTINS })
   if (augmentation !== undefined) yield () => augmentation.dispose()
+  yield installTodoProjects(host as unknown as TodoProjectHost)
   const rows: ForgeRow[] = [
     { forge: 'ff_find', surface: 'retrieval', build: () => defineForgeTool(createFindTool(pool), guard, integration) },
     { forge: 'ff_grep', surface: 'retrieval', build: () => defineForgeTool(createGrepTool(pool), guard, integration) },

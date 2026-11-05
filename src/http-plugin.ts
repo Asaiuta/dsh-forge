@@ -38,10 +38,12 @@ import {
   nextConfig,
   readSettings,
 } from './config-api.ts'
-import { ledgerBatchDetail, ledgerList, LedgerApiError } from './ledger-api.ts'
+import { ledgerBatchDetail, ledgerList, ledgerNodeSnapshot, LedgerApiError } from './ledger-api.ts'
 import { createLedgerRollbackService, type LedgerRollbackOptions } from './ledger-rollback.ts'
 import { createExecutionGuard, type ForgeFileSystem, type ForgePolicyService } from './execution.ts'
 import { getProject, listProjects, projectAction, projectOverview } from './projects.ts'
+import { GitReadError, readGitDiff, readGitStatus } from './git-reader.ts'
+import { createGitRun, DIFF_SIDE_MAX_BYTES, readWorktreeText, type SubprocessLike } from './git-subprocess.ts'
 
 export const name = 'dsh-forge-http'
 
@@ -64,6 +66,9 @@ const MAX_BODY_BYTES = 64 * 1024
  * host's web server, and that is the row's only reason to exist.
  */
 const LEDGER_PATH = '/forge-ledger'
+
+/** Read-only git route for the Git page; GET only, no mutation surface. */
+const GIT_PATH = '/forge-git'
 
 /** The route surface this plugin registers into. */
 export interface WebServerService {
@@ -250,6 +255,18 @@ export function createLedgerHandler(options: LedgerRollbackOptions = {}) {
         send(response, 400, { ok: false, error: 'workspace 必须是绝对路径' })
         return
       }
+      const address = url.searchParams.get('node')
+      if (address !== null) {
+        if (url.searchParams.has('batch')) throw new LedgerApiError('node snapshot and batch detail are exclusive')
+        const side = url.searchParams.get('side')
+        if (side !== 'before' && side !== 'after') throw new LedgerApiError('side must be before or after')
+        let snapshot
+        try { snapshot = ledgerNodeSnapshot(workspace, address, side, Number(url.searchParams.get('offset') ?? '0'), Number(url.searchParams.get('limit') ?? '32768')) }
+        catch (e) { if (e instanceof LedgerApiError) throw e; throw new LedgerApiError(e instanceof Error ? e.message : String(e)) }
+        send(response, 200, { ok: true, snapshot })
+        return
+      }
+      if (url.searchParams.has('side') || url.searchParams.has('offset')) throw new LedgerApiError('side/offset require node')
       const rawBatch = url.searchParams.get('batch')
       if (rawBatch !== null) {
         const id = Number(rawBatch)
@@ -267,14 +284,50 @@ export function createLedgerHandler(options: LedgerRollbackOptions = {}) {
       }
       const rawLimit = Number(url.searchParams.get('limit') ?? '50')
       if (!Number.isSafeInteger(rawLimit) || rawLimit < 1 || rawLimit > 200) throw new LedgerApiError('limit 必须是 1–200 的整数')
-      const filters = Object.fromEntries(['keyword', 'pathContains', 'actor', 'kind', 'cursor'].flatMap(key => url.searchParams.has(key) ? [[key, url.searchParams.get(key)!]] : []))
-      send(response, 200, { ok: true, ...ledgerList(workspace, { limit: rawLimit, ...filters }) })
+      const filters = Object.fromEntries(['keyword', 'pathContains', 'actor', 'kind', 'cursor', 'projectId', 'taskId', 'file'].flatMap(key => url.searchParams.has(key) ? [[key, url.searchParams.get(key)!]] : []))
+      const unassigned = url.searchParams.get('unassigned')
+      if (unassigned !== null && !['true', 'false'].includes(unassigned)) throw new LedgerApiError('unassigned must be true or false')
+      send(response, 200, { ok: true, ...ledgerList(workspace, { limit: rawLimit, ...filters, ...(unassigned === null ? {} : { unassigned: unassigned === 'true' }) }) })
     } catch (error) {
       send(response, error instanceof LedgerApiError ? error.status : error instanceof ConfigEditError ? 400 : 503, { ok: false, error: error instanceof Error ? error.message : String(error) })
     }
   }
 }
 
+
+/**
+ * Read-only git facts for the Git page.
+ *
+ * GET only: there is no route that stages, commits, or writes an index, so an
+ * unreachable page cannot change a repository. The subprocess capability is read
+ * at call time — a host that offers none answers 503 instead of spawning git
+ * outside its sandbox.
+ */
+export function createGitHandler(service: () => SubprocessLike | undefined) {
+  return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    try {
+      if (request.method !== 'GET') { send(response, 405, { ok: false, error: 'Git 页只读，仅支持 GET' }); return }
+      const url = new URL(request.url ?? '/', 'http://localhost')
+      const workspace = url.searchParams.get('workspace') ?? ''
+      if (!path.isAbsolute(workspace)) throw new LedgerApiError('workspace 必须是绝对路径')
+      const subprocess = service()
+      if (!subprocess) throw new LedgerApiError('宿主未提供子进程能力，无法读取 git', 503)
+      const run = createGitRun(subprocess)
+      const file = url.searchParams.get('file')
+      if (file !== null) {
+        if (!file) throw new LedgerApiError('file 不能为空')
+        send(response, 200, { ok: true, diff: await readGitDiff(workspace, file, run, readWorktreeText, { maxBytes: DIFF_SIDE_MAX_BYTES }) })
+        return
+      }
+      const status = await readGitStatus(workspace, run)
+      if (!status.isRepo) { send(response, 200, { ok: true, repo: { isRepo: false } }); return }
+      send(response, 200, { ok: true, repo: status })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      send(response, error instanceof LedgerApiError ? error.status : error instanceof GitReadError ? 400 : 503, { ok: false, error: message })
+    }
+  }
+}
 
 /** Projects live only in forge's private store; actions retain the shared service validation. */
 export function createProjectsHandler() {
@@ -297,7 +350,7 @@ export function createProjectsHandler() {
       assertMutationRequest(request)
       const body = await readJson(request)
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new LedgerApiError('请求体必须是 JSON 对象')
-      const result = await projectAction(body)
+      const result = await projectAction(body, undefined, 'forge-projects-http')
       const action = (body as Record<string, unknown>).action
       send(response, 200, { ok: true, ...(action === 'list' ? { projects: result } : action === 'overview' ? { overview: result } : { project: result }) })
     } catch (error) {
@@ -331,5 +384,6 @@ export function apply(ctx: Context): void {
       } }),
     })
     yield host.webServer.register({ kind: 'exact', path: '/forge-projects', handler: createProjectsHandler() })
+    yield host.webServer.register({ kind: 'exact', path: GIT_PATH, handler: createGitHandler(() => optionalHostService<SubprocessLike>(host, 'subprocess')) })
   }, 'dsh-forge: config and ledger routes')
 }

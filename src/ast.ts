@@ -885,9 +885,10 @@ export function symbolOccurrences(symbols: AstSymbol[]): Map<AstSymbol, number> 
 export interface OutlineOptions {
   depth?: number
   kind?: string
+  scope?: 'declarations' | 'all'
 }
 
-/** Depth-trimmed view; entries carry their nesting level for rendering. */
+/** Filtered view; declaration scope stops below callables without mutating the AST. */
 export function outlineView(symbols: AstSymbol[], options: OutlineOptions = {}): Array<AstSymbol & { level: number }> {
   const kindFilter = options.kind ? options.kind.split(',').map((k) => k.trim()) : null
   const out: Array<AstSymbol & { level: number }> = []
@@ -895,7 +896,7 @@ export function outlineView(symbols: AstSymbol[], options: OutlineOptions = {}):
     if (options.depth !== undefined && level > options.depth) return
     for (const sym of list) {
       if (!kindFilter || kindFilter.includes(sym.kind)) out.push({ ...sym, level })
-      visit(sym.children, level + 1)
+      if (options.scope !== 'declarations' || (sym.kind !== 'function' && sym.kind !== 'method')) visit(sym.children, level + 1)
     }
   }
   visit(symbols, 1)

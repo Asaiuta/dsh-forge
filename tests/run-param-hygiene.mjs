@@ -138,7 +138,8 @@ async function main() {
     exec,
   )
   assert.ok(Array.isArray(paddedOutline.items), `outline must ignore definitions-only fields: ${JSON.stringify(paddedOutline).slice(0, 160)}`)
-  ok('ff_symbols 的 outline 忽略 symbol/glob/limit 补全')
+  assert.equal(paddedOutline.page.returned, 2)
+  ok('ff_symbols 的 outline 忽略 symbol/glob 补全并接受共享 limit')
 
   const paddedDefinitions = await run(symbols, 
     { view: 'definitions', symbol: 'alpha', path: 'sym.js', glob: '', limit: 200, kind: '', depth: 2 },

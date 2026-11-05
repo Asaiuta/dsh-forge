@@ -1,8 +1,8 @@
 /** The SDK boundary: failures use its exception channel, successful values are lossless JSON. */
 import { defineTool, type ParameterSchemaSpec, type ValueSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import type { ForgeExec } from './core.ts'
+import { workdirOf, type ForgeExec } from './core.ts'
 import { cleanArgs, type ArgHygiene } from './param-hygiene.ts'
-import { freezePresentation } from './presentation.ts'
+import { freezePresentation, type ForgePresentation } from './presentation.ts'
 import type { ForgeFileSystem, ForgeFsEvents } from './execution.ts'
 
 /**
@@ -50,8 +50,14 @@ export function defineForgeTool<V, O extends ValueSchemaSpec>(factory: Factory<V
   }) => ToolDefinition
   const sourceSchema = factory.output.schema as ValueSchemaSpec & { properties?: Record<string, ValueSchemaSpec> }
   const outputSchema = { ...sourceSchema, properties: { ...sourceSchema.properties,
-    forgePresentation: { type: 'object' as const, additionalProperties: true as const }, workspace: { type: 'string' as const },
+    workspace: { type: 'string' as const },
   } } as ValueSchemaSpec
+  // Both supported SDK pipelines clone the value but pass the same dispatch
+  // arguments to execute/render/presentationMeta. Weak keys follow dispatch
+  // lifetime, including parent calls whose SDK skips presentationMeta. No UI
+  // source bytes or correlation tokens enter the canonical tool value/schema.
+  const presentations = new WeakMap<object, Map<string, ForgePresentation>>()
+  const coordinate = (value: Record<string, unknown>) => JSON.stringify([value.workspace ?? null, value.newBatch ?? value.batch])
   const definition = compile({
     name: factory.name,
     description: factory.description,
@@ -71,13 +77,21 @@ export function defineForgeTool<V, O extends ValueSchemaSpec>(factory: Factory<V
       let presentation
       try { presentation = await freezePresentation(factory.name, args, value as Record<string, unknown>, guarded ?? {}, integration?.fs, integration?.events) }
       catch { /* committed operations must remain visible as success */ }
-      return presentation ? { ...(value as Record<string, Json>), forgePresentation: presentation as unknown as Json } : value
+      if (presentation) {
+        const result = { ...(value as Record<string, Json>), workspace: (value as Record<string, Json>).workspace ?? workdirOf(guarded) }
+        const entries = presentations.get(input) ?? new Map<string, ForgePresentation>()
+        entries.set(coordinate(result), presentation)
+        presentations.set(input, entries)
+        return result
+      }
+      return value
     },
   })
   // Stamped so code that meets a definition by name can tell forge's own apart
   // from a host built-in (see FORGE_DEFINITION_TAG).
   ;(definition as unknown as Record<string, unknown>)[FORGE_DEFINITION_TAG] = factory.name
-  definition.output.presentationMeta = (_args, value) => typeof value === 'object' && value !== null && !Array.isArray(value) ? value.forgePresentation ?? null : null
+  definition.output.presentationMeta = (args, value) => typeof args === 'object' && args !== null && typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? presentations.get(args)?.get(coordinate(value)) as unknown as Json ?? null : null
   definition.presentResult = (_args, result) => {
     const meta = result.meta
     if (result.isError || !meta || typeof meta !== 'object' || Array.isArray(meta) || !Array.isArray(meta.diffs) || meta.diffs.length === 0) return

@@ -53,7 +53,6 @@ export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CA
   if (!visible.length && !augmented.symbolRead) return ''
   const n = FORGE_TOOLS
   return [
-    'Route by task below, not by habit; each tool\'s schema says how to call it.',
     // One line either way: when `read` answers `file#Symbol`, a plain read stays
     // the built-in's and ff_read keeps what only it can do.
     //
@@ -65,7 +64,7 @@ export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CA
     // opposite question. That correction is the one thing here no schema can
     // carry, so it survives every trim.
     ...(has('read') && augmented.symbolRead ? [
-      `- Symbol known → read with file_path=<file>#<Symbol> (no offset/limit): that definition only, no outline first. Need the names → ${n.read} view=outline; every definition of one name → view=definitions. A plain read stays the built-in read.`,
+      `- Symbol known → read with file_path=<file>#<Symbol> (no offset/limit): that definition only, no outline first. Need the names → ${n.read} view=outline; every definition of one name → view=definitions. Request further outline pages only when needed.`,
     ] : has('read') ? [
       `- Code structure → ${n.read} view=outline for names and line ranges; view=definitions with symbol=<name> for exact definitions. Read source through the built-in read using the returned file and line range.`,
     ] : augmented.symbolRead ? [
@@ -92,18 +91,12 @@ export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CA
       `- ${n.trace} answers wiring questions. A literal channel registration, a declared exposure or a symbol definition is not a dependency — take it as given. capture=true returns a snapshotId that a later ${has('edit') ? n.edit : 'edit'} checks.`,
     ] : []),
     ...(has('edit') ? [
-      // The ticket protocol and the verify whitelist are the tool description and
-      // the `verify` parameter respectively. What survives is what the schema
-      // cannot draw: several steps land against one snapshot, and the receipt
-      // gives the symbol and the new line range — the two things the next edit
-      // needs. A built-in edit is now recorded as well (src/augment.ts), so the
-      // line cannot promise history it alone provides; what it keeps is the
-      // per-file limit and the missing reason.
-      `- Edit after reading → ${n.edit}: 1-50 steps against one snapshot, each receipt naming its symbol and new line range. A built-in edit is recorded too, but one file per batch and with no reason.`,
+      // Ask for the patch at edit time only when the task needs its evidence.
+      `- Edit after reading → ${n.edit}; request receipt=diff when patch evidence is needed. A built-in edit is recorded too.`,
     ] : []),
     ...(has('file') ? [`- Create, remove, move, transfer → ${n.file}; edit one symbol through ${has('edit') ? n.edit : 'the available editing tool'}.`] : []),
     ...(has('verify') ? [`- Check existing work without modifying it → ${n.verify}; keep recorded verdicts separate from current applicability.`] : []),
-    ...(has('project') ? [`- Organize projects, tasks and acceptance reports → ${n.project}; human acceptance is not a machine verification result.`] : []),
+    ...(has('project') ? [`- ${n.project} tracks projects and reports. Daily plans use todo_write, already mirrored into projects; do not recreate them with task_add. Request report/evidence details only when needed.`] : []),
     ...(has('history') ? [
       `- Look back → ${n.history}; revert → ${has('rollback') ? n.rollback : 'ff_rollback'}.`,
     ] : has('rollback') ? [`- Revert a recorded batch → ${n.rollback}.`] : []),

@@ -163,6 +163,8 @@ export interface LedgerNode {
   bom: boolean
 }
 
+export interface BatchAttribution { projectId: string; taskId?: string }
+
 export interface LedgerBatch {
   t: 'b'
   id: number
@@ -172,6 +174,7 @@ export interface LedgerBatch {
   actor: string
   reverted?: number
   transaction?: string
+  attribution?: BatchAttribution
   nodes: LedgerNode[]
 }
 
@@ -332,6 +335,10 @@ function validateRecord(rec: LedgerBatch, previousId: number, line: number): voi
   if (!rec || rec.t !== 'b' || !Number.isSafeInteger(rec.id) || rec.id !== previousId + 1
     || !Number.isFinite(rec.ts) || !['edit', 'rollback', 'external', 'project'].includes(rec.kind)
     || typeof rec.reason !== 'string' || typeof rec.actor !== 'string' || !Array.isArray(rec.nodes)
+    || rec.attribution !== undefined && (!rec.attribution || typeof rec.attribution !== 'object' || Array.isArray(rec.attribution)
+      || typeof rec.attribution.projectId !== 'string' || !rec.attribution.projectId.trim()
+      || rec.attribution.taskId !== undefined && (typeof rec.attribution.taskId !== 'string' || !rec.attribution.taskId.trim())
+      || Object.keys(rec.attribution).some(key => !['projectId', 'taskId'].includes(key)))
     || rec.nodes.some(node => !node || typeof node.file !== 'string' || !['update', 'create', 'delete', 'external'].includes(node.op)
       || ![node.before, node.after].every(hash => hash === null || typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash))
       || !Number.isSafeInteger(node.bytes) || node.bytes < 0 || !['LF', 'CRLF', 'CR'].includes(node.eol) || typeof node.bom !== 'boolean')
@@ -567,6 +574,8 @@ export function commitFiles(store: StorePaths, batch: Omit<LedgerBatch, 't' | 'i
   // before committing, but commitFiles must never clobber a pending journal —
   // the journal IS the record that files may be in a half-written state. Must
   // precede ensureWorkspaceMeta, which refuses while a journal is pending.
+  const previousId = lastBatchId(store)
+  validateRecord({ ...batch, t: 'b', id: previousId + 1, ts: Date.now() }, previousId, previousId + 1)
   recoverStore(store)
   ensureWorkspaceMeta(store)
   const journal: Journal = { transaction: randomUUID(), nodes: changes.map(change => ({

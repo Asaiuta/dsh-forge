@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync 
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { dataDir } from './core.ts'
-import { atomicWrite } from './ledger.ts'
+import { atomicWrite, type BatchAttribution } from './ledger.ts'
 import type { EditStep, StepCandidate } from './edit-engine.ts'
 import type { CheckSelector } from './check-static.ts'
 
@@ -36,6 +36,7 @@ export interface TicketCandidate extends StepCandidate {
 }
 
 export interface TicketPayload {
+  attribution?: BatchAttribution
   /** Absolute file path the batch targets. */
   file: string
   /** The full original step list (unchanged — a ticket reply replays it). */

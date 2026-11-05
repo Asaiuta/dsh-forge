@@ -16,7 +16,7 @@ function contract(schema) {
 const pluginAt = process.argv.indexOf('--plugin')
 if (pluginAt >= 0 && !process.argv[pluginAt + 1]) throw new Error('--plugin requires a compiled index.js path')
 const surface = await promptSurface({
-  ...(process.argv.includes('--takeover') ? { config: { registration: 'takeover' } } : {}),
+  config: { surface: process.argv.includes('--retrieval') ? 'retrieval' : 'full' },
   ...(pluginAt >= 0 ? { plugin: process.argv[pluginAt + 1] } : {}),
 })
 const out = {
@@ -31,7 +31,7 @@ if (compareAt >= 0) {
   out.inputContractsUnchanged = isDeepStrictEqual(surface.schemas.map(contract), baseline.schemas.map(contract))
   out.compare = Object.fromEntries(Object.entries(surface.metrics).map(([name, now]) => {
     const old = baseline.metrics?.[name] ?? {}
-    return [name, Object.fromEntries(['bytes', 'estTokens', 'cl100k_base', 'o200k_base'].map(key => [key, {
+    return [name, Object.fromEntries(['bytes', 'cl100k_base', 'o200k_base'].map(key => [key, {
       before: old[key] ?? null, after: now[key] ?? null,
       delta: old[key] === undefined || now[key] === undefined ? null : now[key] - old[key],
       percent: old[key] && now[key] !== undefined ? (now[key] - old[key]) / old[key] * 100 : null,

@@ -18,8 +18,8 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { getEncoding } = require('js-tiktoken')
 
-const { apply } = await import(new URL('../lib/index.js', import.meta.url).href)
-const sdk = await import('@deepseek-ai/dsh-tools')
+const { promptSurface, promptSdk } = await import('./prompt-surface.mjs')
+const sdk = await promptSdk()
 
 const cl = getEncoding('cl100k_base')
 const o2 = getEncoding('o200k_base')
@@ -27,18 +27,9 @@ const tc = (s) => cl.encode(s).length
 const to = (s) => o2.encode(s).length
 const bytes = (s) => Buffer.byteLength(s, 'utf8')
 
-// --- collect definitions + commands exactly as the host does -----------------
-const definitions = [], commands = [], disposers = []
-const host = {
-  tools: { register: (d) => { definitions.push(d) } },
-  commands: { register: (c) => { commands.push(c) } },
-}
-try {
-  for (const dispose of apply(host)) if (typeof dispose === 'function') disposers.push(dispose)
-
-  const schemas = definitions.map((d) => sdk.ToolRuntime.prototype.schemaOf.call({}, d, true))
-  const outputs = schemas.map((s, i) => ({ ...s, output: definitions[i].output.schema }))
-
+const surface = await promptSurface({ config: { surface: process.argv.includes('--retrieval') ? 'retrieval' : 'full' } })
+const { schemas, outputs, commands } = surface
+{
   const emptyTs = sdk.renderToolsSdk([])
   const emptyPy = sdk.renderToolsSdkPy([])
   const emptyTsLen = bytes(emptyTs), emptyPyLen = bytes(emptyPy)
@@ -124,7 +115,6 @@ try {
   console.log(`  ptcTypescript (SDK 源码投影) : ${tc(tsAll) - emptyTsTok} tok (cl100k) / ${to(tsAll) - to(emptyTs)} (o200k)   ${bytes(tsAll) - emptyTsLen} B`)
   console.log(`  ptcPython    (SDK 源码投影)  : ${tc(pyAll) - emptyPyTok} tok (cl100k) / ${to(pyAll) - to(emptyPy)} (o200k)   ${bytes(pyAll) - emptyPyLen} B`)
   console.log(`  forge-status 命令            : ${cmdTok} tok (cl100k)`)
-  console.log(`  bytes/4 估算(native)         : ${Math.ceil(bytes(nativeAll) / 4)}  → cl100k ${tc(nativeAll)}`)
 
   console.log('\n--- 结构拆分（native 视角）---')
   console.log(`  description 正文合计 : ${sum('descTok')} tok`)
@@ -132,12 +122,9 @@ try {
   console.log(`  参数 schema 序化文本 : ${sum('paramTok')} tok   ← 参数名+类型+enum+说明`)
   console.log(`  native 全文合计      : ${tc(nativeAll)} tok  → 纯 JSON 骨架占 ${tc(nativeAll) - sum('descTok') - sum('paramTok')} tok`)
   console.log(`  空参数说明           : ${sum('blank')} 项`)
-  console.log(`  bytes/4 vs 真实（同一字符串 native）: ${Math.ceil(bytes(nativeAll) / 4)} vs ${tc(nativeAll)} → bytes/4 高估 ${Math.ceil(bytes(nativeAll) / 4) - tc(nativeAll)} (${Math.round((Math.ceil(bytes(nativeAll) / 4) / tc(nativeAll) - 1) * 100)}%)`)
 
   console.log('\n--- 最贵工具（按 ptcPython 边际）---')
   for (const r of [...rows].sort((a, b) => b.pyTok - a.pyTok).slice(0, 5)) {
     console.log(`  ${r.name.padEnd(16)} ptcPy ${String(r.pyTok).padStart(5)}  ptcTS ${String(r.tsTok).padStart(5)}  native ${String(r.nativeTok).padStart(5)}`)
   }
-} finally {
-  for (const dispose of disposers.reverse()) await dispose()
 }
