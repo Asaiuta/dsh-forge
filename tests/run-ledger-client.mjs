@@ -16,7 +16,7 @@ const React = {
 }
 const pending = []
 const fetch = (url, options = {}) => new Promise((resolve, reject) => pending.push({ url, options, resolve: body => resolve({ ok: body.ok !== false, status: body.ok === false ? 409 : 200, text: async () => JSON.stringify(body) }), reject }))
-const output = await build({ entryPoints: ['src/client/ledger-tab.tsx','src/client/project-panel.tsx'], bundle: true, write: false, outdir: 'unused', format: 'cjs', jsx: 'transform', plugins: [{ name:'react-test', setup(b) { b.onResolve({filter:/^react$/},()=>({path:'react',namespace:'test'})); b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:'module.exports = globalThis.__React',loader:'js'})) } }] })
+const output = await build({ entryPoints: ['src/client/ledger-tab.tsx','src/client/project-panel.tsx'], bundle: true, write: false, outdir: 'unused', format: 'cjs', jsx: 'transform', plugins: [{ name:'react-test', setup(b) { b.onResolve({filter:/^@deepseek-ai\/dsh-client-ui-primitives$/},()=>({path:process.cwd()+'/tests/native-ui-fixture.cjs'})); b.onResolve({filter:/^react$/},()=>({path:'react',namespace:'test'})); b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:'module.exports = globalThis.__React',loader:'js'})) } }] })
 function load(name) { const file = output.outputFiles.find(f => f.path.endsWith(name+'.js')); const context = { module: { exports:{} }, exports: {}, __React: React, React, fetch, AbortController, URLSearchParams, URL, Date, console, setTimeout, clearTimeout }; context.exports = context.module.exports; vm.runInNewContext(file.text, context); return context.module.exports }
 const { LedgerTab } = load('ledger-tab')
 const { ProjectPanel } = load('project-panel')

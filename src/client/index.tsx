@@ -66,6 +66,9 @@ const SECTION_ORDER = 60
 /** `betterSidebar.registerTab` id; also the tab type the sidebar keys tabs by. */
 const LEDGER_TAB_ID = 'forge:ledger'
 
+/** better-sidebar's own Git tab id (its unified changes tab kept the old name). */
+const BUILTIN_GIT_TAB = 'git'
+
 /** Route served by `src/http-plugin.ts`. */
 const CONFIG_PATH = '/forge-config'
 
@@ -80,6 +83,38 @@ type Translate = (key: ForgeKey) => string
  * neighbour, and importing its types would make this bundle unloadable — not
  * just unreachable — on every profile that does not have it installed.
  */
+interface PluginSidebarService extends BetterSidebarService {
+  /** Activates an open tab; a strict no-op for an unknown id. */
+  activateTab?(tabId: string): void
+  /** Opens (or reveals) a tab of a registered type in the active session. */
+  openTab?(seed: { type: string; title?: string; path?: string }): void
+}
+
+/**
+ * The door from our Git page to better-sidebar's own Git tab.
+ *
+ * Its id is `git` — kept from before that tab was widened into the unified
+ * changes tab so persisted layouts survive. `openTab` is a silent no-op for a
+ * type the user disabled and for a build that lacks it, so the presence and the
+ * enabled flag are checked first and the result is reported instead of assumed.
+ *
+ * @returns a function that answers whether the tab was actually requested.
+ */
+function openBuiltinGitTab(sidebar: PluginSidebarService): () => boolean {
+  return () => {
+    try {
+      // Only a DEFINITE absence refuses. A build too old to answer `getTab` is not
+      // evidence that the tab is missing, and refusing there would strand the page
+      // on the fallback forever.
+      if (typeof sidebar.getTab === 'function' && sidebar.getTab(BUILTIN_GIT_TAB) === undefined) return false
+      if (sidebar.isTabEnabled?.(BUILTIN_GIT_TAB) === false) return false
+      if (typeof sidebar.openTab === 'function') { sidebar.openTab({ type: BUILTIN_GIT_TAB }); return true }
+      if (typeof sidebar.activateTab === 'function') { sidebar.activateTab(BUILTIN_GIT_TAB); return true }
+      return false
+    } catch { return false }
+  }
+}
+
 interface BetterSidebarService {
   registerTab(descriptor: {
     id: string
@@ -290,6 +325,10 @@ export function apply(ctx: Context): void {
   ctx.inject(['betterSidebar'], (scoped) => {
     const sidebar = (scoped as unknown as { betterSidebar?: BetterSidebarService }).betterSidebar
     if (sidebar === undefined) return
+    // Built once, outside the component factory: the tab factory runs on every
+    // render of this row, and a fresh opener each time would retrigger any
+    // consumer effect keyed on it.
+    const openGit = openBuiltinGitTab(sidebar)
     scoped.effect(() => sidebar.registerTab({
       id: LEDGER_TAB_ID,
       title: () => t('ledgerTitle'),
@@ -297,7 +336,7 @@ export function apply(ctx: Context): void {
       // After the builtin explorer/editor/changes rows (100 is the default).
       order: 70,
       single: true,
-      component: (props: LedgerTabProps) => <LedgerTab {...props} />,
+      component: (props: LedgerTabProps) => <LedgerTab {...props} openGitTab={openGit} />,
     }), 'dsh-forge: ledger tab')
   })
 }
