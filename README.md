@@ -149,7 +149,7 @@ AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python�
 | `retrieval`（默认） | 注册 `ff_find`、`ff_grep`、`ff_symbols`，共 3 个。 |
 | `full` | 注册上述 3 个及 `ff_trace`、`ff_edit`、`ff_file`、`ff_history`、`ff_rollback`、`ff_project`，共 9 个。 |
 
-批量读取与执行/复查的合并接口、预算和限制见[能力合并报告](docs/2026-11-05_read-eval-consolidation-report.md)。独立 `ff_verify` 已移除，旧调用改为 `ff_edit action=verify`；`checks` 改用 `verify`。不注册 `ff_eval` 或 `ff_read_many`。
+批量读取与执行/复查的合并接口、预算和限制见下文。独立 `ff_verify` 已移除，旧调用改为 `ff_edit action=verify`；`checks` 改用 `verify`。不注册 `ff_eval` 或 `ff_read_many`。
 
 `action=eval` 的小结果和日志直接放在 `evaluation.result`，`resultComplete: true` 表示本次已返回完整存档，无须再查询。较大结果为 `resultComplete: false`，通过 `resultId`、`offset` 续读；`evidenceComplete` 单独表示采集是否丢失内容，超时或日志截断仍会标记不完整。`action=verify path=...` 默认只检查语法；按 batch 复查默认检查 bridge 和语法。显式在 path 模式请求 bridge/IPC 仍返回 `not_run`，因为没有修改前基线。
 
@@ -159,7 +159,7 @@ AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python�
 
 同一文件已确定的多处独立修改优先一次提交：`ff_edit {path, steps:[{find,replaceWith}, ...], reason}`。需要严格字面量匹配时加 `match:"literal"`，也支持 1–50 个步骤；所有步骤定位同一份原始快照，重复匹配、重叠或任何一步失败都不写入。只有一处修改才用顶层 `find/replaceWith` 简写；单模式全局替换可用 `replaceAll:true`，不与 steps 混用。literal 模式保留空格、BOM 和 CR/LF，不重缩进、不转换换行；默认 block 模式保留原有容错行为。依赖前一步结果才能决定的修改分开执行。
 
-安装版 SDK 验收：设置 `DSH_FORGE_DSH_MODULES` 后运行 `node --experimental-transform-types tests/run-builtin-writes.mjs`；该检查缺少安装版 SDK 时直接失败，不以跳过作为通过。更详细的范围与计量见[内置写工具隐藏验收](docs/2026-11-06_builtin-write-hiding-report.md)。
+安装版 SDK 验收：设置 `DSH_FORGE_DSH_MODULES` 后运行 `node --experimental-transform-types tests/run-builtin-writes.mjs`；该检查缺少安装版 SDK 时直接失败，不以跳过作为通过。
 
 **内置增强始终启用。** 内置的 `read`/`grep`/`glob` 保留原 schema、提示词、超时和输出契约；forge 在环绕分发点让 `read` 支持 `file#Symbol`，并为 `glob` / `grep` 提供常驻 Rust 搜索后端。结果不在原生层预截断；宿主仍负责展示上限、截断标志和完整结果文件。旧 sidecar 没有完整性标记、完整序列化结果超过 20 MB、后端不可用或参数超出契约时直接交回内置。
 

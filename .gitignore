@@ -70,5 +70,6 @@ __pycache__/
 
 # Acceptance reports measured on one machine. They carry the local evidence
 # root and OS account name, so the conclusions live in README and the tests
-# instead of in a distributed file.
-/docs/2026-11-05_*-report.md
+# instead of in a distributed file. Reports are named by date prefix; design
+# documents carry a topic name and put the date at the end.
+/docs/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*.md
