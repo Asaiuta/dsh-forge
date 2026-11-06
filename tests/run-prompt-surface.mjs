@@ -11,13 +11,20 @@ try {
   const sdk=await promptSdk()
   for(const surface of ['retrieval','full']) {
    const result=await promptSurface({config:{surface}})
-   assert.equal(result.surface,surface);assert.equal(result.schemas.length,surface==='full'?10:3)
+   assert.equal(result.surface,surface);assert.equal(result.schemas.length,surface==='full'?9:3)
    assert.equal(result.metrics.native.o200k_base,encoding.encode(result.texts.native).length)
    assert.equal(result.metrics.ptcTypescript.o200k_base,encoding.encode(result.texts.ptcTypescript).length-encoding.encode(sdk.renderToolsSdk([])).length)
    assert.equal(result.metrics.ptcPython.o200k_base,encoding.encode(result.texts.ptcPython).length-encoding.encode(sdk.renderToolsSdkPy([])).length)
    assert.ok(!('estTokens' in result.metrics.native));assert.ok(!JSON.stringify(result.outputs).includes('forgePresentation'))
-   assert.match(result.texts.guidance,/Symbol known.*read with file_path=<file>#<Symbol>.*no outline first/)
-   if(surface==='full') assert.match(result.texts.guidance,/todo_write.*mirrored.*do not recreate.*task_add/)
+   if(surface==='full') {
+    assert.match(result.texts.guidance,/Symbol known.*ff_file action=read.*files=.*symbol:.*no outline first/)
+    assert.doesNotMatch(result.texts.guidance,/#<Symbol>/)
+    assert.match(result.texts.guidance,/batch independent changes.*ONE call using steps=.*match=literal also supports steps/)
+    assert.match(result.texts.guidance,/todo_write.*mirrored.*do not recreate.*task_add/)
+    const filtered=await promptSurface({config:{surface},visibleNames:['ff_symbols','read']})
+    assert.match(filtered.texts.guidance,/Symbol known.*read with file_path=<file>#<Symbol>.*no outline first/)
+    assert.doesNotMatch(filtered.texts.guidance,/ff_file/)
+   } else assert.match(result.texts.guidance,/Symbol known.*read with file_path=<file>#<Symbol>.*no outline first/)
    console.log('PASS',version,surface,'real SDK projections and tokenizer counts');count++
   }
  }

@@ -130,6 +130,29 @@ await test('expired and evicted cursors fail explicitly; retries before expiry a
  for (let i = 0; i < 129; i++) output.project(large, 'get', {}, { detail: 'tasks', limit: 1 })
  assert.throws(() => output.project(large, 'get', {}, { detail: 'tasks', cursor: old }), /expired|unknown/)
 })
+await test('task pages survive unrelated reports but reject changes beyond previews at the same revision', async () => {
+ const args = { action: 'get', projectId: large.id, detail: 'tasks', limit: 1 }
+ const first = await call(args)
+ await call({ action: 'report', projectId: large.id, revision: large.revision, status: 'draft', conclusion: 'Unrelated to task content', issues: [] })
+ large = getProject(workspace, large.id)
+ const next = await call({ ...args, cursor: first.nextCursor })
+ assert.equal(next.snapshot, first.snapshot); assert.equal(next.tasks[0].id, large.tasks[1].id)
+ const source = structuredClone(large), output = new ProjectOutput()
+ source.tasks[10].note = 'x'.repeat(300) + 'before'
+ const page = output.project(source, 'get', {}, { detail: 'tasks', limit: 1 })
+ const changed = structuredClone(source); changed.tasks[10].note = 'x'.repeat(300) + 'after'
+ assert.equal(changed.revision, source.revision)
+ assert.throws(() => output.project(changed, 'get', {}, { detail: 'tasks', cursor: page.nextCursor }), /snapshot changed/)
+})
+await test('project list cursors bind displayed summaries, not hidden historical bodies', () => {
+ const output = new ProjectOutput(), source = [structuredClone(large), structuredClone(p)]
+ const page = output.list(source, workspace, '', { detail: 'summary', limit: 1 })
+ source[0].reports[0].conclusion = 'Historical body changed outside this summary'
+ const next = output.list(source, workspace, '', { detail: 'summary', cursor: page.nextCursor })
+ assert.equal(next.snapshot, page.snapshot); assert.equal(next.projects[0].id, p.id)
+ source[1].tasks[1].status = 'done'
+ assert.throws(() => output.list(source, workspace, '', { detail: 'summary', cursor: page.nextCursor }), /snapshot changed/)
+})
 await test('one batch linked twice counts as two links and one batch, retaining full evidence', async () => {
  const store = storeFor(workspace), before = putBlob(store, Buffer.from('before\n')), after = putBlob(store, Buffer.from('after\n'))
  const batch = recordBatch(store, { kind: 'edit', reason: 'immutable evidence '.repeat(1200), actor: 'test',

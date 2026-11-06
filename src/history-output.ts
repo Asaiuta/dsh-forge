@@ -86,13 +86,19 @@ export class DiffOutput {
     format: 'patch-fragment', offset: position.offset, totalChars: source.length,
     ...(complete ? {} : { nextCursor: this.next(position, end) }) })
   }
-  const units = sources.flatMap(({ info, patch }) => (patch.hunks.length ? patch.hunks : ['']).map(hunk => ({ info, patch, hunk })))
-  const hasOmissions = units.some(u => oversizedHunk(u.hunk))
+  const units = sources.flatMap(({ info, patch }) => (patch.hunks.length ? patch.hunks : ['']).map(hunk => {
+   const full: NodeDiff = { ...info, diff: patch.header + hunk, binary: patch.binary, coarse: patch.coarse, truncated: false }
+   // Account for complete file/snapshot identity too. A hunk that cannot fit
+   // even an empty page needs the patch reader, regardless of its text size.
+   const oversized = oversizedHunk(hunk) || jsonBytes(full) > OUTPUT_ITEM_BYTES || jsonBytes([full]) > OUTPUT_CONTENT_BYTES
+   return { info, patch, hunk, oversized }
+  }))
+  const hasOmissions = units.some(u => u.oversized)
   const omittedNodes: string[] = []
   const diffs: NodeDiff[] = []
   let end = position.offset
   for (const unit of units.slice(position.offset)) {
-   const existing = diffs.find(d => d.node === unit.info.node), oversized = oversizedHunk(unit.hunk)
+   const existing = diffs.find(d => d.node === unit.info.node), oversized = unit.oversized
    const diff = existing ? { ...existing } : { ...unit.info, diff: unit.patch.header, binary: unit.patch.binary, coarse: unit.patch.coarse, truncated: false }
    diff.diff += oversized ? '' : unit.hunk
    diff.truncated ||= oversized
@@ -123,7 +129,7 @@ export function renderDiffPage(page: DiffPage): string[] {
  if (page.snapshot) lines.push(`[snapshot ${page.snapshot}]`)
  if (page.format) lines.push(`[${page.format} offset=${page.offset} totalChars=${page.totalChars}; concatenate ${page.record === undefined ? 'diff strings before applying' : 'record strings before JSON parsing'}]`)
  if (page.omittedNodes?.length) lines.push(`[oversized hunks omitted; ff_history node=<${page.omittedNodes.join('|')}> detail=patch returns complete patch fragments]`)
- if (page.nextCursor) lines.push(`[incomplete; continue ff_history with the same batch/node/detail and cursor=${page.nextCursor}]`)
+ if (page.nextCursor) lines.push(`[incomplete; continue ff_history with the same selection/detail and cursor=${page.nextCursor}]`)
  if (!page.complete && !page.nextCursor && !page.omittedNodes?.length) lines.push('[incomplete; oversized hunks were omitted on earlier pages; read those node addresses with detail=patch]')
  return lines
 }

@@ -9,14 +9,13 @@ import { storeFor } from './ledger.ts'
 import { persistRecord } from './check-record.ts'
 import { aggregateChecks, sha256Bytes, type CheckResult } from './verification.ts'
 
-export function createVerifyTool() {
+export function createStaticVerifier() {
   return {
-    name: 'ff_verify',
     description: 'Persist independent static verification without editing source files. Select an existing batch integer OR one workspace file path. Batch checks use recorded before/after evidence. Path checks support current syntax; bridge/ipc are not_run (no_baseline), never a fabricated comparison.',
     parameters: {
       batch: { type: 'integer', description: 'Existing positive ledger batch id; exclusive with path.' },
       path: { type: 'string', description: 'One existing workspace file; exclusive with batch. No directory or substring matching.' },
-      checks: { type: 'array', items: { type: 'string', enum: ['bridge', 'ipc', 'syntax'] }, description: 'Nonempty static check list. Defaults to bridge and syntax.' },
+      checks: { type: 'array', items: { type: 'string', enum: ['bridge', 'ipc', 'syntax'] }, description: 'Nonempty static check list. Defaults: path -> syntax; batch -> bridge and syntax.' },
     },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args: unknown, value: { text: string }) => [{ type: 'text' as const, text: value.text }] },
     // batch 补成 0 与「没选」同义，否则会和 path 撞成「二选一」冲突。
@@ -24,10 +23,10 @@ export function createVerifyTool() {
     isConcurrencySafe: () => true,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {
-        for (const key of Object.keys(args)) if (!['batch', 'path', 'checks'].includes(key)) throw new Error(`${key} is not a parameter of ff_verify`)
+        for (const key of Object.keys(args)) if (!['batch', 'path', 'checks'].includes(key)) throw new Error(`${key} is not allowed for action=verify`)
         if ((args.batch === undefined) === (args.path === undefined)) throw new Error('provide exactly one of batch or path')
         if (args.checks !== undefined && !Array.isArray(args.checks)) throw new Error('checks must be a nonempty list')
-        const normalized = normaliseChecks(args.checks)
+        const normalized = normaliseChecks(args.checks ?? (args.path !== undefined ? ['syntax'] : undefined))
         if (!normalized.ok) throw new Error(normalized.detail)
         if (args.batch !== undefined) {
           if (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1) throw new Error('batch must be a positive integer')
@@ -73,3 +72,4 @@ export function createVerifyTool() {
     },
   } as const
 }
+

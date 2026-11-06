@@ -1,5 +1,6 @@
 # dsh-forge 能力补齐与工具闭环路线图
 
+> 2026-11-05 接口更新：`ff_verify` 已并入 `ff_edit action=verify`，新增 `ff_edit action=eval` 与 `ff_file action=read`，full 为 9 个。以下既有阶段说明保留当时状态；当前契约见 [合并报告](2026-11-05_read-eval-consolidation-report.md)。
 文档起草于 2026-10-28；当前接口于 2026-11-01 复核：当前 `retrieval` 为 3 个工具，`full` 为 10 个，见[接口迁移说明](forge-interface-migration-2026-11-01.md)。M0/M1 的主要静态实现进入工作树；原 `ffcheck plan/run` 宿主执行层与 `ff_cards` 已下线，历史设计保留但不可调用。M2 及之后仍为规划。源码状态不代表发布、部署或真实 GUI 验收；现有 URL 返回 `403 Browser access disabled`，未完成浏览器 E2E。
 
 本文只管理未来阶段、依赖和验收，不承载逐次实现日志。历史 Trace 重构见 [旧路线图](trace-roadmap-2026-10-26.md)，语义后端选型依据见 [语义引擎研究](semantics-engine-research-2026-10-26.md)，现有接口见 [Trace 参考](trace-reference.md)。历史文档中的“计划”和“已完成”均不能代替当前源码验证。

@@ -1,5 +1,6 @@
 # 检查吸收历史与当前验证入口
 
+> 2026-11-05 接口更新：`ff_verify` 已并入 `ff_edit action=verify`，新增 `ff_edit action=eval` 与 `ff_file action=read`，full 为 9 个。以下既有阶段说明保留当时状态；当前契约见 [合并报告](2026-11-05_read-eval-consolidation-report.md)。
 日期：2026-10-31；接口状态补记：2026-11-01。依据见 [takeover 评测结果](takeover-eval-result-2026-10-30.md) 与全会话工具调用统计。
 
 ## 当前状态（2026-11-01）

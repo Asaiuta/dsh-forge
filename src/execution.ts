@@ -4,7 +4,7 @@ import { canonicalTarget } from './fs-paths.ts'
 import { workdirOf, type ForgeExec } from './core.ts'
 
 interface FsTarget { targetKey: unknown; displayPath: string }
-export interface ForgeSandboxPolicy { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string }
+export interface ForgeSandboxPolicy { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string; additionalWritableRoots?: string[] }
 export interface ForgePolicyService {
   resolve(request: { session?: NonNullable<ForgeExec['agent']>['session'] }): ForgeSandboxPolicy
 }
@@ -22,9 +22,11 @@ export interface ForgeFsEvents {
   waterfall?(event: 'fs/write-intent', target: FsTarget, actor: unknown, next: () => undefined): Promise<unknown>
   emit?(event: 'fs/observed', target: FsTarget, observation: unknown, actor: unknown): unknown
 }
-export function createExecutionGuard(provider: ForgeFileSystem | undefined, events: ForgeFsEvents = {}, policyService?: ForgePolicyService) {
+export function createExecutionGuard(hostProvider: ForgeFileSystem | undefined, events: ForgeFsEvents = {}, hostPolicy?: ForgePolicyService) {
   return async (exec: ForgeExec | undefined, args: Record<string, unknown>, tool: string): Promise<ForgeExec> => {
     exec?.signal?.throwIfAborted()
+    const provider = exec?.agent?.ctx ? exec.agent.ctx.get('fs') as ForgeFileSystem | undefined : hostProvider
+    const policyService = exec?.agent?.ctx ? exec.agent.ctx.get('sandboxPolicy') as ForgePolicyService | undefined : hostPolicy
     if (!provider) throw new Error('forge host requires the DSH filesystem service')
     if (typeof provider.resolve !== 'function' || typeof provider.processPath !== 'function' || typeof provider.processPathFromHostPath !== 'function') {
       throw new Error('forge requires a shared-local DSH filesystem provider with native path mapping')

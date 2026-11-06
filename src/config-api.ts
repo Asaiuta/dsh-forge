@@ -5,7 +5,7 @@ export const FORGE_ROW_ID = 'dsh-forge'
 export const CONFIG_PATH = '/forge-config'
 const SURFACES = ['retrieval', 'full'] as const
 
-export interface ForgeSettingsState { surface: ForgeSurface }
+export interface ForgeSettingsState { surface: ForgeSurface; hideBuiltinWrites: boolean }
 
 export class ConfigEditError extends Error {
   constructor(message: string) { super(message); this.name = 'ConfigEditError' }
@@ -17,7 +17,7 @@ function record(value: unknown): Record<string, unknown> {
 
 export function readSettings(raw: unknown): ForgeSettingsState {
   const surface = record(raw).surface
-  return { surface: (SURFACES as readonly unknown[]).includes(surface) ? surface as ForgeSurface : 'retrieval' }
+  return { surface: (SURFACES as readonly unknown[]).includes(surface) ? surface as ForgeSurface : 'retrieval', hideBuiltinWrites: record(raw).hideBuiltinWrites === true }
 }
 
 export function nextConfig(current: unknown, body: unknown): Record<string, unknown> {
@@ -26,5 +26,6 @@ export function nextConfig(current: unknown, body: unknown): Record<string, unkn
   if (!(SURFACES as readonly unknown[]).includes(surface)) {
     throw new ConfigEditError('surface 必须是 retrieval 或 full')
   }
-  return { ...record(current), surface }
+  if (input.hideBuiltinWrites !== undefined && typeof input.hideBuiltinWrites !== 'boolean') throw new ConfigEditError('hideBuiltinWrites 必须是布尔值')
+  return { ...record(current), surface, hideBuiltinWrites: input.hideBuiltinWrites ?? readSettings(current).hideBuiltinWrites }
 }

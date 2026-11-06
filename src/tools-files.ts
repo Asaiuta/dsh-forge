@@ -1,15 +1,16 @@
 /** File and symbol transfers commit all affected raw bytes in one recoverable batch. */
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, mkdirSync, lstatSync, rmdirSync } from 'node:fs'
 import path from 'node:path'
 import { canonicalTarget, canonicalWorkspace, within } from './fs-paths.ts'
 import { observedRead, parseLineRange, type ForgeExec, workdirOf, withFileLock, withFileLocks, withNativeWrite } from './core.ts'
-import { commitFiles, detectEncoding, encodeText, prepareWorkspace, putBlob, readKnownState, recordExternalState, storeFor, type FileChange, type LedgerNode } from './ledger.ts'
+import { commitFiles, detectEncoding, encodeText, hasPendingTransaction, prepareWorkspace, putBlob, readKnownState, recordExternalState, storeFor, type FileChange, type LedgerNode } from './ledger.ts'
 import { AUDIT_REASONS, AUDIT_STATUSES, auditCommit, renderAudit, type EditAudit } from './edit-audit.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
 import { findSymbol, parseFile, normalizeText, symbolSpan, syntaxValid, detectLanguage } from './ast.ts'
 import { applyEditSteps } from './edit-engine.ts'
 import { isSymbolicLink } from './fs-paths.ts'
 import { validateAttribution } from './projects.ts'
+import { createBatchReader, type ReadManyPage } from './read-many.ts'
 
 /** Leading spaces of the nearest usable line at/after the insertion point (then before),
  *  skipping the moved range in same-file moves and tab-indented lines — space re-indent only.
@@ -48,6 +49,41 @@ function read(file: string): Buffer | null {
   const bytes = readFileSync(file)
   if (bytes.length > 8 * 1024 * 1024) throw new Error('file operation exceeds 8MB cap')
   return bytes
+}
+
+/** Called only inside the authorized provider write lock. Directory rollback is
+ * best effort and removes only our still-empty, unchanged directories. Successful
+ * file rollback intentionally leaves directories, as the ledger tracks files. */
+function withCreateParents<T>(file: string, workspace: string, pending: () => boolean, operation: () => T): T {
+  const missing: string[] = []
+  for (let dir = path.dirname(file); !existsSync(dir); dir = path.dirname(dir)) {
+    if (!within(workspace, dir) || dir === path.dirname(dir)) throw new Error('create parent escapes workspace')
+    missing.unshift(dir)
+  }
+  const created: Array<{ dir: string; ino: number; dev: number }> = []
+  try {
+    for (const dir of missing) {
+      if (canonicalTarget(dir) !== dir) throw new Error('create parent changed during planning')
+      try { mkdirSync(dir) } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const current = lstatSync(dir)
+        if (!current.isDirectory() || current.isSymbolicLink()) throw new Error('create parent is not a regular directory')
+        continue
+      }
+      const stat = lstatSync(dir)
+      created.push({ dir, ino: stat.ino, dev: stat.dev })
+    }
+    if (canonicalTarget(file) !== file) throw new Error('create target changed during planning')
+    return operation()
+  } catch (error) {
+    if (!pending()) for (const item of created.reverse()) {
+      try {
+        const stat = lstatSync(item.dir)
+        if (stat.ino === item.ino && stat.dev === item.dev && !stat.isSymbolicLink()) rmdirSync(item.dir)
+      } catch { /* Never remove a directory populated or replaced by another writer. */ }
+    }
+    throw error
+  }
 }
 /**
  * Validate a snapshot as before-evidence for a whole-file operation.
@@ -132,12 +168,14 @@ function validateFileArgs(args: Record<string, unknown>): void {
 
 
 export function createFileTool() {
+  const reader = createBatchReader()
   return {
     name: 'ff_file',
-    description: 'Create/remove/move files or transfer a symbol/line range atomically. Paths stay inside the workspace; parents must exist. Read before writing. create takes content; move takes destination; copy_code/move_code take sourceSymbol|fromLines plus one of after|before|afterSymbol|beforeSymbol. Every other field is rejected by name. Symbol editing belongs to ff_edit.',
+    description: 'Read a known symbol with action=read, files=[{path,symbol}]; also batches files/ranges with snapshot paging. Plain single-file reads use read. Create/remove/move files or transfer code atomically inside the workspace. create makes missing parents; other writes require them. Read before writing; symbol edits use ff_edit.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['create', 'remove', 'move', 'copy_code', 'move_code'], description: 'File operation. Unrelated fields are rejected.' },
-      path: { type: 'string', required: true, description: 'File path, absolute or workspace-relative; source for move/transfers.' },
+      action: { type: 'string', required: true, enum: ['read', 'create', 'remove', 'move', 'copy_code', 'move_code'], description: 'read takes files or cursor; writes take path and reason. Unrelated fields are rejected.' },
+      path: { type: 'string', description: 'Write target, absolute or workspace-relative; source for move/transfers.' },
+      ...reader.parameters,
       destination: { type: 'string', description: 'Required for move/transfers.' },
       content: { type: 'string', description: 'Required for create: literal UTF-8 text.' },
       overwrite: { type: 'boolean', description: 'create/move: allow overwriting the destination. Default false.' },
@@ -149,13 +187,14 @@ export function createFileTool() {
       afterSymbol: { type: 'string', description: 'Insert after this destination symbol.' },
       beforeSymbol: { type: 'string', description: 'Insert before this destination symbol.' },
       indent: { type: 'string', enum: ['auto', 'none'], description: 'Transfers only: auto (default) re-indents, none keeps block bytes.' },
-      reason: { type: 'string', required: true, description: 'Why this change; recorded in history.' },
+      reason: { type: 'string', description: 'Required for writes: why this change; recorded in history.' },
       projectId: { type: 'string', description: 'Optional explicit project attribution in this workspace; not inferred from GUI selection.' },
       taskId: { type: 'string', description: 'Optional non-archived task; requires projectId.' },
       snapshotId: { type: 'string', description: 'Baseline from ff_trace capture=true: reads must match those bytes, a create must be absent from it.' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: {
-      batch: { type: 'integer', required: true }, files: { type: 'array', items: { type: 'string' }, required: true },
+      batch: { type: 'integer' }, files: { type: 'array', items: { type: 'string' } },
+      read: { type: 'object', additionalProperties: true, description: 'Read page: ordered selections with complete paths, source hashes, line ranges, UTF-16 offsets and LF text; complete/nextCursor govern continuation.' },
       note: { type: 'string' },
       audit: {
         type: 'object',
@@ -171,8 +210,9 @@ export function createFileTool() {
           rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
         },
       },
-    } }, render: (_args: unknown, value: { batch: number; files: string[]; note?: string; audit?: EditAudit }) => {
-      const lines = [`batch #${value.batch}\n${value.files.join('\n')}${value.note ? `\n[${value.note}]` : ''}`]
+    } }, render: (_args: unknown, value: { batch?: number; files?: string[]; read?: ReadManyPage; note?: string; audit?: EditAudit }) => {
+      if (value.read) return reader.output.render(_args, value.read)
+      const lines = [`batch #${value.batch}\n${value.files!.join('\n')}${value.note ? `\n[${value.note}]` : ''}`]
       if (value.audit) lines.push(...renderAudit(value.audit))
       return [{ type: 'text' as const, text: lines.join('\n') }]
     } },
@@ -195,6 +235,7 @@ export function createFileTool() {
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
       try {
+        if (args.action === 'read') { const { action: _, ...input } = args; return { read: await reader.execute(input, exec) } }
         validateFileArgs(args)
         const workspace = canonicalWorkspace(workdirOf(exec))
         const store = storeFor(workspace), action = required(args, 'action'), reason = required(args, 'reason')
@@ -207,7 +248,8 @@ export function createFileTool() {
         await exec?.authorizeNativePaths?.([source, ...(destination ? [destination] : [])])
         for (const file of [source, destination].filter((file): file is string => !!file)) {
           if (!within(workspace, file)) throw new Error('file operations must stay inside the workspace')
-          if (!existsSync(path.dirname(file)) || !statSync(path.dirname(file)).isDirectory()) throw new Error('destination parent must be an existing directory')
+          const parent = path.dirname(file)
+          if (existsSync(parent) ? !statSync(parent).isDirectory() : action !== 'create') throw new Error('destination parent must be an existing directory')
         }
         const snapshotId = typeof args.snapshotId === 'string' ? args.snapshotId.trim() : ''
         const committed = await withFileLock(store.dir, () => withFileLocks([source, ...(destination ? [destination] : [])], async () => {
@@ -383,7 +425,8 @@ export function createFileTool() {
               return { file, op: change.after === null ? 'delete' : change.before === null ? 'create' : 'update', before: change.before === null ? null : putBlob(store, change.before).id,
                 after: change.after === null ? null : putBlob(store, change.after).id, bytes: change.after?.length ?? 0, eol: enc.eol, bom: enc.bom }
             })
-            const batch = commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, nodes, ...(attribution ? { attribution } : {}) }, changes)
+            const commit = () => commitFiles(store, { kind: 'edit', actor: exec?.agent?.session?.header?.id ?? 'unknown', reason, nodes, ...(attribution ? { attribution } : {}) }, changes)
+            const batch = action === 'create' ? withCreateParents(source, workspace, () => hasPendingTransaction(store), commit) : commit()
             return { batch: batch.id, files: nodes.map(node => node.file), ...(transferNote ? { note: transferNote } : {}) }
           })
         }))

@@ -47,7 +47,7 @@ export function createReadTool(workers?: AstWorkerPool) {
   const outline = new OutlineOutput()
   return {
     name: 'ff_symbols',
-    description: 'Browse declarations and container members or locate exact symbol definitions. Outline pages stop below function/method bodies by default; changed source invalidates cursors. Known file and symbol: read file_path=<file>#<Symbol> directly.',
+    description: 'Browse declarations and container members or locate exact symbol definitions. Outline pages stop below function/method bodies by default; changed source invalidates cursors. When the file and symbol are known, read the definition directly without outlining first.',
     parameters: {
       view: { type: 'string', enum: VIEWS, required: true, description: 'outline for one file, definitions to find a symbol.' },
       path: { type: 'string', description: 'outline: required file. definitions: optional search root; a file narrows the search to that file.' },

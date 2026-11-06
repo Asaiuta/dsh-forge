@@ -4,8 +4,8 @@
  * Forge never renames itself onto a built-in, so every line names a forge tool
  * by its own name, and a line appears only when that tool resolves in the
  * calling scope. The built-ins `read`/`grep`/`glob` carry their own prompt
- * sections; augmenting them adds exactly one line here, for the one behaviour
- * the model cannot discover from the built-in's description (`file#Symbol`).
+ * sections. Full scopes use ff_file's explicit symbol selector; retrieval-only
+ * scopes advertise the augmented read's file#Symbol convention.
  */
 import { FORGE_DEFINITION_TAG } from './host.ts'
 import type { AugmentName } from './augment.ts'
@@ -14,14 +14,14 @@ export const FORGE_GUIDANCE_ORDER = 130
 export const FORGE_GUIDANCE_SECTION = 'plugin:dsh-forge'
 
 export const FORGE_CAPABILITIES = [
-  'find', 'grep', 'read', 'edit', 'file', 'history', 'rollback', 'trace', 'verify', 'project',
+  'find', 'grep', 'read', 'edit', 'file', 'history', 'rollback', 'trace', 'project',
 ] as const
 export type ForgeCapability = (typeof FORGE_CAPABILITIES)[number]
 
 /** The forge tool serving each capability. */
 export const FORGE_TOOLS: Record<ForgeCapability, string> = {
   find: 'ff_find', grep: 'ff_grep', read: 'ff_symbols', edit: 'ff_edit', file: 'ff_file',
-  history: 'ff_history', rollback: 'ff_rollback', trace: 'ff_trace', verify: 'ff_verify', project: 'ff_project',
+  history: 'ff_history', rollback: 'ff_rollback', trace: 'ff_trace', project: 'ff_project',
 }
 export const FORGE_TOOL_NAMES = FORGE_CAPABILITIES.map((capability) => FORGE_TOOLS[capability])
 
@@ -53,17 +53,12 @@ export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CA
   if (!visible.length && !augmented.symbolRead) return ''
   const n = FORGE_TOOLS
   return [
-    // One line either way: when `read` answers `file#Symbol`, a plain read stays
-    // the built-in's and ff_read keeps what only it can do.
-    //
-    // Order matters and was measured: leading with "view=outline first" made two
-    // real sessions run a 21KB outline before reading a symbol they had already
-    // named (Q5 of docs/takeover-eval-result-2026-10-30.md — 5.4k tok and one
-    // round trip burnt for nothing). The known-symbol case comes first and says
-    // not to outline; the outline is introduced only as what answers the
-    // opposite question. That correction is the one thing here no schema can
-    // carry, so it survives every trim.
-    ...(has('read') && augmented.symbolRead ? [
+    // Known definitions precede outline discovery. Full scopes expose a symbol
+    // field directly; missing/hidden ff_file falls back to augmented read.
+    ...(has('file') ? [
+      `- Symbol known → ${n.file} action=read, files=[{path:"src/service.ts",symbol:"Service.start"}]; no outline first. Also batches known files/ranges. Plain single-file reads → read.`,
+      ...(has('read') ? [`- Need names → ${n.read} view=outline; every definition of one name → view=definitions. Request further pages only when needed.`] : []),
+    ] : has('read') && augmented.symbolRead ? [
       `- Symbol known → read with file_path=<file>#<Symbol> (no offset/limit): that definition only, no outline first. Need the names → ${n.read} view=outline; every definition of one name → view=definitions. Request further outline pages only when needed.`,
     ] : has('read') ? [
       `- Code structure → ${n.read} view=outline for names and line ranges; view=definitions with symbol=<name> for exact definitions. Read source through the built-in read using the returned file and line range.`,
@@ -92,10 +87,9 @@ export function forgeGuidance(visible: readonly ForgeCapability[] = RETRIEVAL_CA
     ] : []),
     ...(has('edit') ? [
       // Ask for the patch at edit time only when the task needs its evidence.
-      `- Edit after reading → ${n.edit}; request receipt=diff when patch evidence is needed. A built-in edit is recorded too.`,
+      `- Edit after reading → ${n.edit}: batch independent changes to the same file in ONE call using steps=[{find,replaceWith},...]; all target the original snapshot. match=literal also supports steps. Use a single find/replaceWith only for one change. receipt=diff when evidence is needed; compilers/tests for build/type correctness.`,
     ] : []),
-    ...(has('file') ? [`- Create, remove, move, transfer → ${n.file}; edit one symbol through ${has('edit') ? n.edit : 'the available editing tool'}.`] : []),
-    ...(has('verify') ? [`- Check existing work without modifying it → ${n.verify}; keep recorded verdicts separate from current applicability.`] : []),
+    ...(has('file') ? [`- Create/overwrite files → ${n.file} action=create (overwrite=true to replace); missing parents are created.`] : []),
     ...(has('project') ? [`- ${n.project} tracks projects and reports. Daily plans use todo_write, already mirrored into projects; do not recreate them with task_add. Request report/evidence details only when needed.`] : []),
     ...(has('history') ? [
       `- Look back → ${n.history}; revert → ${has('rollback') ? n.rollback : 'ff_rollback'}.`,

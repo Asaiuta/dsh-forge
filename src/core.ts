@@ -100,6 +100,7 @@ export function isHomeDir(dir: string): boolean {
 /** Structural slice of the DSH tool-execution context this module reads. */
 export interface ForgeExec {
   agent?: {
+    ctx?: { get(name: string): unknown }
     session?: { header?: { cwd?: string; id?: string } }
     /** Present on the real host agent (blackhole reads the same fields for
      *  compaction routing); optional here — provenance labels degrade to

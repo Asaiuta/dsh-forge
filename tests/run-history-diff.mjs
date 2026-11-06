@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 const temp = mkdtempSync(path.join(os.tmpdir(), 'forge-diff-'))
 const workspace = path.join(temp, 'work'); mkdirSync(workspace)
 process.env.DSH_FORGE_DATA_DIR = path.join(temp, 'private')
-const { snapshotPatch, snapshotDiff } = await import('../src/history.ts')
+const { snapshotPatch, snapshotDiff, oversizedHunk } = await import('../src/history.ts')
 const { DiffOutput } = await import('../src/history-output.ts')
 const { createEditTool, createHistoryTool } = await import('../src/tools-edit.ts')
 const { FinderPool } = await import('../src/core.ts')
@@ -23,7 +23,7 @@ function applyPatch(before, after, patch, file = 'sample.txt') {
  const target = path.join(root, file); mkdirSync(path.dirname(target), {recursive:true})
  if (before !== null) writeFileSync(target, before)
  const patchFile = path.join(root, 'input.patch'); writeFileSync(patchFile, patch)
- const result = spawnSync('git', ['-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', '--', patchFile], {cwd:root, encoding:'utf8'})
+ const result = spawnSync('git', ['-c', 'core.autocrlf=false', '-c', 'core.longpaths=true', 'apply', '--whitespace=nowarn', '--', patchFile], {cwd:root, encoding:'utf8'})
  assert.equal(result.status, 0, result.stderr + '\n' + patch)
  if (after !== null) assert.deepEqual(readFileSync(target), Buffer.from(after))
  else assert.throws(() => readFileSync(target), /ENOENT/)
@@ -136,6 +136,24 @@ await test('oversized hunk and long line are explicit and patch fragments recove
   text+=part;cursor=v.page.nextCursor;pages++
  }while(cursor)
  assert.ok(pages>1);applyPatch(a,b,text,'long.txt')
+})
+await test('a near-budget hunk with long file identity returns an explicit patch route, not an error', async () => {
+ const file=Array.from({length:9},(_,i)=>`${i}${'d'.repeat(54)}`).join('/')+'/sample.txt'
+ const before=Array.from({length:8},(_,i)=>`${i}${'a'.repeat(849)}\n`).join('')
+ const after=before.replace(`3${'a'.repeat(849)}`,`3${'b'.repeat(849)}`)
+ const patch=snapshotPatch(buffer(before),buffer(after),file)
+ assert.equal(patch.hunks.length,1);assert.equal(oversizedHunk(patch.hunks[0]),false)
+ const {batch}=batchFor(file,before,after),node=`b${batch.id}:n0`
+ const preview=await call({batch:batch.id})
+ assert.equal(preview.page.complete,false);assert.deepEqual(preview.page.omittedNodes,[node])
+ assert.equal(preview.items[0].diffs[0].file,file);assert.equal(preview.items[0].diffs[0].truncated,true)
+ assert.ok(Buffer.byteLength(JSON.stringify(preview))<=12*1024)
+ let cursor,text=''
+ do {
+  const v=await call({node,detail:'patch',...(cursor?{cursor}:{})})
+  assert.equal(v.page.offset,text.length);text+=v.items[0].diffs[0].diff;cursor=v.page.nextCursor
+ }while(cursor)
+ assert.equal(text,patch.header+patch.hunks.join(''));applyPatch(before,after,text,file)
 })
 await test('multi-node pages preserve every node and inline diff cursors continue in history', async () => {
  const store=storeFor(workspace)

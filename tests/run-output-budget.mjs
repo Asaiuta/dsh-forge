@@ -2,15 +2,19 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { jsonBytes, outputFragment, outputRows, outputPreview, OUTPUT_PAGE_BYTES } from '../src/output-budget.ts'
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-budget-'))
 const workspace = path.join(temp, 'work'); fs.mkdirSync(workspace)
 process.env.DSH_FORGE_DATA_DIR = path.join(temp, 'private')
 const { createEditTool, createHistoryTool } = await import('../src/tools-edit.ts')
 const { FinderPool } = await import('../src/core.ts')
-const { storeFor, putBlob, recordBatch, gcStoreBlobs } = await import('../src/ledger.ts')
+const { storeFor, putBlob, recordBatch, readLedgerTail, gcStoreBlobs } = await import('../src/ledger.ts')
 const { defineForgeTool } = await import('../src/host.ts')
-const { ToolRuntime } = await import('@deepseek-ai/dsh-tools')
+const modules=process.env.DSH_FORGE_DSH_MODULES
+const ToolRuntime=modules
+ ?(await import(pathToFileURL(path.join(modules,'dsh-tools/lib/pipeline.js')))).ToolExecutionPipeline
+ :(await import('@deepseek-ai/dsh-tools')).ToolRuntime
 const pool = new FinderPool(), edit = defineForgeTool(createEditTool(pool)), history = defineForgeTool(createHistoryTool())
 const runtime = Object.create(ToolRuntime.prototype); runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
 const exec = {agent:{session:{header:{cwd:workspace,id:'budget-test'}}}}
@@ -19,6 +23,8 @@ async function test(name,fn) { await fn(); console.log('PASS',name); count++ }
 async function call(tool,args) {
  const context = {...exec, arguments:args, token:{}, parent:{}}
  const value = await tool.execute(args,context), result = runtime.createSuccessResult(context,tool,value)
+ const native = runtime.createSuccessResult({...context,parent:undefined},tool,value)
+ assert.deepEqual(native.value,result.value)
  assert.ok(jsonBytes(result.value) <= OUTPUT_PAGE_BYTES)
  assert.ok(Buffer.byteLength(result.content.map(p=>p.text).join('\n')) <= OUTPUT_PAGE_BYTES)
  assert.ok(!('forgePresentation' in result.value))
@@ -58,19 +64,40 @@ try {
   const value=await call(history,{batch:batch.id});assert.match(value.note,/truncated/);assert.ok(value.page.complete)
   const full=await record({batch:batch.id,detail:'record'});assert.ok(full.pages>1);assert.deepEqual(full.value,batch)
  })
- await test('large successful edit receipt stays successful and full diagnostics remain reachable',async()=>{
+ for (const mode of ['default', 'diff']) await test(`large ${mode} edit receipt stays successful and full diagnostics remain reachable`,async()=>{
   const names=Array.from({length:50},(_,i)=>`f${i}_${'X'.repeat(220)}`)
   const before=names.map(n=>`function ${n}(){ return 1 }`).join('\n')+'\n'
   fs.writeFileSync(path.join(workspace,'receipt.js'),before)
   const steps=names.map((n,i)=>({start:i+1,end:i+1,text:`function ${n}(){ return 2 }`}))
-  const value=await call(edit,{path:'receipt.js',steps,reason:'large receipt fixture',receipt:'diff'})
+  const value=await call(edit,{path:'receipt.js',steps,reason:'large receipt fixture',...(mode==='diff'?{receipt:'diff'}:{})})
   assert.equal(value.status,'applied');assert.equal(value.applied,50);assert.equal(value.receiptComplete,false);assert.match(value.receiptRef,/^[a-f0-9]{64}$/)
   gcStoreBlobs(storeFor(workspace))
   const full=await record({batch:value.batch,detail:'receipt',receiptRef:value.receiptRef})
   assert.ok(full.pages>1);assert.equal(full.value.reports.length,50);assert.equal(full.value.hash,value.hash)
-  assert.ok(fs.readFileSync(path.join(workspace,'receipt.js'),'utf8').includes('return 2'))
+  assert.equal(fs.readFileSync(path.join(workspace,'receipt.js'),'utf8'),names.map(n=>`function ${n}(){ return 2 }`).join('\n')+'\n')
   await assert.rejects(call(history,{batch:value.batch-1,detail:'receipt',receiptRef:value.receiptRef}),/does not identify/)
   await assert.rejects(call(history,{batch:value.batch,receiptRef:value.receiptRef}),/requires detail/)
+ })
+ for (const mode of ['unchanged', 'ticket']) await test(`large ${mode} receipt is bounded without inventing a ledger batch`,async()=>{
+  const names=Array.from({length:50},(_,i)=>`f${i}_${'X'.repeat(220)}`)
+  const before=names.map(n=>`function ${n}(){\n  return 1\n}`).join('\n')+'\n'
+  fs.writeFileSync(path.join(workspace,'unwritten.js'),before)
+  const countBefore=readLedgerTail(storeFor(workspace)).length
+  const args=mode==='ticket'?{find:'  return 1',replaceWith:'  return 2'}
+   :{steps:names.map((n,i)=>({start:i*3+1,end:i*3+1,text:`function ${n}(){`}))}
+  const value=await call(edit,{path:'unwritten.js',...args,reason:'unwritten receipt fixture'})
+  assert.equal(value.status,mode==='ticket'?'ticket':'applied');assert.equal(value.batch,undefined)
+  assert.equal(value.receiptComplete,false);assert.match(value.receiptRef,/^[a-f0-9]{64}$/)
+  const full=await record({detail:'receipt',receiptRef:value.receiptRef})
+  assert.ok(full.pages>1);assert.equal(full.value.status,value.status)
+  if(mode==='ticket') {assert.equal(full.value.candidates.length,50);assert.equal(full.value.ticket,value.ticket)}
+  else {assert.equal(full.value.reports.length,50);assert.equal(full.value.hash,value.hash)}
+  assert.equal(fs.readFileSync(path.join(workspace,'unwritten.js'),'utf8'),before)
+  assert.equal(readLedgerTail(storeFor(workspace)).length,countBefore)
+  for(const fields of [{node:'b1:n0'},{checks:true},{limit:1},{batch:1}])
+   await assert.rejects(call(history,{detail:'receipt',receiptRef:value.receiptRef,...fields}),/only|does not identify/)
+  const first=await call(history,{detail:'receipt',receiptRef:value.receiptRef})
+  await assert.rejects(call(history,{detail:'receipt',receiptRef:'0'.repeat(64),cursor:first.page.nextCursor}))
  })
  console.log(`${count} output budget groups passed, 0 failed`)
 } finally {pool.disposeAll();fs.rmSync(temp,{recursive:true,force:true})}

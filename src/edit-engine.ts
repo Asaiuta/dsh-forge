@@ -298,6 +298,34 @@ function inferOp(step: EditStep): EditOp | null {
   return null
 }
 
+/** Validate intent before either the line planner or automatic inline matching. */
+function stepShapeError(step: EditStep, op: EditOp): string | null {
+  const shapes = {
+    target: '{find:"old",replaceWith:"new"} (op omitted or target)',
+    replace: '{op:"replace",start:1,text:"new"}',
+    insert: '{op:"insert",after:0,text:"new"}',
+    delete: '{op:"delete",start:1}',
+  }
+  if (!Object.hasOwn(shapes, op)) return 'op must be target, replace, insert or delete; text matching uses {find,replaceWith}'
+  const conflicts: Array<keyof EditStep> = op === 'target' ? ['start', 'end', 'after', 'text']
+    : op === 'insert' ? ['find', 'replaceWith', 'start', 'end']
+    : op === 'delete' ? ['find', 'replaceWith', 'after', 'text'] : ['find', 'replaceWith', 'after']
+  const foreign = conflicts.filter(key => step[key] !== undefined)
+  if (op !== 'target' && step.inline) foreign.push('inline')
+  const help = `use ${shapes[op]}` + (op === 'target' ? '' : `; text matching uses ${shapes.target}`)
+  if (foreign.length) return `${op} cannot use ${foreign.join(', ')}; ${help}`
+  const missing: string[] = []
+  if (op === 'target') {
+    if (typeof step.find !== 'string' || !step.find) missing.push('nonempty find')
+    if (typeof step.replaceWith !== 'string') missing.push('explicit replaceWith')
+  } else {
+    const coordinate = op === 'insert' ? 'after' : 'start'
+    if (!Number.isInteger(step[coordinate])) missing.push(`integer \`${coordinate}\``)
+    if (op !== 'delete' && typeof step.text !== 'string') missing.push('explicit text')
+  }
+  return missing.length ? `${op} requires ${missing.join(' and ')}; ${help}; empty replacement text is allowed` : null
+}
+
 /** expect drift correction: returns lines moved (0 = in place), or null if unresolvable. */
 function reanchor(lines: string[], anchor: number, expect: string, window: number): number | null {
   if (anchor >= 1 && anchor <= lines.length && lines[anchor - 1].trim() === expect.trim()) return 0
@@ -429,9 +457,9 @@ function planStep(lines: string[], step: EditStep, index: number, options: EditO
   }
   report.op = op
 
-  if ((op === 'replace' || op === 'insert') && typeof step.text !== 'string'
-    || op === 'target' && (typeof step.find !== 'string' || typeof step.replaceWith !== 'string')) {
-    report.reason = `${op} requires explicit ${op === 'target' ? 'find and replaceWith' : 'text'}; use an empty string or op=delete to remove content`
+  const shapeError = stepShapeError(step, op)
+  if (shapeError) {
+    report.reason = shapeError
     return { kind: 'failed', report }
   }
 
@@ -740,7 +768,7 @@ function applyLineSteps(originalText: string, steps: EditStep[], options: EditOp
 
 /** Character targets share the same original snapshot and overlap contract. */
 export function applyEditSteps(originalText: string, steps: EditStep[], options: EditOptions = {}): EditOutcome {
-  steps = steps.map(step => step.inline || !step.find || step.find.includes('\n') || typeof step.replaceWith !== 'string' ? step
+  steps = steps.map(step => step.inline || inferOp(step) !== 'target' || stepShapeError(step, 'target') || typeof step.find !== 'string' || typeof step.replaceWith !== 'string' || step.find.includes('\n') ? step
     : resolveTarget(originalText.split('\n'), step.find, step.replaceWith).kind === 'missing' && originalText.includes(step.find) ? { ...step, inline: true } : step)
   if (!steps.some(step => step.inline)) return applyLineSteps(originalText, steps, options)
   if (options.mode === 'bestEffort') return { ok: false, reason: 'inline targets currently require atomic mode; bestEffort supports whole-line steps only', reports: [] }
@@ -750,6 +778,8 @@ export function applyEditSteps(originalText: string, steps: EditStep[], options:
     const step = steps[index]
     if (!step.inline) continue
     const report: StepReport = { index, op: 'target', status: 'failed' }
+    const shapeError = stepShapeError(step, inferOp(step) ?? 'target')
+    if (shapeError) return { ok: false, reason: `step ${index} failed: ${shapeError}`, reports: [{ ...report, reason: shapeError }] }
     if (!step.find || typeof step.replaceWith !== 'string' || step.find.includes('\n')) return { ok: false, reason: 'inline target requires nonempty single-line find and explicit replaceWith', reports: [report] }
     const candidates: StepCandidate[] = []
     let cursor = 0

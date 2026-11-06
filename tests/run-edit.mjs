@@ -46,6 +46,43 @@ function readFile(name) {
 }
 
 async function main() {
+  // Production-shaped mistakes must fail before inline inference or any write.
+  {
+    const original = 'const timeout = 1000;\nconst keep = true;\n'
+    writeFile('shape-errors.js', original)
+    const ledger = storeFor(WORK), beforeBatches = readLedgerTail(ledger).length
+    for (const step of [
+      { op: 'replace', find: 'timeout = 1000', replaceWith: 'timeout = 2000' },
+      { op: 'replace', find: 'timeout = 1000', text: 'timeout = 2000' },
+      { op: 'replace', find: 'timeout = 1000', replaceWith: 'timeout = 2000', inline: true },
+      { op: 'replace', start: 1, text: 'new', find: 'timeout = 1000', replaceWith: 'timeout = 2000' },
+      { op: 'target', find: 'timeout = 1000', replaceWith: 'timeout = 2000', start: 1 },
+      { op: 'insert', after: 0 },
+      { op: 'replace' },
+    ]) {
+      const result = await edit.execute({ path: 'shape-errors.js', steps: [step], reason: 'validate intent' }, exec)
+      assert.ok(result.error, JSON.stringify(step))
+      assert.match(result.error, /use \{.*(?:start|after|find)/)
+      assert.equal(readFile('shape-errors.js'), original)
+      assert.equal(readLedgerTail(ledger).length, beforeBatches)
+    }
+    const missing = applyEditSteps(original, [{ op: 'replace' }])
+    assert.match(missing.reason, /integer `start` and explicit text/)
+    // The two stated repairs both work, including implicit substring targeting.
+    for (const step of [{ find: 'timeout = 1000', replaceWith: 'timeout = 2000' }, { op: 'replace', start: 1, text: 'const timeout = 2000;' }]) {
+      const repaired = applyEditSteps(original, [step])
+      assert.ok(repaired.ok); assert.equal(repaired.text, original.replace('1000', '2000'))
+    }
+    const batch = await edit.execute({ path: 'shape-errors.js', steps: [{ start: 2, text: 'changed' }, { op: 'insert', after: 0 }], reason: 'atomic failure' }, exec)
+    assert.ok(batch.error); assert.equal(readFile('shape-errors.js'), original)
+    assert.equal(readLedgerTail(ledger).length, beforeBatches)
+    writeFile('shape-errors.md', '# Heading\n')
+    const markdown = await edit.execute({ path: 'shape-errors.md', sourceSymbol: '__none__', edit: 'replace', content: '# Changed', reason: 'unsupported symbol' }, exec)
+    assert.match(markdown.error, /unsupported language.*find,replaceWith,match:"literal",reason.*omit sourceSymbol/)
+    assert.equal(readFile('shape-errors.md'), '# Heading\n')
+    assert.equal(readLedgerTail(ledger).length, beforeBatches)
+    ok('conflicting shapes and missing fields explain a complete repair without writes or ledger batches')
+  }
   // --- engine: replace / delete / insert ------------------------------------
   {
     const r = applyEditSteps('a\nb\nc\n', [

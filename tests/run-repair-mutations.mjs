@@ -72,11 +72,16 @@ await test('history pathContains filters and rejects legacy path; rollback integ
   assert.equal((await r.execute({ latest: true, reason: 'test' }, exec)).status, 'plan')
 })
 await test('independent verify persists batch and file checks without code writes or ledger batches', async () => {
-  const { createVerifyTool } = await import('../src/tools-verify.ts'); const verify = createVerifyTool(); assert.equal(verify.name, 'ff_verify')
+  const verify = { execute: async ({ checks, ...args }, exec) => { const r = await edit.execute({ action: 'verify', ...args, ...(checks ? { verify: checks } : {}) }, exec); return r.check ?? r } }
   const before = get('inline.js'), batches = readLedgerTail(storeFor(root)).length
   const batch = (await createHistoryTool().execute({ pathContains: 'inline' }, exec)).items[0].batch
   const result = await verify.execute({ batch, checks: ['syntax'] }, exec); assert.equal(result.status, 'passed'); assert.equal(result.verification.persisted, true)
+  const defaultPath = await verify.execute({ path: 'inline.js' }, exec)
+  assert.equal(defaultPath.status, 'passed'); assert.deepEqual(defaultPath.checks.map(c=>c.kind), ['syntax'])
+  const defaultBatch = await verify.execute({ batch }, exec)
+  assert.deepEqual(defaultBatch.checks, ['bridge', 'syntax'])
   const byPath = await verify.execute({ path: 'inline.js', checks: ['syntax', 'bridge', 'ipc'] }, exec); assert.notEqual(byPath.status, 'passed'); assert.equal(byPath.verification.persisted, true)
+  assert.ok(byPath.checks.filter(c=>c.kind!=='syntax').every(c=>c.status==='not_run' && c.reason.includes('no_baseline')))
   assert.ok(listRecords(storeFor(root), { limit: 20 }).records.some(r => r.batchIds.length === 0))
   assert.deepEqual(get('inline.js'), before); assert.equal(readLedgerTail(storeFor(root)).length, batches)
   for (const args of [{ batch: String(batch) }, { batch, path: 'inline.js' }, { path: '../outside.js' }, { path: 'inline.js', checks: ['tests'] }, {}]) assert.ok((await verify.execute(args, exec)).error)
@@ -96,15 +101,13 @@ await test('literal edits, tickets and symbol insertion/deletion use shared edit
   const removed = await change({ path: 'comments.js', sourceSymbol: 'renamed', edit: 'delete' }); assert.ok(removed.batch, JSON.stringify(removed)); assert.equal(get('comments.js').toString().includes('/** keep */'), false); assert.match(get('comments.js').toString(), /function extra/)
 })
 await test('factory schemas and actual outputs validate in the host SDK', async () => {
-  const { createVerifyTool } = await import('../src/tools-verify.ts')
   const runtime = Object.create(ToolRuntime.prototype); runtime.canonicalResults = new WeakMap(); runtime.concludingExecutions = new WeakSet()
-  for (const [tool, args] of [[file, { action: 'create', path: 'sdk.txt', content: 'sdk', reason: 'SDK test' }], [edit, { path: 'sdk.txt', find: 'sdk', replaceWith: 'valid', reason: 'SDK test' }], [createHistoryTool(), { pathContains: 'sdk' }], [createRollbackTool(pool), { latest: true, reason: 'SDK plan' }], [createVerifyTool(), { path: 'comments.js', checks: ['syntax'] }]]) {
+  for (const [tool, args] of [[file, { action: 'create', path: 'sdk.txt', content: 'sdk', reason: 'SDK test' }], [edit, { path: 'sdk.txt', find: 'sdk', replaceWith: 'valid', reason: 'SDK test' }], [createHistoryTool(), { pathContains: 'sdk' }], [createRollbackTool(pool), { latest: true, reason: 'SDK plan' }], [edit, { action: 'verify', path: 'comments.js', verify: ['syntax'] }]]) {
     const result = await tool.execute(args, exec); assert.ok(!result.error, JSON.stringify(result)); runtime.createSuccessResult(exec, defineTool(tool), result)
   }
 })
 await test('verify rejects nonexistent batch instead of implying existing scope', async () => {
-  const { createVerifyTool } = await import('../src/tools-verify.ts')
-  const result = await createVerifyTool().execute({ batch: 999999, checks: ['syntax'] }, exec); assert.ok(result.error, JSON.stringify(result))
+  const result = await edit.execute({ action: 'verify', batch: 999999, verify: ['syntax'] }, exec); assert.ok(result.error, JSON.stringify(result))
 })
 await test('inline destination symbol anchors refuse scope-changing whole-line insertion without writes', async () => {
   put('anchor-source.js', 'function inserted() {}\n')

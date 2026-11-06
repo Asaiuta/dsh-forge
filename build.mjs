@@ -9,10 +9,11 @@
  */
 import { build } from 'esbuild'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 mkdirSync('lib', { recursive: true })
+for (const worker of ['eval-worker.cjs', 'eval-worker.py']) copyFileSync(join('src', worker), join('lib', worker))
 
 // Chunks are pruned AFTER the build, against esbuild's own output list. Deleting
 // every chunk up front looks equivalent but is not: a delete loop is a pile of
@@ -42,7 +43,6 @@ const result = await build({
     'src/ledger.ts',
     'src/tickets.ts',
     'src/tools-edit.ts',
-    'src/tools-verify.ts',
     'src/projects.ts',
     'src/tools-project.ts',
     'src/ledger-api.ts',

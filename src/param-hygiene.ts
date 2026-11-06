@@ -16,6 +16,8 @@
 export interface ArgHygiene {
   /** 空串有语义、不能删的字段（`replaceWith: ""` 是删除匹配块）。 */
   keepEmpty?: readonly string[]
+  /** Some modes treat whitespace as literal data rather than an omitted field. */
+  keepEmptyWhen?: (input: Record<string, unknown>) => readonly string[]
   /** 0 表示「没有选择」的数值字段（1-based 的批号之类）。 */
   zeroMeansAbsent?: readonly string[]
   /** 决定互斥分组的字段名。 */
@@ -28,8 +30,8 @@ export interface ArgHygiene {
   defaultOnlyIn?: Record<string, readonly string[]>
   /** 缺省形态表，供 `defaultOnlyIn` / `requires` 判断。 */
   defaults?: Record<string, unknown>
-  /** 字段 → 它依赖的字段；依赖不存在且值为缺省形态时删除。 */
-  requires?: Record<string, string>
+  /** 字段 → 任一所需字段；依赖均不存在且值为缺省形态时删除。 */
+  requires?: Record<string, string | readonly string[]>
 }
 
 function isBlankString(value: string): boolean {
@@ -52,7 +54,7 @@ function drop(args: Record<string, unknown>, key: string): void {
  */
 export function cleanArgs(input: Record<string, unknown>, hygiene?: ArgHygiene): Record<string, unknown> {
   const args = { ...input }
-  const keep = new Set(hygiene?.keepEmpty ?? [])
+  const keep = new Set([...(hygiene?.keepEmpty ?? []), ...(hygiene?.keepEmptyWhen?.(input) ?? [])])
   const zero = new Set(hygiene?.zeroMeansAbsent ?? [])
   const defaults = hygiene?.defaults ?? {}
   const isDefault = (key: string) => key in defaults && Object.is(args[key], defaults[key])
@@ -83,7 +85,8 @@ export function cleanArgs(input: Record<string, unknown>, hygiene?: ArgHygiene):
   }
 
   for (const [key, dependsOn] of Object.entries(hygiene?.requires ?? {})) {
-    if (key in args && !(dependsOn in args) && isDefault(key)) drop(args, key)
+    const dependencies = typeof dependsOn === 'string' ? [dependsOn] : dependsOn
+    if (key in args && !dependencies.some(field => field in args) && isDefault(key)) drop(args, key)
   }
 
   return args

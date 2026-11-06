@@ -182,11 +182,24 @@ async function main() {
   assert.deepEqual(fs.readFileSync(storeFor(workspace).ledgerFile), beforeLedger)
   ok('second-file failure compensates the first deletion and leaves no committed batch')
 
+  fs.renameSync = function(from, to) { if (to === file('failed/deep/new.txt')) throw Error('nested create failure'); return rename(from, to) }
+  syncBuiltinESMExports()
+  try { assert.match((await call({ action: 'create', path: 'failed/deep/new.txt', content: 'no' })).error, /nested create failure/) }
+  finally { fs.renameSync = rename; syncBuiltinESMExports() }
+  assert.equal(fs.existsSync(file('failed')), false)
+  assert.deepEqual(fs.readFileSync(storeFor(workspace).ledgerFile), beforeLedger)
+  ok('failed nested create compensates the file and removes only its empty new directories')
+
   assert.match((await call({ action: 'create', path: '../escape', content: 'x' })).error, /inside/)
-  assert.match((await call({ action: 'create', path: 'missing/parent.txt', content: 'x' })).error, /parent/)
+  const nested = await call({ action: 'create', path: 'missing/parent.txt', content: 'x' })
+  assert.ok(nested.batch, nested.error)
+  await undo(nested.batch)
+  assert.equal(fs.existsSync(file('missing/parent.txt')), false)
+  assert.ok(fs.statSync(file('missing')).isDirectory(), 'file rollback preserves created directories')
+  assert.match((await call({ action: 'move', path: 'src/a.txt', destination: 'absent/parent.txt' })).error, /parent/)
   fs.writeFileSync(file('src/invalid.js'), Buffer.from([65, 255, 10]))
   assert.ok((await call({ action: 'copy_code', path: 'src/invalid.js', sourceSymbol: 'A', destination: 'src/target.js', after: 0 })).error)
-  ok('workspace containment, absent parents and invalid source encoding fail before writes')
+  ok('create makes parents; file rollback leaves directories; transfers still require parents; containment/encoding stay checked')
 
   fs.writeFileSync(file('src/human.txt'), 'HUMAN\n')
   const link = file('src/link.txt')

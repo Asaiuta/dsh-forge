@@ -1,12 +1,9 @@
 /**
- * dsh-forge — browser half: the three settings the plugin actually has.
+ * dsh-forge — browser settings for tool surface and built-in write visibility.
  *
  * ## What this page is, and what it is not
  *
- * It edits `surface` — the field whose change
- * alters which tools exist. It deliberately does **not** edit `cards`: that block
- * carries an endpoint URL and a credential, it changes behaviour nobody touches
- * twice, and keeping it in the profile patch is the honest home for a secret.
+ * It edits `surface` and `hideBuiltinWrites`, leaving other row fields intact.
  *
  * ## Why the page owns its own form
  *
@@ -72,7 +69,7 @@ const BUILTIN_GIT_TAB = 'git'
 /** Route served by `src/http-plugin.ts`. */
 const CONFIG_PATH = '/forge-config'
 
-interface Settings { surface: 'retrieval' | 'full' }
+interface Settings { surface: 'retrieval' | 'full'; hideBuiltinWrites: boolean }
 
 type Translate = (key: ForgeKey) => string
 
@@ -163,6 +160,7 @@ async function request(init?: RequestInit): Promise<Settings> {
 function signature(settings: Settings): string {
   return JSON.stringify({
     surface: settings.surface,
+    hideBuiltinWrites: settings.hideBuiltinWrites,
   })
 }
 
@@ -218,6 +216,7 @@ function ForgeSettingsPage(props: { view?: string; t: Translate; close?: () => v
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           surface: draft.surface,
+          hideBuiltinWrites: draft.hideBuiltinWrites,
         }),
       })
       setSaved(state)
@@ -264,6 +263,15 @@ function ForgeSettingsPage(props: { view?: string; t: Translate; close?: () => v
             disabled={busy}
             onChange={(next: string) => { patch({ surface: next as Settings['surface'] }) }}
           />
+        </div>
+
+        <div className="dfg-field">
+          <label className="dfg-label" htmlFor="dfg-hide-writes">
+            <input id="dfg-hide-writes" type="checkbox" checked={draft.hideBuiltinWrites}
+              disabled={busy || draft.surface !== 'full'}
+              onChange={(event) => { patch({ hideBuiltinWrites: event.target.checked }) }} />
+            {t('hideBuiltinWrites')}
+          </label>
         </div>
 
         <div className="dfg-footer">

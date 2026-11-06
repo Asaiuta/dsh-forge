@@ -126,7 +126,8 @@ export class ProjectOutput {
    ...(complete ? {} : { nextCursor: this.continuation(cursor, end) }) })
  }
  list(projects: Project[], workspace: unknown, query: unknown, view: ProjectView): ProjectPayload {
-  return this.rows('projects', projects, {}, JSON.stringify(['list', workspace ?? null, query ?? '']), JSON.stringify(projects), view, p => projectSummary(p, true))
+  const summaries = projects.map(p => projectSummary(p, true))
+  return this.rows('projects', summaries, {}, JSON.stringify(['list', workspace ?? null, query ?? '']), JSON.stringify(summaries), view, summary => summary)
  }
  project(project: Project, action: string, args: Record<string, unknown>, view: ProjectView): ProjectPayload {
   if (action !== 'get') {
@@ -164,7 +165,12 @@ export class ProjectOutput {
    }
    return this.record(report!.evidence, { ...coordinate, available: true, historical: true }, query, view)
   }
-  if (view.detail === 'tasks') return this.rows('tasks', task ? [task] : project.tasks, coordinate, query, JSON.stringify(project), view, taskSummary)
+  if (view.detail === 'tasks') {
+   const tasks = task ? [task] : project.tasks
+   // Bind full selected task content, including text beyond the preview and
+   // Todo changes without a revision bump; unrelated reports are not this view.
+   return this.rows('tasks', tasks, coordinate, query, JSON.stringify(tasks), view, taskSummary)
+  }
   return this.rows('reports', report ? [report] : [...project.reports].reverse(), coordinate, query,
    JSON.stringify(report ?? project.reports), view, reportSummary)
  }

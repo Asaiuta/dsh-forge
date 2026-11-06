@@ -34,6 +34,7 @@ export interface ForgeStatusResult {
 /** What the status command reports about the active surface. */
 export interface StatusRegistration {
   surface: string
+  builtinWrites?: { status(agent?: ForgeExec['agent']): string }
   augmentation?: { stats(): AugmentStats; nativeSearchEnabled(): boolean }
 }
 
@@ -107,7 +108,7 @@ export function createStatusCommand(pool: FinderPool, registration?: StatusRegis
 
       const modeLine = registration === undefined ? undefined : `工具面：${registration.surface}`
       const augmentationLine = registration === undefined ? undefined : describeAugmentation(registration)
-      const statusHead = [modeLine, augmentationLine].filter((line): line is string => line !== undefined)
+      const statusHead = [modeLine, registration?.builtinWrites?.status(invocation.agent), augmentationLine].filter((line): line is string => line !== undefined)
 
       if (live.length === 0) {
         return {

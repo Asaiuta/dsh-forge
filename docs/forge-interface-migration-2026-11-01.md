@@ -1,5 +1,6 @@
 # Forge 接口迁移与修复边界（2026-11-01）
 
+> 2026-11-05 后续调整：独立 `ff_verify` 已并入 `ff_edit action=verify`，参数 `checks` 改为 `verify`；新增 `ff_edit action=eval` 与 `ff_file action=read`，full 为 9 个。下文保留 11-01 接口迁移记录，当前调用以 [合并报告](2026-11-05_read-eval-consolidation-report.md) 为准。
 本页以当前源码为准，记录接口迁移，不是部署声明。旧设计见[能力路线图](forge-capability-roadmap-2026-10-28.md)与[检查吸收记录](forge-check-absorption.md)；依赖查询详见[Trace 参考](trace-reference.md)。
 
 ## 公开工具名与注册

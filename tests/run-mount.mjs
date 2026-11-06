@@ -59,11 +59,11 @@ const plugin = ctx.plugin(apply, { surface: 'full' })
 // Services were provided before mount; activation should be immediate.
 await new Promise((resolve) => setImmediate(resolve))
 
-assert.equal(registeredTools.length, 10, `expected 10 tools, got ${registeredTools.length}`)
+assert.equal(registeredTools.length, 9, `expected 9 tools, got ${registeredTools.length}`)
 assert.equal(registeredCommands.length, 1, 'expected 1 command')
 assert.deepEqual(
   registeredTools.map((d) => d.name),
-  ['ff_find', 'ff_grep', 'ff_symbols', 'ff_edit', 'ff_history', 'ff_rollback', 'ff_file', 'ff_trace', 'ff_verify', 'ff_project'],
+  ['ff_find', 'ff_grep', 'ff_symbols', 'ff_edit', 'ff_history', 'ff_rollback', 'ff_file', 'ff_trace', 'ff_project'],
   'tool registration order changed',
 )
 assert.equal(registeredCommands[0].name, 'forge-status')
@@ -106,8 +106,13 @@ assert.equal(section.text({}), rendered, 'rendering must be stable across calls'
 // and keep the text covering the surface that is actually registered.
 assert.doesNotMatch(rendered, /path=<file>#/, 'a host without symbol-read augmentation must never advertise specialist source reads')
 assert.match(rendered, /view=outline/, 'the outline discovers names and source locations')
-assert.match(rendered, /view=definitions with symbol=<name>/, 'a known symbol is located through the supported definitions view')
-assert.match(rendered, /built-in read using the returned file and line range/, 'source bytes must be read through the built-in window reader')
+assert.match(rendered, /every definition of one name → view=definitions/, 'definitions still finds all declarations of a name')
+assert.match(rendered, /Symbol known → ff_file action=read.*symbol:.*no outline first/, 'explicit symbols are read directly even without built-in augmentation')
+reachable.delete('ff_file')
+const noFile = section.text({})
+assert.doesNotMatch(noFile, /ff_file/)
+assert.match(noFile, /built-in read using the returned file and line range/, 'without ff_file or augmentation use the supported line reader')
+reachable.add('ff_file')
 // The target enum and the edgeMode mechanics are the parameter descriptions
 // verbatim, so the guidance no longer repeats them (see the dedup note in
 // src/guidance.ts). What it must still carry is what no schema states: the
@@ -132,7 +137,7 @@ const REBILLED = [
   ['ff_find surface', /mode=(name|glob)/, /Fuzzy file-name or path/],
   ['ff_trace target enum', /impact:|ffi:<name>/, /ffi:<name>/],
   ['ff_trace edgeMode mechanics', /edgeMode/, /certain excludes them/],
-  ['ff_edit ticket protocol', /ticket, choice/, /ticket plus choice/],
+  ['ff_edit ticket protocol', /ticket, choice/, /ticket\+choice/],
   ['ff_edit verify whitelist', /verify=\[bridge/, /static checks over it/],
   ['ff_history checks semantics', /checks=true/, /CURRENT applicability/],
   ['ff_file read-before-write', /read before chang/i, /Read before writing/],

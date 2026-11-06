@@ -44,14 +44,13 @@
 | `ff_grep` | 检索 | 模糊内容搜索，或一次查询多个字面量。普通文本和正则交给内置 `grep`。 | 搜索调用点、配置名和不确定的文本。 |
 | `ff_symbols` | 检索 | `view=outline` 列出单文件定义；`view=definitions` 跨文件查找精确符号定义。正文交给内置 `read`。 | 已知符号用 `read file_path=<file>#<Symbol>`。 |
 | `ff_trace` | 完整 | 静态依赖、影响、IPC、暴露关系和 FFI 证据。 | 定义查询交给 `ff_symbols`，不接受 `symbol:`。 |
-| `ff_edit` | 完整 | 带快照和审计的文本或精确符号编辑，可追加 `verify`。 | 符号参数用 `sourceSymbol` / `includeLeadingComment`。 |
-| `ff_file` | 完整 | 创建、删除、移动文件或复制/移动代码。 | 不再承载 `edit_symbol`；符号编辑归 `ff_edit`。 |
+| `ff_edit` | 完整 | 编辑、复查已有批次、执行符号。默认编辑仍可追加 `verify`。 | `action=verify` 不制造编辑批次；`action=eval` 试跑 JS/Python 或已有 Rust 测试。 |
+| `ff_file` | 完整 | 多文件/范围/符号读取，以及创建、删除、移动、代码转移。 | `action=read` 用 `files` 或续页 `cursor`；符号编辑归 `ff_edit`。 |
 | `ff_history` | 完整 | 查询施工台账与不可变 diff、验证记录。 | 列表路径子串用 `pathContains`。 |
 | `ff_rollback` | 完整 | 预览并恢复已记录批次。 | 正整数 `batch`、`latest:true`、`throughBatch` 三选一；当前过滤仍叫 `path`。 |
-| `ff_verify` | 完整 | 独立静态验证，不制造编辑批次。 | 既有 `batch` 或单文件 `path` 二选一。 |
 | `ff_project` | 完整 | 私有工程、任务、批次关联与报告快照。 | 工具返回 `{ok, action, payload, error?}`，不是 HTTP 信封。 |
 
-只注册新公开名，没有运行时旧名 alias。旧名映射仅供文档迁移与离线 normalize。`retrieval` 共 3 个，`full` 共 10 个；详细互斥参数与迁移示例见[接口迁移说明](docs/forge-interface-migration-2026-11-01.md)。
+只注册新公开名，没有运行时旧名 alias。旧名映射仅供文档迁移与离线 normalize。`retrieval` 共 3 个，`full` 共 9 个；详细互斥参数与迁移示例见[接口迁移说明](docs/forge-interface-migration-2026-11-01.md)。
 
 AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python（含 PYI）、Rust、Go、C、C++、Java、C#、Lua。
 
@@ -142,12 +141,25 @@ AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python�
   name: dsh-forge
   config:
     surface: full                   # 默认 retrieval
+    hideBuiltinWrites: true          # 默认 false；仅 full 生效
 ```
 
 | `surface` | 结果 |
 |---|---|
 | `retrieval`（默认） | 注册 `ff_find`、`ff_grep`、`ff_symbols`，共 3 个。 |
-| `full` | 注册上述 3 个及 `ff_trace`、`ff_edit`、`ff_file`、`ff_history`、`ff_rollback`、`ff_verify`、`ff_project`，共 10 个。 |
+| `full` | 注册上述 3 个及 `ff_trace`、`ff_edit`、`ff_file`、`ff_history`、`ff_rollback`、`ff_project`，共 9 个。 |
+
+批量读取与执行/复查的合并接口、预算和限制见[能力合并报告](docs/2026-11-05_read-eval-consolidation-report.md)。独立 `ff_verify` 已移除，旧调用改为 `ff_edit action=verify`；`checks` 改用 `verify`。不注册 `ff_eval` 或 `ff_read_many`。
+
+`action=eval` 的小结果和日志直接放在 `evaluation.result`，`resultComplete: true` 表示本次已返回完整存档，无须再查询。较大结果为 `resultComplete: false`，通过 `resultId`、`offset` 续读；`evidenceComplete` 单独表示采集是否丢失内容，超时或日志截断仍会标记不完整。`action=verify path=...` 默认只检查语法；按 batch 复查默认检查 bridge 和语法。显式在 path 模式请求 bridge/IPC 仍返回 `not_run`，因为没有修改前基线。
+
+`hideBuiltinWrites` 在替代能力可用的代理中隐藏内置 `edit` / `write`，原生 schema、PTC 声明及内置提示词同步消失。当前支持共享本地文件系统、无沙箱或会话为 `danger-full-access`、从全局或预设继承的工具。受限会话保留内置权限升级入口；远程文件系统、代理自身注册的工具、缺少公开限制接口或 Forge 替代工具被遮蔽时也保留入口。`/forge-status` 显示逐项结果。关闭开关、切回 retrieval 或卸载会恢复原入口；其它插件自身的限制不受影响。
+
+启用后的整文件写入使用 `ff_file action=create`，覆盖已有文件须显式 `overwrite=true`；限工作区内、8 MiB，自动创建缺失父目录。权限或观察版本拒绝时不创建目录；提交失败清理本次仍为空的目录，成功批次的文件回滚保留目录。
+
+同一文件已确定的多处独立修改优先一次提交：`ff_edit {path, steps:[{find,replaceWith}, ...], reason}`。需要严格字面量匹配时加 `match:"literal"`，也支持 1–50 个步骤；所有步骤定位同一份原始快照，重复匹配、重叠或任何一步失败都不写入。只有一处修改才用顶层 `find/replaceWith` 简写；单模式全局替换可用 `replaceAll:true`，不与 steps 混用。literal 模式保留空格、BOM 和 CR/LF，不重缩进、不转换换行；默认 block 模式保留原有容错行为。依赖前一步结果才能决定的修改分开执行。
+
+安装版 SDK 验收：设置 `DSH_FORGE_DSH_MODULES` 后运行 `node --experimental-transform-types tests/run-builtin-writes.mjs`；该检查缺少安装版 SDK 时直接失败，不以跳过作为通过。更详细的范围与计量见[内置写工具隐藏验收](docs/2026-11-06_builtin-write-hiding-report.md)。
 
 **内置增强始终启用。** 内置的 `read`/`grep`/`glob` 保留原 schema、提示词、超时和输出契约；forge 在环绕分发点让 `read` 支持 `file#Symbol`，并为 `glob` / `grep` 提供常驻 Rust 搜索后端。结果不在原生层预截断；宿主仍负责展示上限、截断标志和完整结果文件。旧 sidecar 没有完整性标记、完整序列化结果超过 20 MB、后端不可用或参数超出契约时直接交回内置。
 
@@ -165,7 +177,7 @@ AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python�
 
 ### 浏览声明与完整符号
 
-已知目标时直接 `read { file_path: "src/store.ts#Store.save" }`。需要浏览结构时，`ff_symbols { view: "outline", path: "src/store.ts" }` 默认展示顶层声明及类、接口、对象等容器成员，停止展开函数和方法内部符号；默认深度没有改成 1，因此类方法仍可发现。
+full 模式下，已知目标直接 `ff_file { action: "read", files: [{ path: "src/store.ts", symbol: "Store.save" }] }`；单个符号也使用这一显式参数，同一 files 数组可读取多个文件、符号或行范围。单个普通文件全文/范围使用内置 read。retrieval 模式或 ff_file 不可见时，继续使用 `read { file_path: "src/store.ts#Store.save" }`。需要浏览结构时，`ff_symbols { view: "outline", path: "src/store.ts" }` 默认展示顶层声明及类、接口、对象等容器成员，停止展开函数和方法内部符号；默认深度没有改成 1，因此类方法仍可发现。
 
 默认输出已从全符号列表改为分页的声明视图。需要旧视图的全部符号时传 `scope: "all"`；显式 `kind`（如 `"field"`）默认在完整树中筛选，也可以同时传 `scope: "declarations"` 保持声明边界。`depth` 独立控制层级，范围 1–20。
 
@@ -193,7 +205,7 @@ AST 支持 11 种语言：JavaScript、TypeScript（含 TSX/MTS/CTS）、Python�
 
 项目、大纲与 diff 共用 `output-budget.ts`：按序列化 JSON 的 UTF-8 字节限制内容、单项与整页，并分别限制条数；模型 Token 只在离线统一 tokenizer 验收时计算。ID、哈希、符号名和行号保持完整。显示字段缩短会注明；完整记录、补丁或源码通过明确入口读取。超大的身份字段返回可操作的读取提示，不会静默切断。
 
-`ff_history {batch:12, detail:"record"}` 返回批次完整 JSON 分片，拼接 `page.record` 后解析。它可读取被默认 reason 预览省略的正文。`ff_edit receipt:"diff"` 的整个成功回执超过 12 KiB 时，保留提交身份、计数和审计状态，设置 `receiptComplete:false`，并给出 `receiptRef`。用 `ff_history {batch:12, detail:"receipt", receiptRef:"返回的完整哈希"}` 逐页拼接 `page.record` 获取冻结的完整回执。回执内的 diff 若仍是分页结果，继续按节点读取补丁。回执存储随工作区历史一起清除，不受普通源码 blob GC 影响；归档失败会明确说明诊断不可恢复，编辑仍报告已提交。
+`ff_history {batch:12, detail:"record"}` 返回批次完整 JSON 分片，拼接 `page.record` 后解析。它可读取被默认 reason 预览省略的正文。`ff_edit` 的默认回执和 diff 回执均受 12 KiB 限制；超限保留结果身份、计数和状态，设置 `receiptComplete:false` 并给出 `receiptRef`。用 `ff_history {detail:"receipt", receiptRef:"返回的完整哈希"}` 逐页拼接 `page.record` 获取冻结的完整回执；可选 batch 必须与回执匹配。内容未变或歧义票据的回执也可读取，不会为此制造编辑批次。回执内的 diff 若仍是分页结果，继续按节点读取补丁。回执存储随工作区历史一起清除，不受普通源码 blob GC 影响；归档失败会明确说明诊断不可恢复。获取全部诊断的续页会增加总成本，不能把短首页视为完整信息的压缩收益。
 
 UI 修改前后全文仅放入 SDK 展示元数据，不再放进工具 `value` 或 PTC 返回类型。展示数据在执行时冻结，回放不读取当前文件；原生和 PTC 调用的文件观察事件仍正常发出。完整性、整对象大小和续查成本以离线计量脚本与各专项测试为准。
 
@@ -216,6 +228,8 @@ UI 修改前后全文仅放入 SDK 展示元数据，不再放进工具 `value` 
 
 续页保留相同查询，传入 `cursor: nextCursor`；`limit` 保持一致或省略。JSON 片段按 `offset`（UTF-16 字符偏移）依次拼接 `text`，到 `complete: true` 后再解析。游标绑定内容摘要，30 分钟过期，每个工具实例保留最多 128 个续页位置；内容改变、过期或被淘汰均明确要求重新查询。即使 Todo 镜像没有增加人工操作 revision，内容变化仍会使相关游标失效。冻结报告的详情可独立于后续项目修改继续读取。
 
+任务分页绑定所选任务的完整内容，不受无关报告提交或项目名称修改影响；项目列表绑定概况及顺序，历史正文变化不会打断列表翻页。多文件读取仍校验整个批次的所有源文件，需先读完续页再编辑，避免混合不同版本。
+
 分页 payload 另有 12 KiB 外层检查；这是 UTF-8 字节约束，不是严格 Token 上限。查询长记录的总成本应累计全部续页。`node --experimental-transform-types tests/run-project-output.mjs` 验证规模稳定性、原生与结构化结果一致、长 Unicode 记录还原、游标隔离/失效、冻结证据及无副作用的参数拒绝。
 
 ### 设置页
@@ -225,11 +239,11 @@ UI 修改前后全文仅放入 SDK 展示元数据，不再放进工具 `value` 
 - **设置 → DSH-Forge**：设置面板侧栏里的一行（页面标题同名）。
 - **插件 → dsh-forge → 配置**：插件管理页里该组合包自己的配置页，行内摘要写「检索工具与内置工具增强」。
 
-两处是同一个页面，只有一个二选一的 surface 控件。
+两处是同一个页面，包含 surface 控件和「可替代时隐藏内置 edit / write」开关；后者仅 full 可设置。
 
 保存写入的是**当前 profile 的 `cordis.patch.yml`**（`configEditor` 的语义），然后走 Loader 的正常生命周期 —— 这一行会被重载，工具面真的按新配置重新注册，不需要重启应用。
 
-页面只写 `surface`，其它键原样穿过，不会被页面删掉。
+页面只写 `surface` 和 `hideBuiltinWrites`，其它键原样穿过，不会被页面删掉。
 
 页面依赖一条独立行 `dsh-forge-http`（`inject: ['webServer','configEditor']`，路由 `GET/POST /forge-config`）。headless / SDK profile 没有 `webServer`，这一行由 cordis 直接跳过，主插件照常加载，只是没有页面可用。
 
@@ -294,7 +308,7 @@ Git 读取经宿主 `subprocess` 能力执行，环境为 `GIT_CONFIG_COUNT=0`�
 1. **数据都在插件私有目录**：快照与批次账本在 `~/.dsh/forge/snapshots/`，票据在 `~/.dsh/forge/tickets/`，验证记录在 `~/.dsh/forge/verification/`。即使用户仓库没有 Git，也有完整快照与回滚；这些目录整体可删，下次调用重建。旧版 `~/.dsh/forge/cards/` 随知识卡片工具一起废弃，留着也不会被读。
 2. **目录只在机器索引命中时返回**：`ff_find` 在机器索引（Everything）答话时会返回目录并带尾部 `/`，走 fff 模糊回退时只返回文件。路径模式和目录下的文件列表交给内置 `glob`，不要给 `ff_find` 传 `mode`。
 3. **单文件 2 MiB 上限**：AST 解析超限会降级并提示改用 `ff_grep`。
-4. **正文读取属于内置 `read`**：`ff_symbols` 只接受 `outline` 与 `definitions`；已知符号时使用内置 `read` 的 `file_path=<file>#<Symbol>`。增强不可用时，用 `ff_symbols view=definitions` 定位范围，再用内置 `read` 的 `offset` / `limit` 读正文。
+4. **单文件正文优先内置 `read`，多文件用 `ff_file action=read`**：`ff_symbols` 只接受 `outline` 与 `definitions`；已知符号时使用内置 `read` 的 `file_path=<file>#<Symbol>`。增强不可用时，用 `ff_symbols view=definitions` 定位范围，再用内置 `read` 的 `offset` / `limit` 读正文。
 5. **读取正文与结构分工**：`ff_symbols` 仅查询结构，不提供正文视图。保留旧读取层的历史基准：≤256 KB 一次性解码，更大的按 256 KB 分块；94 MB 日志读取 `L500001-500005` 时常驻内存 254 MB → 9 MB、缓冲区 93.8 MB → 0.25 MB，耗时 224 ms → 246 ms。该实现仍扫到 EOF 取总行数，是恒定内存而非零成本；这些历史数字不代表当前内置 read 增强的复测，也不恢复已移除的 Forge 正文参数。
 6. **分页预算与引擎硬截断分开**：`ff_grep` 每页最多返回 `limit` 条，单模式和多字面量模式都会保留已收集的溢出命中并通过 `nextCursor` 继续，写入覆盖层同样受作用域与分页预算约束。引擎在单文件内最多收集 2000 条；超过这 2000 条的命中无法翻页取得，结果会给出文件名与硬截断提示。游标绑定原查询与索引实例，5 分钟过期；未知、过期或变更参数的游标明确拒绝，不会静默从第一页重来。
 7. **空结果分两种**：区分"索引看不见"和"被 `path=` 约束滤掉"，后者会直接告出命中有多少落在约束之外。

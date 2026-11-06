@@ -26,6 +26,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import type { EditOptions, EditStep, StepReport, StepCandidate } from './edit-engine.ts'
 import { applyEditSteps, stripLinePrefixes, targetCandidateMatches } from './edit-engine.ts'
+import { applyLiteralEdit, applyLiteralEdits } from './edit-literal.ts'
 import {
   type LedgerNode,
   detectEncoding,
@@ -45,7 +46,7 @@ import {
   type TextEncoding,
 } from './ledger.ts'
 import { createTicket, deleteTicket, loadTicket } from './tickets.ts'
-import { canonicalWorkspace, isSymbolicLink } from './fs-paths.ts'
+import { canonicalWorkspace, isSymbolicLink, readBoundedFile } from './fs-paths.ts'
 import { historyContentMatches, nodeId, readNode, snapshot } from './history.ts'
 import { DIFF_PAGE_FIELDS, DIFF_PAGE_SCHEMA, NODE_DIFF_SCHEMA, historyDiffOutput, renderDiffPage, type DiffPage } from './history-output.ts'
 import { applicabilityOf, listRecords, readRevision } from './verification.ts'
@@ -55,6 +56,9 @@ import { runStaticCheck, type CheckSelector } from './check-static.ts'
 import { resolveBeforeEvidence } from './tools-trace.ts'
 import { validateAttribution, getProject, listProjects, projectBatchMembership } from './projects.ts'
 import type { BatchAttribution } from './ledger.ts'
+import { createStaticVerifier } from './verify-static.ts'
+import { createSymbolEvaluator } from './symbol-eval.ts'
+import type { EvalServices } from './eval-process.ts'
 
 /** The refusal half of {@link resolveBeforeEvidence}: only failures reach the reply. */
 type BeforeRejection = Extract<Awaited<ReturnType<typeof resolveBeforeEvidence>>, { ok: false }>
@@ -152,6 +156,8 @@ export function normalizeLegacyRollbackArgs(args: Record<string, unknown>): Reco
 // ---------------------------------------------------------------------------
 
 interface ApplyParams {
+  literalSteps?: boolean
+  literalEdit?: import('./edit-literal.ts').LiteralEdit
   attribution?: BatchAttribution
   exec?: ForgeExec
   abs: string
@@ -200,6 +206,7 @@ interface ApplyErr {
 type ApplyResult = ApplyOk | ApplyTicket | ApplyErr
 
 async function planSymbolEdit(abs: string, original: string, selection: SymbolEdit): Promise<ReturnType<typeof applyEditSteps>> {
+  if (!detectLanguage(abs)) throw new Error(`unsupported language for symbol editing: ${path.basename(abs)}; use ff_edit {path,find,replaceWith,match:"literal",reason} for text; omit sourceSymbol, edit and content`)
   const parsed = await parseFile(abs)
   if (!parsed.value || parsed.value.partial) throw new Error(parsed.error ?? 'symbol edit requires a syntax-valid original parse')
   if (parsed.value.text !== original) throw new Error('source changed during symbol planning; nothing written')
@@ -235,7 +242,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   if (exists) {
     let raw: string
     try {
-      rawBuf = await observedRead<Buffer>(params.exec, abs, (file) => readFileSync(file))
+      rawBuf = await observedRead<Buffer>(params.exec, abs, (file) => params.literalEdit || params.literalSteps ? readBoundedFile(file, 8 * 1024 * 1024) : readFileSync(file))
       raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(rawBuf)
     } catch (cause) {
       return { ok: false, error: `cannot read ${abs}: ${causeMessage(cause)}`, reports: [] }
@@ -255,7 +262,10 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
   // last-known state → snapshot it first so rollback never swallows it.
   let externalBatchId: number | undefined
   const options: EditOptions = { mode, pinnedTargets: params.pinned }
-  const planned = params.symbolEdit ? await planSymbolEdit(abs, bodyText, params.symbolEdit) : applyEditSteps(bodyText, steps, options)
+  const planned = params.literalEdit
+    ? applyLiteralEdit(rawBuf!.toString('utf8'), params.literalEdit)
+    : params.literalSteps ? applyLiteralEdits(rawBuf!.toString('utf8'), steps as Array<{ find: string; replaceWith: string }>)
+    : params.symbolEdit ? await planSymbolEdit(abs, bodyText, params.symbolEdit) : applyEditSteps(bodyText, steps, options)
   if (!planned.ok) {
     if (planned.ambiguity) {
       const lines = bodyText.split('\n')
@@ -313,7 +323,8 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
     }
   }
 
-  const newRaw = Buffer.from(encodeText(planned.text, enc), 'utf8')
+  const newRaw = Buffer.from(params.literalEdit || params.literalSteps ? planned.text : encodeText(planned.text, enc), 'utf8')
+  const newEncoding = params.literalEdit || params.literalSteps ? detectEncoding(planned.text) : enc
   const newHash = sha256(newRaw)
   const applied = planned.reports.filter((r) => r.status === 'applied' || r.status === 'drifted').length
   const skipped = planned.reports.filter((r) => r.status === 'skipped').length
@@ -353,7 +364,7 @@ async function applyBatch(pool: FinderPool, params: ApplyParams): Promise<ApplyR
       const after = putBlob(store, newRaw).id
       return commitFiles(store, {
         kind: 'edit', reason, actor, ...(params.attribution ? { attribution: params.attribution } : {}),
-        nodes: [{ file: rel, op, before, after, bytes: newRaw.length, eol: enc.eol, bom: enc.bom }],
+        nodes: [{ file: rel, op, before, after, bytes: newRaw.length, eol: newEncoding.eol, bom: newEncoding.bom }],
       }, [{ file: abs, before: rawBuf, after: newRaw }])
     })
   } catch (cause) {
@@ -405,7 +416,7 @@ const STEP_ITEM_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    op: { type: 'string', enum: ['replace', 'insert', 'delete', 'target'], description: 'Optional; inferred from find/after/start and presence of text.' },
+    op: { type: 'string', enum: ['replace', 'insert', 'delete', 'target'], description: 'Usually omit: find+replaceWith → target; start+text → replace; after+text → insert; start alone → delete. Never mix these shapes.' },
     start: { type: 'integer', description: 'Required for replace/delete: first line, 1-based.' },
     end: { type: 'integer', description: 'replace/delete: inclusive last line; default start.' },
     after: { type: 'integer', description: 'Required for insert: original line to insert after; 0 = file start.' },
@@ -429,24 +440,69 @@ function verifyCandidateStillMatches(abs: string, find: string, start: number, e
   }
 }
 
-export function createEditTool(pool: FinderPool) {
+export function createEditTool(pool: FinderPool, services: EvalServices = { get: () => undefined }) {
+  const mutation = createEditMutator(pool), verification = createStaticVerifier(), evaluation = createSymbolEvaluator(services)
+  const { path: _path, symbol: _symbol, ...evalParameters } = evaluation.parameters
+  return {
+    ...mutation,
+    description: mutation.description + ' action=verify rechecks recorded bridge/IPC contracts or parser syntax. action=eval runs an exported JS/Python callable or existing Rust test in a fresh host-confined process; imports/setup may have side effects. returned is not passed. Use project compilers/tests for build/type correctness.',
+    parameters: { ...mutation.parameters, ...evalParameters,
+      action: { type: 'string', enum: ['edit', 'verify', 'eval'], description: 'Default edit. verify: batch|path; defaults to bridge+syntax for batch, syntax for path. eval: path+sourceSymbol; small results/logs inline, resultComplete=false uses resultId+offset.' },
+      batch: verification.parameters.batch,
+      sourceSymbol: { ...mutation.parameters.sourceSymbol, description: 'Exact qualified symbol for editing or action=eval; no mutation edit/content parameters with eval.' },
+    },
+    output: { schema: { ...mutation.output.schema, properties: { ...mutation.output.schema.properties,
+      check: { type: 'object', additionalProperties: true }, evaluation: { type: 'object', additionalProperties: true },
+    } }, render: (args: unknown, value: Parameters<typeof mutation.output.render>[1] & { check?: { text: string }; evaluation?: Record<string, unknown> }) => {
+      if (value.check) return verification.output.render(args, value.check)
+      if (value.evaluation) return evaluation.output.render(args, value.evaluation)
+      return mutation.output.render(args, value)
+    } },
+    hygiene: { ...mutation.hygiene, keepEmpty: [...mutation.hygiene.keepEmpty, ...evaluation.hygiene.keepEmpty], zeroMeansAbsent: ['batch'],
+      modeFrom: (args: Record<string, unknown>) => String(args.action ?? 'edit'),
+      defaultOnlyIn: { match: ['edit'], replaceAll: ['edit'], edit: ['edit'], content: ['edit'], includeLeadingComment: ['edit'], replaceWith: ['edit'], args: ['eval'], kwargs: ['eval'], setup: ['eval'] },
+      defaults: { ...mutation.hygiene.defaults, args: '', kwargs: '', setup: '' },
+    },
+    dispose: () => evaluation.dispose(),
+    async execute(args: Record<string, unknown>, exec?: ForgeExec) {
+      const { action = 'edit', ...input } = args
+      if (action === 'edit') return mutation.execute(input, exec)
+      if (action === 'verify') {
+        const foreign = Object.keys(input).find(key => !['batch', 'path', 'verify'].includes(key))
+        if (foreign) return failure(`${foreign} is not allowed for action=verify`)
+        const { verify, ...target } = input
+        const result = await verification.execute({ ...target, ...(verify === undefined ? {} : { checks: verify }) }, exec)
+        if ('error' in result) return result
+        return { status: result.status, check: result }
+      }
+      if (action === 'eval') {
+        const { sourceSymbol, ...target } = input
+        const result = await evaluation.execute({ ...target, ...(sourceSymbol === undefined ? {} : { symbol: sourceSymbol }) }, exec)
+        return { status: typeof result.status === 'string' ? result.status : 'evidence', evaluation: result }
+      }
+      return failure('action must be edit, verify or eval')
+    },
+  } as const
+}
+
+function createEditMutator(pool: FinderPool) {
   return {
     name: 'ff_edit',
     description:
-      'Edit text after reading it. receipt=diff includes snapshot-bound local hunks; continue incomplete output through ff_history. For one literal replacement pass find/replaceWith directly; multi-step edits use steps. All steps use ORIGINAL snapshot lines; overlaps fail. Prefer expect anchors or target matching. An ambiguous target writes nothing: it returns a ticket, and you apply the saved batch by resending ff_edit with that ticket plus choice (never steps). ' +
-      'Replacement text quoting the range\'s first and last lines keeps them. Create files with insert after=0. ' +
-      'Preserves UTF-8 CRLF/LF/BOM; refuses binary files. Exact sourceSymbol edits share this commit, audit and verify pipeline; code transfers use ff_file.',
+      'Batch independent edits to one file in ONE call: {path,steps:[{find,replaceWith},...],reason}. All steps address the ORIGINAL snapshot; overlaps fail. match=literal makes every pair exact, preserving whitespace and line endings. Top-level find/replaceWith is for one change only. Symbol edit: sourceSymbol+edit+content (delete omits content). receipt=diff returns snapshot hunks; continue via ff_history. Ambiguous block matches write nothing: resend only ticket+choice. Preserves UTF-8 CRLF/LF/BOM; refuses binary files. Create files and transfer code with ff_file.',
     parameters: {
       path: { type: 'string', description: 'File path (absolute or workspace-relative). Required unless answering a ticket.' },
+      steps: { type: 'array', items: STEP_ITEM_SCHEMA, description: 'Batch 1–50 edits in one call. Match: {find,replaceWith}; lines: {start,text}; insert: {after,text}; delete: {op:"delete",start}. match=literal accepts only match pairs. Exclusive with top-level find and sourceSymbol.' },
+      find: { type: 'string', description: 'Single replacement: text to locate. Use match=literal for an exact substring; default block matches whole lines with indentation tolerance.' },
+      replaceWith: { type: 'string', description: 'Replacement for find; empty deletes the match.' },
+      match: { type: 'string', enum: ['block', 'literal'], description: 'Default block. literal applies to every steps pair or the single find/replaceWith; exact substrings with whitespace, BOM and line endings preserved.' },
+      reason: { type: 'string', description: 'Why this change; recorded in history. Required unless answering a ticket.' },
       receipt: { type: 'string', enum: ['summary', 'diff'], description: 'Default summary; diff appends the committed snapshot patch. Also allowed on ticket replies.' },
       sourceSymbol: { type: 'string', description: 'Exact symbol name or qualified name. Exclusive with steps and find/replaceWith.' },
       includeLeadingComment: { type: 'boolean', description: 'Keep the symbol leading comment. Default true.' },
       edit: { type: 'string', enum: ['replace', 'delete', 'insert_before', 'insert_after'], description: 'Required with sourceSymbol.' },
       content: { type: 'string', description: 'Required for symbol edit except delete; literal UTF-8 text.' },
-      find: { type: 'string', description: 'Shorthand for one step: literal block to locate (whole-line match).' },
-      replaceWith: { type: 'string', description: 'Replacement for find; empty deletes the block.' },
-      steps: { type: 'array', items: STEP_ITEM_SCHEMA, description: '1–50 steps; omit with the find/replaceWith shorthand.' },
-      reason: { type: 'string', description: 'Why this change; recorded in history. Required unless answering a ticket.' },
+      replaceAll: { type: 'boolean', description: 'Single top-level find with match=literal only: replace all non-overlapping occurrences. Default false requires one match.' },
       projectId: { type: 'string', description: 'Optional explicit project attribution in this workspace; never inferred from GUI selection.' },
       taskId: { type: 'string', description: 'Optional task in projectId. Requires projectId; archived tasks/projects refuse construction.' },
       revertOnSyntaxError: { type: 'boolean', description: 'Default false: reject introduced syntax errors in a clean file; dirty files stay report-only.' },
@@ -588,19 +644,20 @@ export function createEditTool(pool: FinderPool) {
     // 缺失时它们只可能是补全产物——按缺省形态删，非缺省值仍是误用。
     hygiene: {
       keepEmpty: ['content', 'replaceWith'],
+      keepEmptyWhen: (args: Record<string, unknown>) => args.match === 'literal' && !(Array.isArray(args.steps) && args.steps.length) ? ['find'] : [],
       requires: {
         edit: 'sourceSymbol',
         content: 'sourceSymbol',
         includeLeadingComment: 'sourceSymbol',
         // 空 replaceWith 只有在 find 成立时才是「删除匹配块」；没有 find 时它
         // 只是补全产物，留着会和 steps 抢同一批参数。
-        replaceWith: 'find',
+        replaceWith: 'find', match: ['find', 'steps'], replaceAll: 'find',
       },
-      defaults: { edit: 'replace', content: '', includeLeadingComment: true, replaceWith: '' },
+      defaults: { edit: 'replace', content: '', includeLeadingComment: true, replaceWith: '', match: 'block', replaceAll: false },
     },
     isConcurrencySafe: () => false,
     async execute(args: Record<string, unknown>, exec: ForgeExec | undefined) {
-      const allowed = new Set(['receipt', 'path', 'find', 'replaceWith', 'steps', 'reason', 'revertOnSyntaxError', 'ticket', 'choice', 'snapshotId', 'verify', 'sourceSymbol', 'includeLeadingComment', 'edit', 'content', 'projectId', 'taskId'])
+      const allowed = new Set(['match', 'replaceAll', 'receipt', 'path', 'find', 'replaceWith', 'steps', 'reason', 'revertOnSyntaxError', 'ticket', 'choice', 'snapshotId', 'verify', 'sourceSymbol', 'includeLeadingComment', 'edit', 'content', 'projectId', 'taskId'])
       for (const key of Object.keys(args)) if (!allowed.has(key)) return failure(`${key} is not a parameter of ff_edit`)
       for (const key of ['revertOnSyntaxError', 'includeLeadingComment']) if (args[key] !== undefined && typeof args[key] !== 'boolean') return failure(`${key} must be boolean`)
       for (const key of ['path', 'reason', 'snapshotId']) if (args[key] !== undefined && typeof args[key] !== 'string') return failure(`${key} must be a string`)
@@ -627,6 +684,10 @@ export function createEditTool(pool: FinderPool) {
       if (args.choice !== undefined) {
         return failure('choice only applies to a ticket reply — pass ticket with it')
       }
+      if (args.match !== undefined && args.match !== 'block' && args.match !== 'literal') return failure('match must be block or literal')
+      if (args.match !== undefined && (args.sourceSymbol !== undefined || args.find === undefined && args.steps === undefined)) return failure('match requires steps or find/replaceWith')
+      if (args.replaceAll !== undefined && (args.find === undefined || args.steps !== undefined || args.sourceSymbol !== undefined)) return failure('replaceAll requires the single find/replaceWith shorthand; batch distinct changes with steps')
+      if (args.replaceAll !== undefined && (typeof args.replaceAll !== 'boolean' || args.replaceAll && args.match !== 'literal')) return failure('replaceAll must be boolean and requires match=literal')
       if (args.steps !== undefined && (args.find !== undefined || args.replaceWith !== undefined)) {
         return failure('provide either steps or the find/replaceWith single-step shorthand, not both')
       }
@@ -652,6 +713,12 @@ export function createEditTool(pool: FinderPool) {
         if (args.steps.length > MAX_STEPS) return failure(`steps accepts at most ${MAX_STEPS} steps`)
         steps = args.steps.filter((s): s is EditStep => typeof s === 'object' && s !== null)
         if (steps.length !== args.steps.length) return failure('every step must be an object')
+      }
+      if (args.match === 'literal' && args.steps !== undefined) {
+        for (const [index, step] of steps.entries()) {
+          if (Object.keys(step).some(key => !['op', 'find', 'replaceWith'].includes(key)) || step.op !== undefined && step.op !== 'target') return failure(`step ${index}: match=literal takes {find,replaceWith} (op omitted or target); line operations use match=block`)
+          if (typeof step.find !== 'string' || !step.find || typeof step.replaceWith !== 'string') return failure(`step ${index}: match=literal requires nonempty find and explicit replaceWith`)
+        }
       }
       // One contract, not a knob: a batch either lands whole or writes nothing.
       // `bestEffort` exists in the engine for internal callers, but exposing it
@@ -679,7 +746,9 @@ export function createEditTool(pool: FinderPool) {
             const before = resolveBeforeEvidence(workdir, snapshotId, abs)
             if (!before.ok) return { beforeRejected: before }
           }
-          return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), attribution, mode: 'atomic', exec, verify: verify.checks, symbolEdit, revertOnSyntaxError: symbolEdit !== undefined || args.revertOnSyntaxError === true })
+          return await applyBatch(pool, { abs, workdir, steps, reason, actor: actorOf(exec), attribution, mode: 'atomic', exec, verify: verify.checks, symbolEdit,
+            ...(args.match === 'literal' ? args.steps !== undefined ? { literalSteps: true } : { literalEdit: { find: args.find as string, replaceWith: args.replaceWith as string, replaceAll: args.replaceAll === true } } : {}),
+            revertOnSyntaxError: symbolEdit !== undefined || args.revertOnSyntaxError === true })
         } catch (cause) { return { throwable: causeMessage(cause) } }
       }))
       if ('throwable' in committed) return failure(committed.throwable)
@@ -859,7 +928,11 @@ async function shapeCommitted(result: ApplyResult, context: { workdir: string; a
     const skipped = checks.length > 0
       ? { verification: { status: 'not_run' as const, text: '[verify] not_run: this call wrote nothing, so there is no batch to check' } }
       : undefined
-    return { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), ...(skipped ?? {}) }
+    const receipt: Record<string, unknown> = { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), ...(skipped ?? {}) }
+    if ('error' in shaped) return receipt
+    const { reports: _reports, candidates: _candidates, ...compact } = receipt
+    return boundEditReceipt(receipt, compact, context.workdir,
+      result.ok ? 'content identical; nothing written or recorded' : 'ambiguous target; nothing written')
   }
   const audit = await auditCommit({
     workspace: context.workdir,
@@ -882,26 +955,27 @@ async function shapeCommitted(result: ApplyResult, context: { workdir: string; a
   }
   const receipt = { ...shaped, ...(evidence ? { beforeEvidence: evidence } : {}), audit, ...(verification ? { verification } : {}),
     ...(diff ? { diff } : {}), ...(diffNote ? { note: diffNote } : {}) }
-  if (!context.receipt || jsonBytes(receipt) <= OUTPUT_PAGE_BYTES) return receipt
-  let receiptRef: string | undefined
-  try { receiptRef = archiveOutputReceipt(storeFor(result.workspace ?? context.workdir), receipt) }
-  catch { /* A snapshot storage failure cannot undo the already committed edit. */ }
-  // Never turn a committed edit into an error because its optional receipt is
-  // large. Preserve identity/counts/verdicts; explicitly defer the patch.
-  return {
+  return boundEditReceipt(receipt, {
     status: 'applied', workspace: result.workspace ?? context.workdir, batch: result.batchId,
-    hash: result.hash, applied: result.applied, skipped: result.skipped, receiptComplete: false,
-    ...(receiptRef ? { receiptRef } : {}),
+    hash: result.hash, applied: result.applied, skipped: result.skipped,
     ...(result.externalBatchId ? { externalBatch: result.externalBatchId } : {}),
     ...(result.syntaxWarning ? { syntaxWarning: outputPreview(result.syntaxWarning) } : {}),
     audit: { status: audit.status, reason: audit.reason },
     ...(evidence ? { beforeEvidence: evidence } : {}),
     ...(verification ? { verification: { ...verification, text: outputPreview(verification.text) } } : {}),
-    note: receiptRef
-      ? `edit committed; receipt abbreviated. Read ff_history batch=${result.batchId} detail=receipt receiptRef=${receiptRef} for the complete frozen receipt; diff pages remain available by batch.`
-      : `edit committed; receipt omitted by budget and could not be archived. Step diagnostics are unavailable; ff_history batch=${result.batchId} retrieves the committed patch.`,
-  }
+  }, result.workspace ?? context.workdir, 'edit committed')
+}
 
+/** One receipt budget, whether the call committed, was unchanged, or needs a ticket choice. */
+function boundEditReceipt(receipt: Record<string, unknown>, compact: Record<string, unknown>, workspace: string, outcome: string): Record<string, unknown> {
+  if (jsonBytes(receipt) <= OUTPUT_PAGE_BYTES) return receipt
+  let receiptRef: string | undefined
+  try { receiptRef = archiveOutputReceipt(storeFor(workspace), receipt) }
+  catch { /* Archiving cannot change the already settled edit outcome. */ }
+  return { ...compact, receiptComplete: false, ...(receiptRef ? { receiptRef } : {}),
+    note: receiptRef
+      ? `${outcome}; receipt abbreviated. Read ff_history detail=receipt receiptRef=${receiptRef} for the complete frozen receipt.`
+      : `${outcome}; receipt omitted by budget and could not be archived. Step diagnostics are unavailable.${compact.batch ? ` ff_history batch=${compact.batch} retrieves the committed patch.` : ''}` }
 }
 
 /** Which static checks `verify` accepts. The order is the report order. */
@@ -966,9 +1040,9 @@ export function createHistoryTool() {
     parameters: {
       batch: { type: 'integer', description: 'Positive batch ID from a previous call: return its nodes\' snapshot diffs, not a listing.' },
       node: { type: 'string', description: 'One node address, e.g. b12:n0: return just that node\'s diff. Mutually exclusive with batch.' },
-      detail: { type: 'string', enum: ['hunks', 'patch', 'record', 'receipt'], description: 'Default hunks. patch requires node; record reads full batch JSON; receipt reads an archived edit receipt using batch + receiptRef. Concatenate fragment strings.' },
-      cursor: { type: 'string', description: 'Diff continuation from the same batch/node/detail; 30 minute TTL. Live file edits do not change frozen snapshots.' },
-      receiptRef: { type: 'string', description: 'Full receipt hash from an abbreviated ff_edit result; requires batch and detail=receipt.' },
+      detail: { type: 'string', enum: ['hunks', 'patch', 'record', 'receipt'], description: 'Default hunks. patch requires node; record reads full batch JSON; receipt reads an archived edit reply by receiptRef, even when nothing was written. Concatenate fragment strings.' },
+      cursor: { type: 'string', description: 'Continue with the same selection/detail, including receiptRef for receipts; 30 minute TTL. Live edits do not change frozen snapshots.' },
+      receiptRef: { type: 'string', description: 'Full receipt hash from an abbreviated ff_edit result; requires detail=receipt. Optional batch must match the receipt.' },
       pathContains: { type: 'string', description: 'Substring filter on file paths; not a filesystem path.' },
       keyword: { type: 'string', description: 'Case-insensitive substring filter on reasons.' },
       actor: { type: 'string', description: 'Exact actor (session id) filter.' },
@@ -1024,7 +1098,8 @@ export function createHistoryTool() {
         },
       },
       render: (_args: unknown, value: { items: Array<{ batch: number; ts: string; kind: string; actor: string; reason: string; files: string[]; diffs?: DiffPage['diffs']; checks?: Array<{ id: string; recorded: string; applicable: boolean; effective: string; provenance: string; finishedAt: string; drifted?: string[]; detail?: string }> }>; note?: string; checksNote?: string; page?: Omit<DiffPage, 'diffs'> }) => {
-        if (value.items.length === 0) return text('no ledger entries matched')
+        if (value.items.length === 0) return text(value.page?.record !== undefined
+          ? renderDiffPage({ diffs: [], ...value.page }).join('\n') : 'no ledger entries matched')
         const lines = value.items.map((b) => {
           const head = `#${b.batch} ${b.ts} ${b.kind} by ${b.actor.slice(0, 12)}… — ${b.reason}\n    ${b.files.join(', ')}`
           // A recorded verdict and its present applicability are printed as two
@@ -1052,12 +1127,23 @@ export function createHistoryTool() {
       if ((args.batch !== undefined || args.node !== undefined) && ['pathContains', 'keyword', 'actor', 'kind', 'content', 'limit', 'projectId', 'taskId', 'file', 'unassigned'].some(key => args[key] !== undefined)) return failure('batch/node diff selection is exclusive with listing filters')
       if (args.detail !== undefined && !['hunks', 'patch', 'record', 'receipt'].includes(String(args.detail))) return failure('detail must be hunks, patch, record or receipt')
       if (args.cursor !== undefined && (typeof args.cursor !== 'string' || !args.cursor)) return failure('cursor must be a nonempty string')
-      if ((args.detail !== undefined || args.cursor !== undefined) && args.batch === undefined && args.node === undefined) return failure('detail/cursor require batch or node')
+      if ((args.detail !== undefined || args.cursor !== undefined) && args.batch === undefined && args.node === undefined && args.detail !== 'receipt') return failure('detail/cursor require batch or node')
       if (args.detail === 'patch' && args.node === undefined) return failure('detail=patch requires node')
-      if (args.detail === 'receipt' && (args.batch === undefined || typeof args.receiptRef !== 'string' || !/^[a-f0-9]{64}$/.test(args.receiptRef))) return failure('detail=receipt requires batch and a full receiptRef hash')
+      if (args.detail === 'receipt' && (typeof args.receiptRef !== 'string' || !/^[a-f0-9]{64}$/.test(args.receiptRef))) return failure('detail=receipt requires a full receiptRef hash')
       if (args.receiptRef !== undefined && args.detail !== 'receipt') return failure('receiptRef requires detail=receipt')
       const workdir = canonicalWorkspace(workdirOf(exec))
       const store = storeFor(workdir)
+      if (args.detail === 'receipt') {
+        if (Object.keys(args).some(key => !['detail', 'receiptRef', 'cursor', 'batch'].includes(key))) return failure('receipt reads accept only detail, receiptRef, cursor and optional batch')
+        if (args.batch !== undefined && (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1)) return failure('batch must be a positive integer')
+        try {
+          const archived = readOutputReceipt(store, args.receiptRef as string), parsed = JSON.parse(archived)
+          if (!['applied', 'ticket'].includes(parsed.status) || (args.batch !== undefined && parsed.batch !== args.batch)) throw new Error('receiptRef does not identify a receipt for this batch')
+          const { diffs: _diffs, ...page } = historyDiffOutput.record(archived,
+            JSON.stringify([store.root, args.batch ?? null, 'receipt', args.receiptRef]), args.cursor as string | undefined)
+          return { items: [], page }
+        } catch (cause) { return failure(causeMessage(cause)) }
+      }
       const wantChecks = args.checks === true
       const checksFor = (batchId: number) => {
         if (!wantChecks) return undefined
@@ -1093,24 +1179,16 @@ export function createHistoryTool() {
             if (!Number.isSafeInteger(args.batch) || Number(args.batch) < 1) return failure('batch must be a positive integer')
             const found = readLedgerTail(store, Number.MAX_SAFE_INTEGER).find((b) => b.id === args.batch)
             if (!found) return failure(`batch ${String(args.batch)} not found`)
-            if (!['record', 'receipt'].includes(String(args.detail)) && found.nodes.length > 50) return failure('batch has more than 50 nodes; query individual nodes')
+            if (args.detail !== 'record' && found.nodes.length > 50) return failure('batch has more than 50 nodes; query individual nodes')
             return { batch: found, picks: found.nodes.map((node, index) => ({ node, index })) }
           }
           const selected = pick()
           if ('error' in selected) return selected
           const b = selected.batch
-          let archived: string | undefined
-          if (args.detail === 'receipt') {
-            archived = readOutputReceipt(store, args.receiptRef as string)
-            const parsed = JSON.parse(archived)
-            if (parsed.batch !== b.id || parsed.status !== 'applied') throw new Error('receiptRef does not identify a receipt for this batch')
-          }
-          const { diffs, ...page } = archived !== undefined
-            ? historyDiffOutput.record(archived, JSON.stringify([store.root, b.id, 'receipt', args.receiptRef]), args.cursor as string | undefined)
-            : historyDiffOutput.read(store, b, selected.picks,
+          const { diffs, ...page } = historyDiffOutput.read(store, b, selected.picks,
             args.node !== undefined ? `node:${args.node}` : `batch:${b.id}`,
             { detail: args.detail as 'hunks' | 'patch' | 'record' | undefined, cursor: args.cursor as string | undefined })
-          const record = args.detail === 'record' || args.detail === 'receipt'
+          const record = args.detail === 'record'
           const result = {
             page,
             items: [{ batch: b.id, ts: new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19), kind: b.kind,

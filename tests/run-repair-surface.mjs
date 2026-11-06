@@ -13,7 +13,7 @@ test('retrieval and trace factories expose canonical names only', () => {
   assert.equal(createTraceTool().name, 'ff_trace')
 })
 test('guidance covers independent verification and project governance', () => {
-  assert.equal(FORGE_TOOLS.verify, 'ff_verify')
+  assert.ok(!('verify' in FORGE_TOOLS))
   assert.equal(FORGE_TOOLS.project, 'ff_project')
   const text = forgeGuidance(Object.keys(FORGE_TOOLS))
   for (const name of Object.values(FORGE_TOOLS)) assert.ok(text.includes(name), name)

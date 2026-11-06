@@ -17,7 +17,6 @@ import { tmpdir } from 'node:os'
 import { createEditTool } from '../src/tools-edit.ts'
 import { createFileTool } from '../src/tools-files.ts'
 import { createReadTool } from '../src/tools-read.ts'
-import { createVerifyTool } from '../src/tools-verify.ts'
 import { createTraceTool } from '../src/tools-trace.ts'
 import { createRollbackTool } from '../src/tools-edit.ts'
 import { defineForgeTool } from '../src/host.ts'
@@ -40,7 +39,7 @@ const run = async (tool, args) => {
 const edit = define(createEditTool(pool))
 const files = define(createFileTool())
 const symbols = define(createReadTool())
-const verify = define(createVerifyTool())
+const verify = edit
 const trace = define(createTraceTool())
 const rollback = define(createRollbackTool(pool))
 
@@ -49,6 +48,7 @@ const paddedEdit = args => ({
   choice: '', content: '', edit: 'replace', find: '', includeLeadingComment: true,
   path: '', projectId: '', reason: '', replaceWith: '', revertOnSyntaxError: true,
   snapshotId: '', sourceSymbol: '', steps: [], taskId: '', ticket: '', verify: [],
+  match: 'block', replaceAll: false,
   ...args,
 })
 
@@ -84,6 +84,12 @@ async function main() {
   assert.ok(stepsOnly.batch, `steps path should win over empty find: ${JSON.stringify(stepsOnly).slice(0, 160)}`)
   assert.equal(fs.readFileSync(file('a.txt'), 'utf8'), 'zero\none\nbaz\nthree\n')
   ok('ff_edit 的空数组 steps 归一、有内容 steps 保留，find/replaceWith 空串不抢占')
+
+  fs.writeFileSync(file('literal.txt'), '\uFEFFa  b\r\nc = 1\n')
+  const literalBatch = await run(edit, paddedEdit({ path: 'literal.txt', match: 'literal', steps: [{ find: '  ', replaceWith: '\t' }, { find: 'c = 1', replaceWith: 'c = 2' }], reason: 'batch exact replacements' }))
+  assert.equal(literalBatch.applied, 2, JSON.stringify(literalBatch))
+  assert.equal(fs.readFileSync(file('literal.txt'), 'utf8'), '\uFEFFa\tb\r\nc = 2\n')
+  ok('strict padding preserves match=literal on steps without inventing a top-level find')
 
   // H3：replaceWith:'' 仍然是「删除匹配块」，不能被归一掉。
   const deleted = await run(edit, paddedEdit({ path: 'a.txt', find: 'one', replaceWith: '', reason: 'drop one' }), exec)
@@ -153,10 +159,10 @@ async function main() {
   assert.match(String(misspelled.error), /not used by view=outline/, `unknown key must still refuse: ${JSON.stringify(misspelled)}`)
   ok('ff_symbols 仍拒绝视图里不存在的参数名')
 
-  // ff_verify：batch 补成 0、checks 补成 []，只给了 path → 必须按 path 走。
-  const verified = await run(verify, { batch: 0, path: 'sym.js', checks: [] }, exec)
+  // ff_edit action=verify：batch 补成 0、checks 补成 []，只给了 path → 必须按 path 走。
+  const verified = await run(verify, { action: 'verify', batch: 0, path: 'sym.js', verify: [] }, exec)
   assert.ok(!verified.error, `path-only verify must not trip the exclusive check: ${JSON.stringify(verified).slice(0, 160)}`)
-  ok('ff_verify 的 batch:0 / checks:[] 视为未提供，path 单独成立')
+  ok('ff_edit action=verify 的 batch:0 / checks:[] 视为未提供，path 单独成立')
 
   // ff_trace：空串的 path 类字段与可分页字段要被归一；枚举字段的空串止步于
   // SDK 的参数校验（defineTool 先校验后调 execute），forge 不会把它吞掉。

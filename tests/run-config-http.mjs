@@ -85,9 +85,9 @@ ctx.provide('configEditor', {
 ctx.plugin({ name: module.name, inject: module.inject, apply: module.apply })
 await new Promise((resolve) => setImmediate(resolve))
 
-// Exactly the approved settings, ledger and projects endpoints; no duplicate routes.
-assert.equal(routes.length, 3, `expected config, ledger and projects routes, got ${routes.length}`)
-assert.deepEqual(routes.map(route => route.path).sort(), ['/forge-config', '/forge-ledger', '/forge-projects'])
+// Settings, ledger, projects and the existing Git route; no duplicate routes.
+assert.equal(routes.length, 4, `expected config, ledger, projects and Git routes, got ${routes.length}`)
+assert.deepEqual(routes.map(route => route.path).sort(), ['/forge-config', '/forge-git', '/forge-ledger', '/forge-projects'])
 const configRoute = routes.find((route) => route.path === '/forge-config')
 const ledgerRoute = routes.find((route) => route.path === '/forge-ledger')
 const projectsRoute = routes.find((route) => route.path === '/forge-projects')
@@ -104,18 +104,18 @@ const handler = configRoute.handler
   const { seen, res } = reply()
   await handler(request('GET'), res)
   assert.equal(seen.status, 200, seen.body)
-  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'retrieval' })
+  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'retrieval', hideBuiltinWrites: false })
   ok('GET answers the row’s own values')
 }
 
 // --- POST: a legal save reaches configEditor.edit --------------------------
 {
   const { seen, res } = reply()
-  await handler(request('POST', { surface: 'full' }), res)
+  await handler(request('POST', { surface: 'full', hideBuiltinWrites: true }), res)
   assert.equal(seen.status, 200, seen.body)
   assert.equal(edits.length, 1, 'the save must go through configEditor.edit')
-  assert.deepEqual(edits[0], { surface: 'full' })
-  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'full' })
+  assert.deepEqual(edits[0], { surface: 'full', hideBuiltinWrites: true })
+  assert.deepEqual(JSON.parse(seen.body).state, { surface: 'full', hideBuiltinWrites: true })
   ok('POST persists through the editor and echoes what it wrote')
 }
 

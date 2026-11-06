@@ -30,10 +30,10 @@ import { installTodoProjects, type TodoProjectHost } from './todo-projects.ts'
 import { createFileTool } from './tools-files.ts'
 import { createReadTool } from './tools-read.ts'
 import { createTraceTool } from './tools-trace.ts'
-import { createVerifyTool } from './tools-verify.ts'
 import { createProjectTool } from './tools-project.ts'
 import { AstWorkerPool } from './ast-pool.ts'
 import { Config, resolveConfig } from './config.ts'
+import { installBuiltinWrites, type BuiltinWritesHost } from './builtin-writes.ts'
 import { planRegistration, type ForgeRow } from './registration.ts'
 import {
   FORGE_GUIDANCE_ORDER,
@@ -111,6 +111,8 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
   const workers = new AstWorkerPool()
   const guard = createExecutionGuard(host.fs, host, optionalService<ForgePolicyService>(host, 'sandboxPolicy'))
   const integration = { fs: host.fs, events: host }
+  const edit = createEditTool(pool, { get: name => optionalService(host, name) })
+  yield () => edit.dispose()
   const toolLookup: ScopedToolLookup | undefined =
     typeof host.tools.get === 'function' ? { get: (toolName, scope) => host.tools.get?.(toolName, scope) } : undefined
   const augmentation = installAugmentation(host as unknown as AugmentHost, { names: AUGMENTED_BUILTINS })
@@ -120,7 +122,7 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
     { forge: 'ff_find', surface: 'retrieval', build: () => defineForgeTool(createFindTool(pool), guard, integration) },
     { forge: 'ff_grep', surface: 'retrieval', build: () => defineForgeTool(createGrepTool(pool), guard, integration) },
     { forge: 'ff_symbols', surface: 'retrieval', build: () => defineForgeTool(createReadTool(workers), guard, integration) },
-    { forge: 'ff_edit', surface: 'full', build: () => defineForgeTool(createEditTool(pool), guard, integration) },
+    { forge: 'ff_edit', surface: 'full', build: () => defineForgeTool(edit, guard, integration) },
     { forge: 'ff_history', surface: 'full', build: () => defineForgeTool(createHistoryTool(), guard, integration) },
     { forge: 'ff_rollback', surface: 'full', build: () => defineForgeTool(createRollbackTool(pool), guard, integration) },
     { forge: 'ff_file', surface: 'full', build: () => defineForgeTool(createFileTool(), guard, integration) },
@@ -132,18 +134,24 @@ export function* apply(ctx: Context, rawConfig?: unknown): Generator<unknown, vo
     // retrieval surface for a tool a session uses one time in seven. Move this
     // row to 'retrieval' when wiring questions become the common case.
     { forge: 'ff_trace', surface: 'full', build: () => defineForgeTool(createTraceTool(workers), guard, integration) },
-    { forge: 'ff_verify', surface: 'full', build: () => defineForgeTool(createVerifyTool(), guard, integration) },
     { forge: 'ff_project', surface: 'full', build: () => defineForgeTool(createProjectTool(), guard, integration) },
   ]
 
   const registered = planRegistration(config, rows)
   const registeredNames = registered.map((row) => row.forge)
+  const owned = new Map<string, unknown>()
   for (const row of registered) {
-    yield host.tools.register(row.build())
+    const definition = row.build()
+    owned.set(row.forge, definition)
+    yield host.tools.register(definition)
   }
+
+  const builtinWrites = installBuiltinWrites(host as unknown as BuiltinWritesHost, config, owned)
+  yield () => builtinWrites.dispose()
 
   yield host.commands.register(createStatusCommand(pool, {
     surface: config.surface,
+    builtinWrites,
     ...(augmentation === undefined ? {} : { augmentation }),
   }))
 

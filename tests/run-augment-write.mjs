@@ -110,7 +110,8 @@ async function main() {
     const { forgeGuidance } = await import(new URL('../lib/guidance.js', import.meta.url).href)
     const full = forgeGuidance(['find', 'grep', 'read', 'edit', 'file', 'history', 'rollback', 'trace'], { symbolRead: true })
     assert.ok(!full.includes('leaves no batch'), 'the prompt no longer claims a built-in edit is invisible to history')
-    assert.ok(full.includes('built-in edit is recorded'), 'the prompt says built-in writes reach the ledger')
+    assert.ok(full.includes('Edit after reading → ff_edit'), 'guidance routes writes through the replacement available in full mode')
+    assert.ok(!full.includes('built-in edit is recorded'), 'guidance must not recommend a potentially hidden built-in')
     ok('C0b the guidance matches what the augmentation now records')
   }
 

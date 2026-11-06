@@ -12,9 +12,10 @@ const { FinderPool } = await import('../lib/core.js')
 let passed = 0
 const ok = (label) => console.log(`ok ${++passed} - ${label}`)
 
-assert.deepEqual(resolveConfig(), { surface: 'retrieval' })
-assert.deepEqual(resolveConfig({}), { surface: 'retrieval' })
-assert.deepEqual(resolveConfig({ surface: 'full' }), { surface: 'full' })
+assert.deepEqual(resolveConfig(), { surface: 'retrieval', hideBuiltinWrites: false })
+assert.deepEqual(resolveConfig({}), { surface: 'retrieval', hideBuiltinWrites: false })
+assert.deepEqual(resolveConfig({ surface: 'full', hideBuiltinWrites: true }), { surface: 'full', hideBuiltinWrites: true })
+assert.throws(() => resolveConfig({ hideBuiltinWrites: 'true' }), /boolean/)
 assert.throws(() => resolveConfig('full'), /mapping/)
 assert.throws(() => resolveConfig({ surface: 'all' }), /surface/)
 for (const config of [{}, { surface: 'retrieval' }, { surface: 'full' }]) {
@@ -27,7 +28,6 @@ const rows = [
   { forge: 'ff_grep', surface: 'retrieval' },
   { forge: 'ff_symbols', surface: 'retrieval' },
   { forge: 'ff_edit', surface: 'full' },
-  { forge: 'ff_verify', surface: 'full' },
   { forge: 'ff_project', surface: 'full' },
 ]
 assert.deepEqual(planRegistration(resolveConfig(), rows).map((row) => row.forge), ['ff_find', 'ff_grep', 'ff_symbols'])
@@ -81,10 +81,10 @@ async function mount(config) {
 {
   const host = await mount({ surface: 'full' })
   const names = host.definitions.map((definition) => definition.name)
-  assert.equal(names.length, 10)
-  assert.equal(new Set(names).size, 10, 'SDK registration must not duplicate a public tool')
-  assert.deepEqual([...names].sort(), ['ff_find', 'ff_grep', 'ff_symbols', 'ff_edit', 'ff_history', 'ff_rollback', 'ff_file', 'ff_trace', 'ff_verify', 'ff_project'].sort())
-  for (const legacy of ['fffind', 'ffgrep', 'ff_read', 'fftrace', 'ffedit', 'ffhistory', 'ffrollback']) {
+  assert.equal(names.length, 9)
+  assert.equal(new Set(names).size, 9, 'SDK registration must not duplicate a public tool')
+  assert.deepEqual([...names].sort(), ['ff_find', 'ff_grep', 'ff_symbols', 'ff_edit', 'ff_history', 'ff_rollback', 'ff_file', 'ff_trace', 'ff_project'].sort())
+  for (const legacy of ['fffind', 'ffgrep', 'ff_read', 'fftrace', 'ffedit', 'ffhistory', 'ffrollback', 'ff_verify', 'ff_eval', 'ff_read_many']) {
     assert.ok(!names.includes(legacy), `retired public name must not be registered: ${legacy}`)
   }
   const grepDef = host.definitions.find((definition) => definition.name === 'ff_grep')
